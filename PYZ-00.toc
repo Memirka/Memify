@@ -1,4 +1,4 @@
-('D:\\Memify\\App\\App\\build\\main\\PYZ-00.pyz',
+('D:\\Memify\\App\\App\\build\\Memify\\PYZ-00.pyz',
  [('PyQt6',
    'C:\\Users\\temmy\\AppData\\Local\\Programs\\Python\\Python313\\Lib\\site-packages\\PyQt6\\__init__.py',
    'PYMODULE'),
