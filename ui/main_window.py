@@ -20,6 +20,7 @@ from PyQt6.QtWidgets import (
     QMenu, QFileDialog, QProgressDialog, QSpacerItem,
     QAbstractItemView, QFrame, QMessageBox, QGraphicsDropShadowEffect,
     QGraphicsScene, QGraphicsPixmapItem, QGraphicsBlurEffect,
+    QStyledItemDelegate, QStyle,
 )
 from PyQt6.QtCore import (
     Qt, QTimer, QThread, QUrl, QSize, QRectF, pyqtSignal, pyqtSlot, QObject, QPoint, QPointF,
@@ -200,6 +201,20 @@ def _liked_entry_matches(entry, keys: set) -> bool:
     if isinstance(entry, str):
         return bool(_track_like_keys({}, entry) & keys)
     return False
+
+
+# _settings keys that describe *this machine*, not the user's account —
+# never synced to the server (a different device's audio device ID or media
+# key support wouldn't mean anything here).
+_LOCAL_ONLY_SETTINGS_KEYS = {"audio_output_device_id", "global_media_keys"}
+
+# _settings keys that are baked into every widget/the whole QApplication at
+# construction time — changing them live isn't practical, so a value that
+# arrives from the server different from what's already running needs a
+# restart prompt (same as changing them locally in Settings). accent_color
+# is deliberately not here — unlike theme/scale, it already applies live
+# (see _refresh_accent_widgets()).
+_RESTART_REQUIRED_SETTINGS_KEYS = {"theme", "ui_scale"}
 
 
 class AlbumGridWidget(QWidget):
@@ -2062,6 +2077,97 @@ class WelcomePage(QWidget):
 _LIKED_ROW_ROLE = Qt.ItemDataRole.UserRole + 1
 _ARTIST_ROW_ROLE = Qt.ItemDataRole.UserRole + 2
 
+# Custom data roles for the reorderable artist/album QListWidgetItems (see
+# _SidebarItemDelegate) — offset well clear of the two roles above.
+_SR_KEY = Qt.ItemDataRole.UserRole              # "artist::Name" / "album::Artist||Title"
+_SR_SUBTITLE = Qt.ItemDataRole.UserRole + 10
+_SR_COVER = Qt.ItemDataRole.UserRole + 11
+_SR_RADIUS = Qt.ItemDataRole.UserRole + 12
+_SR_FALLBACK = Qt.ItemDataRole.UserRole + 13
+_SR_CLICK_DATA = Qt.ItemDataRole.UserRole + 14
+_SR_KIND = Qt.ItemDataRole.UserRole + 15
+
+
+class _SidebarItemDelegate(QStyledItemDelegate):
+    """Paints artist/album rows directly instead of using setItemWidget().
+
+    A widget embedded via setItemWidget() sits on top of the viewport and
+    swallows mouse press/move events for its whole area before the
+    QListWidget itself ever sees them — which is exactly why the built-in
+    InternalMove drag-to-reorder silently did nothing when rows were real
+    child widgets (dragging never even started). Owner-drawing keeps the
+    same cover+name+subtitle look while letting the view's native
+    drag-and-drop receive the events it needs to actually work.
+    """
+
+    ROW_HEIGHT = 54
+    COVER_SIZE = 40
+
+    def sizeHint(self, option, index):
+        width = option.rect.width() if option.rect.width() > 0 else 240
+        return QSize(width, self.ROW_HEIGHT)
+
+    def paint(self, painter, option, index):
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        c = COLORS
+        rect = option.rect
+        hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+
+        if hovered or selected:
+            bg_path = QPainterPath()
+            bg_path.addRoundedRect(QRectF(rect.adjusted(4, 1, -4, -1)), 8, 8)
+            painter.fillPath(bg_path, QColor(c["SURFACE_LIGHT"]))
+
+        radius = index.data(_SR_RADIUS) or 6
+        cover_size = self.COVER_SIZE
+        cover_rect = QRectF(
+            rect.x() + 10, rect.y() + (rect.height() - cover_size) / 2, cover_size, cover_size
+        )
+        cover_path = QPainterPath()
+        cover_path.addRoundedRect(cover_rect, radius, radius)
+        pm = index.data(_SR_COVER)
+        if isinstance(pm, QPixmap) and not pm.isNull():
+            painter.save()
+            painter.setClipPath(cover_path)
+            painter.drawPixmap(cover_rect.toRect(), pm)
+            painter.restore()
+        else:
+            painter.fillPath(cover_path, QColor(c["SURFACE_LIGHT"]))
+            fallback = index.data(_SR_FALLBACK) or ""
+            if fallback:
+                painter.setPen(QColor(c["TEXT_PRIMARY"]))
+                painter.setFont(QFont("Segoe UI", 12))
+                painter.drawText(cover_rect, Qt.AlignmentFlag.AlignCenter, fallback)
+
+        text_x = cover_rect.right() + 10
+        text_w = max(10.0, rect.right() - text_x - 8)
+        name = index.data(Qt.ItemDataRole.DisplayRole) or ""
+        subtitle = index.data(_SR_SUBTITLE) or ""
+
+        name_font = QFont("Segoe UI", 10)
+        painter.setPen(QColor(c["TEXT_PRIMARY"] if (hovered or selected) else c["TEXT_SECONDARY"]))
+        painter.setFont(name_font)
+        fm = QFontMetrics(name_font)
+        elided_name = fm.elidedText(name, Qt.TextElideMode.ElideRight, int(text_w))
+        name_rect = (
+            QRectF(text_x, rect.y() + 8, text_w, 18) if subtitle
+            else QRectF(text_x, rect.y(), text_w, rect.height())
+        )
+        painter.drawText(name_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, elided_name)
+
+        if subtitle:
+            sub_font = QFont("Segoe UI", 8)
+            sub_fm = QFontMetrics(sub_font)
+            painter.setFont(sub_font)
+            painter.setPen(QColor(c["TEXT_SECONDARY"]))
+            elided_sub = sub_fm.elidedText(subtitle, Qt.TextElideMode.ElideRight, int(text_w))
+            sub_rect = QRectF(text_x, rect.y() + rect.height() - 24, text_w, 18)
+            painter.drawText(sub_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, elided_sub)
+
+        painter.restore()
+
 
 class _SidebarItem(QWidget):
     """Single item in the sidebar with a 40x40 cover + label."""
@@ -2069,17 +2175,17 @@ class _SidebarItem(QWidget):
 
     COVER_SIZE = 40
 
-    def __init__(self, text: str, data, radius: int = 6, parent=None):
+    def __init__(self, text: str, data, radius: int = 6, subtitle: str = "", parent=None):
         super().__init__(parent)
         self.setObjectName("sidebarItem")
         self._data = data
         self._radius = radius
         self._selected = False
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._build_ui(text)
+        self._build_ui(text, subtitle)
         self._set_style(hover=False, selected=False)
 
-    def _build_ui(self, text: str):
+    def _build_ui(self, text: str, subtitle: str = ""):
         lay = QHBoxLayout(self)
         lay.setContentsMargins(6, 3, 6, 3)
         lay.setSpacing(10)
@@ -2092,10 +2198,23 @@ class _SidebarItem(QWidget):
         )
         lay.addWidget(self._cover_label)
 
+        text_col = QVBoxLayout()
+        text_col.setContentsMargins(0, 0, 0, 0)
+        text_col.setSpacing(0)
+
         self._name_label = QLabel(text)
         self._name_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self._name_label.setWordWrap(False)
-        lay.addWidget(self._name_label, 1)
+        text_col.addWidget(self._name_label)
+
+        self._subtitle_label = None
+        if subtitle:
+            self._subtitle_label = QLabel(subtitle)
+            self._subtitle_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+            self._subtitle_label.setWordWrap(False)
+            text_col.addWidget(self._subtitle_label)
+
+        lay.addLayout(text_col, 1)
 
     def _set_style(self, hover: bool, selected: bool):
         c = COLORS
@@ -2104,6 +2223,8 @@ class _SidebarItem(QWidget):
         color = c["TEXT_PRIMARY"] if active else c["TEXT_SECONDARY"]
         self.setStyleSheet(f"QWidget#sidebarItem {{ background: {bg}; border-radius: 8px; }}")
         self._name_label.setStyleSheet(f"color: {color}; font: 10pt 'Segoe UI';")
+        if self._subtitle_label is not None:
+            self._subtitle_label.setStyleSheet(f"color: {c['TEXT_SECONDARY']}; font: 8pt 'Segoe UI';")
 
     def set_cover(self, pixmap: QPixmap):
         if pixmap and not pixmap.isNull():
@@ -2143,6 +2264,10 @@ class Sidebar(QWidget):
     artist_selected = pyqtSignal(dict)
     album_selected = pyqtSignal(dict, dict)   # (album, artist)
     liked_tracks_selected = pyqtSignal()
+    # Emitted after the user drags an artist/album row to a new position —
+    # carries the full new order as stable "artist::Name" / "album::Artist||Title"
+    # keys, ready to hand straight to follow_order.
+    order_changed = pyqtSignal(list)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2152,8 +2277,13 @@ class Sidebar(QWidget):
             f"QWidget#sidebar {{ background-color: {COLORS['SURFACE']}; "
             f"border-right: 1px solid {COLORS['SURFACE_LIGHT']}; }}"
         )
-        self._items: list[_SidebarItem] = []
+        self._liked_item: _SidebarItem | None = None
         self._runners: list = []
+        # True while load_account_content() is rebuilding the list — the
+        # rebuild itself re-adds every row (a "move" as far as the model is
+        # concerned), which would otherwise be misread as a user drag and
+        # echo a bogus order_changed.
+        self._rebuilding = False
         self._build_ui()
 
     def _build_ui(self):
@@ -2176,49 +2306,75 @@ class Sidebar(QWidget):
         header.setStyleSheet(f"color: {COLORS['TEXT_PRIMARY']}; padding: 4px 6px;")
         layout.addWidget(header)
 
-        self._scroll = QScrollArea()
-        self._scroll.setWidgetResizable(True)
-        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self._scroll.setStyleSheet(get_scrollbar_style() + "QScrollArea { background: transparent; border: none; }")
+        # "Понравившиеся треки" is pinned above the reorderable list, not
+        # part of it — it isn't an artist or album, so dragging it around
+        # relative to them wouldn't mean anything.
+        self._liked_slot = QVBoxLayout()
+        self._liked_slot.setContentsMargins(0, 0, 0, 0)
+        layout.addLayout(self._liked_slot)
 
-        self._container = QWidget()
-        self._container.setStyleSheet("background: transparent;")
-        self._items_layout = QVBoxLayout(self._container)
-        self._items_layout.setContentsMargins(0, 0, 4, 0)
-        self._items_layout.setSpacing(2)
-        self._items_layout.addStretch(1)
-
-        self._scroll.setWidget(self._container)
-        layout.addWidget(self._scroll, 1)
+        # Reorderable artist/album list. Rows are owner-drawn (see
+        # _SidebarItemDelegate) rather than embedded widgets — a widget set
+        # via setItemWidget() would intercept every mouse press itself,
+        # leaving the view's built-in InternalMove drag-and-drop with
+        # nothing to react to.
+        self._list = QListWidget()
+        self._list.setObjectName("sidebarList")
+        self._list.setItemDelegate(_SidebarItemDelegate(self._list))
+        self._list.setFrameShape(QFrame.Shape.NoFrame)
+        self._list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self._list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._list.setMouseTracking(True)   # needed for State_MouseOver per-row hover
+        self._list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self._list.setDefaultDropAction(Qt.DropAction.MoveAction)
+        # Explicit alongside DragDropMode (which should already imply these)
+        # — belt and suspenders, since the previous setItemWidget-based
+        # attempt looked correctly configured too and still didn't drag.
+        self._list.setDragEnabled(True)
+        self._list.setAcceptDrops(True)
+        self._list.setDropIndicatorShown(True)
+        self._list.setSpacing(2)
+        self._list.setStyleSheet(
+            get_scrollbar_style() +
+            "QListWidget#sidebarList { background: transparent; border: none; }"
+        )
+        self._list.model().rowsMoved.connect(self._on_rows_moved)
+        self._list.itemClicked.connect(self._on_item_clicked)
+        layout.addWidget(self._list, 1)
 
     def set_username(self, login: str):
         self._user_label.setText(login or "")
 
-    def load_account_content(self, liked: bool, artists: list[dict], albums: list = None):
+    def load_account_content(self, liked: bool, entries: list | None = None):
+        """entries: ordered list of ("artist", artist_dict) /
+        ("album", (album_dict, artist_dict)) tuples, already in the desired
+        display order (caller resolves follow_order into this)."""
         _stop_runners(self._runners)
-        for item in self._items:
-            self._items_layout.removeWidget(item)
-            item.deleteLater()
-        self._items.clear()
 
-        self._add_item(self._make_liked_item())
+        if self._liked_item is not None:
+            self._liked_slot.removeWidget(self._liked_item)
+            self._liked_item.deleteLater()
+            self._liked_item = None
+        if liked:
+            self._liked_item = self._make_liked_item()
+            self._liked_slot.addWidget(self._liked_item)
 
-        for a in artists:
-            self._add_item(self._make_artist_item(a))
-
-        for al, ar in (albums or []):
-            self._add_item(self._make_album_item(al, ar))
-
-    def _add_item(self, item: _SidebarItem):
-        # Remove placeholder if present
-        for i in range(self._items_layout.count()):
-            w = self._items_layout.itemAt(i)
-            if w and w.widget() and w.widget().objectName() == "_sidebar_placeholder":
-                w.widget().deleteLater()
-                break
-        self._items_layout.insertWidget(self._items_layout.count() - 1, item)
-        self._items.append(item)
+        self._rebuilding = True
+        try:
+            self._list.clear()
+            for kind, payload in (entries or []):
+                if kind == "artist":
+                    list_item = self._make_artist_row(payload)
+                elif kind == "album":
+                    album, artist = payload
+                    list_item = self._make_album_row(album, artist)
+                else:
+                    continue
+                self._list.addItem(list_item)
+        finally:
+            self._rebuilding = False
 
     def _make_liked_item(self) -> _SidebarItem:
         item = _SidebarItem("Понравившиеся треки", "_liked_tracks_", radius=6)
@@ -2232,35 +2388,45 @@ class Sidebar(QWidget):
         item.set_cover_text("♥", COLORS["PRIMARY"])
         return item
 
-    def _make_artist_item(self, artist: dict) -> _SidebarItem:
+    def _make_artist_row(self, artist: dict) -> QListWidgetItem:
         name = clean_artist_name(artist.get("artist", "")) or "Неизвестно"
-        item = _SidebarItem(name, artist, radius=20)
-        item.clicked.connect(lambda data: self.artist_selected.emit(data))
+        list_item = QListWidgetItem(name)
+        list_item.setData(_SR_KEY, f"artist::{(artist.get('artist') or '').strip()}")
+        list_item.setData(_SR_KIND, "artist")
+        list_item.setData(_SR_CLICK_DATA, artist)
+        list_item.setData(_SR_SUBTITLE, "Исполнитель")
+        list_item.setData(_SR_RADIUS, 20)
+        list_item.setData(_SR_FALLBACK, "♪")
+
         cover_rel = artist.get("cover", "")
         if cover_rel:
             url = SERVER_URL + cover_rel if not cover_rel.startswith("http") else cover_rel
-            self._load_cover(item, url, 40, 20)
-        else:
-            item.set_cover_text("♪")
-        return item
+            self._load_cover(list_item, url, 40, 20)
+        return list_item
 
-    def _make_album_item(self, album: dict, artist: dict) -> _SidebarItem:
+    def _make_album_row(self, album: dict, artist: dict) -> QListWidgetItem:
         name = clean_title(album.get("title", "")) or "Неизвестно"
-        item = _SidebarItem(name, (album, artist), radius=6)
-        item.clicked.connect(lambda data: self.album_selected.emit(data[0], data[1]))
+        list_item = QListWidgetItem(name)
+        artist_name = (artist.get("artist") or "").strip()
+        album_title = (album.get("title") or "").strip()
+        list_item.setData(_SR_KEY, f"album::{artist_name}||{album_title}")
+        list_item.setData(_SR_KIND, "album")
+        list_item.setData(_SR_CLICK_DATA, (album, artist))
+        list_item.setData(_SR_SUBTITLE, "Альбом")
+        list_item.setData(_SR_RADIUS, 6)
+        list_item.setData(_SR_FALLBACK, "♪")
+
         cover_rel = album.get("cover", "")
         if cover_rel:
             url = SERVER_URL + cover_rel if not cover_rel.startswith("http") else cover_rel
-            self._load_cover(item, url, 40, 6)
-        else:
-            item.set_cover_text("♪")
-        return item
+            self._load_cover(list_item, url, 40, 6)
+        return list_item
 
-    def _load_cover(self, item: _SidebarItem, url: str, size: int, radius: int):
+    def _load_cover(self, list_item: QListWidgetItem, url: str, size: int, radius: int):
         key = cache_key(url, size, radius)
         cached = cover_cache.get(key)
         if cached and not cached.isNull():
-            item.set_cover(cached)
+            list_item.setData(_SR_COVER, cached)
             return
 
         def on_loaded(loaded_url, img, s, r):
@@ -2268,18 +2434,42 @@ class Sidebar(QWidget):
                 pm = QPixmap.fromImage(img) if img else QPixmap()
                 if not pm.isNull():
                     cover_cache.set(cache_key(loaded_url, s, r), pm)
-                    item.set_cover(pm)
-            except Exception:
+                    # list_item may have been deleted by a load_account_content()
+                    # rebuild that happened while this was in flight.
+                    list_item.setData(_SR_COVER, pm)
+                    self._list.viewport().update()
+            except RuntimeError:
                 pass
 
         _start_image_loader([url], size, radius, on_loaded, self._runners)
 
     def select_artist(self, artist_name: str):
-        for item in self._items:
-            if isinstance(item._data, dict) and item._data.get("artist") == artist_name:
-                item.set_selected(True)
-            else:
-                item.set_selected(False)
+        for row in range(self._list.count()):
+            list_item = self._list.item(row)
+            is_match = (
+                list_item.data(_SR_KIND) == "artist"
+                and (list_item.data(_SR_CLICK_DATA) or {}).get("artist") == artist_name
+            )
+            list_item.setSelected(is_match)
+
+    def _on_item_clicked(self, list_item: QListWidgetItem):
+        kind = list_item.data(_SR_KIND)
+        data = list_item.data(_SR_CLICK_DATA)
+        if kind == "artist":
+            self.artist_selected.emit(data)
+        elif kind == "album":
+            album, artist = data
+            self.album_selected.emit(album, artist)
+
+    def _on_rows_moved(self, *_args):
+        if self._rebuilding:
+            return
+        keys = []
+        for row in range(self._list.count()):
+            key = self._list.item(row).data(_SR_KEY)
+            if key:
+                keys.append(key)
+        self.order_changed.emit(keys)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -2617,53 +2807,25 @@ class SettingsPage(QWidget):
 # Main application window
 # ──────────────────────────────────────────────────────────────────────────────
 
-class _LibraryWorker(QObject):
+class _LibraryLoadSignal(QObject):
+    """Bridges a background library-refresh back to the main thread — see
+    _DiscordConnectSignal below for why this is a plain daemon thread
+    rather than a QThread/moveToThread worker: in this environment, a
+    QThread's started->run() connection has intermittently just never
+    fired (observed directly — the thread object exists, but its run()
+    slot is silently never called), stalling library/player-data loading
+    indefinitely with no error. A daemon thread's target function always
+    runs; emitting a signal from it marshals delivery to the main thread
+    the same way a QThread's queued connection would."""
     finished = pyqtSignal()
 
-    def __init__(self, library_manager):
-        super().__init__()
-        self._lm = library_manager
 
-    @pyqtSlot()
-    def run(self):
-        try:
-            self._lm.refresh_from_network()
-        except Exception as e:
-            print(f"Library refresh error: {e}")
-        self.finished.emit()
-
-
-class _PlayerDataWorker(QObject):
+class _PlayerDataLoadSignal(QObject):
     finished = pyqtSignal(dict)
 
-    def __init__(self, account_manager):
-        super().__init__()
-        self._account_manager = account_manager
 
-    @pyqtSlot()
-    def run(self):
-        try:
-            data = self._account_manager.fetch_player_data() or {}
-        except Exception:
-            data = {}
-        self.finished.emit(data)
-
-
-class _PlayerDataSaveWorker(QObject):
+class _PlayerDataSaveSignal(QObject):
     finished = pyqtSignal()
-
-    def __init__(self, account_manager, updates: dict):
-        super().__init__()
-        self._account_manager = account_manager
-        self._updates = updates
-
-    @pyqtSlot()
-    def run(self):
-        try:
-            self._account_manager.save_player_data(self._updates)
-        except Exception:
-            pass
-        self.finished.emit()
 
 
 class _DiscordConnectSignal(QObject):
@@ -2732,8 +2894,16 @@ class MusicApp(QWidget):
         self._liked_tracks: list = []        # list of track dicts from server
         self._subscriptions: list = []       # list of artist names
         self._album_subscriptions: list = [] # list of "artist||album" strings
-        self._player_data_thread: QThread | None = None
-        self._library_thread: QThread | None = None
+        # User's custom sidebar order — "artist::Name" / "album::Artist||Title"
+        # keys, letting artists and albums be freely interleaved instead of
+        # always grouped as all-artists-then-all-albums.
+        self._follow_order: list = []
+        # Keep-alive lists for in-flight background-load/-save signal
+        # bridges (see _LibraryLoadSignal) — daemon threads, so nothing to
+        # join/quit() on close; entries are removed as each one finishes.
+        self._library_load_signals: list = []
+        self._player_data_load_signals: list = []
+        self._player_data_save_signals: list = []
 
         self._discord_rpc = None
         self._discord_connecting = False
@@ -2744,6 +2914,7 @@ class MusicApp(QWidget):
         self._playing_url: str = ""
         self._playing_track: dict | None = None
         self._player_warmed_up = False
+        self._settings_sync_timer: QTimer | None = None
 
         self._load_settings()
         self._setup_ui()
@@ -2800,6 +2971,7 @@ class MusicApp(QWidget):
                 json.dump(self._settings, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
+        self._schedule_settings_sync()
 
     def _save_ui_state(self, **kwargs):
         self._settings.update(kwargs)
@@ -2808,6 +2980,21 @@ class MusicApp(QWidget):
                 json.dump(self._settings, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
+        self._schedule_settings_sync()
+
+    def _schedule_settings_sync(self):
+        """Debounced push of _settings to the server (via app_settings in
+        player data), so settings/likes/state carry over when logging in on
+        another device. Debounced because some callers (volume slider drag)
+        fire on every tick — without this, dragging the slider would fire a
+        network request and spin up a QThread dozens of times a second."""
+        if not self._account_manager or self._closing:
+            return
+        if self._settings_sync_timer is None:
+            self._settings_sync_timer = QTimer(self)
+            self._settings_sync_timer.setSingleShot(True)
+            self._settings_sync_timer.timeout.connect(lambda: self._save_player_data_async({}))
+        self._settings_sync_timer.start(800)
 
     # ── UI setup ──────────────────────────────────────────────────────────────
 
@@ -2835,6 +3022,7 @@ class MusicApp(QWidget):
         self._sidebar.artist_selected.connect(self._on_artist_selected)
         self._sidebar.album_selected.connect(self._on_sidebar_album_selected)
         self._sidebar.liked_tracks_selected.connect(self._on_liked_tracks_selected)
+        self._sidebar.order_changed.connect(self._on_sidebar_order_changed)
         if self._account_manager and self._account_manager.active_login:
             self._sidebar.set_username(self._account_manager.active_login)
         body_row.addWidget(self._sidebar)
@@ -3062,23 +3250,34 @@ class MusicApp(QWidget):
             if local:
                 self._on_player_data_loaded(local)
             else:
-                self._sidebar.load_account_content(liked=False, artists=[])
+                self._sidebar.load_account_content(liked=False, entries=[])
 
         # Step 3: Refresh library from server in background (won't block UI)
-        worker = _LibraryWorker(self.library_manager)
-        thread = QThread(QApplication.instance())
-        worker.moveToThread(thread)
-        worker.finished.connect(self._on_library_loaded)
-        worker.finished.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        thread.started.connect(worker.run)
-        self._library_thread = thread
-        thread.start()
+        signal = _LibraryLoadSignal(self)
+        self._library_load_signals.append(signal)
+
+        def _cleanup(s=signal):
+            try:
+                self._library_load_signals.remove(s)
+            except ValueError:
+                pass
+
+        signal.finished.connect(self._on_library_loaded)
+        signal.finished.connect(_cleanup)
+
+        library_manager = self.library_manager
+
+        def _worker():
+            try:
+                library_manager.refresh_from_network()
+            except Exception as e:
+                print(f"Library refresh error: {e}")
+            signal.finished.emit()
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _on_library_loaded(self):
         self._loading = False
-        self._library_thread = None
         # Retry the player warm-up now that real track URLs may be available
         # — on a fresh login (no local library cache yet) the earlier
         # timer-based attempt had nothing to warm the network path up with.
@@ -3091,35 +3290,98 @@ class MusicApp(QWidget):
             if self._state_restored and not self._nav_restored:
                 self._retry_nav_restore()
         else:
-            self._sidebar.load_account_content(liked=False, artists=[])
+            self._sidebar.load_account_content(liked=False, entries=[])
 
     def _fetch_player_data(self):
         if self._closing:
             return
-        if self._player_data_thread:
+
+        signal = _PlayerDataLoadSignal(self)
+        self._player_data_load_signals.append(signal)
+
+        def _cleanup(s=signal):
             try:
-                self._player_data_thread.quit()
-            except Exception:
+                self._player_data_load_signals.remove(s)
+            except ValueError:
                 pass
 
-        worker = _PlayerDataWorker(self._account_manager)
-        thread = QThread(QApplication.instance())
-        worker.moveToThread(thread)
-        worker.finished.connect(self._on_player_data_loaded)
-        worker.finished.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        thread.started.connect(worker.run)
-        thread.start()
-        self._player_data_thread = thread
+        signal.finished.connect(self._on_player_data_loaded)
+        signal.finished.connect(_cleanup)
+
+        account_manager = self._account_manager
+
+        def _worker():
+            try:
+                data = account_manager.fetch_player_data() or {}
+            except Exception:
+                data = {}
+            signal.finished.emit(data)
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _on_player_data_loaded(self, data: dict):
         self._liked_tracks = data.get("liked_tracks", []) or []
         self._subscriptions = data.get("subscriptions", []) or []
         self._album_subscriptions = data.get("album_subscriptions", []) or []
+        self._follow_order = data.get("follow_order", []) or []
+        self._apply_synced_settings(data.get("app_settings") or {})
         self._update_sidebar_from_account()
         if not self._state_restored:
             QTimer.singleShot(0, self._restore_ui_state)
+
+    def _apply_synced_settings(self, app_settings: dict):
+        """Merge settings synced from the server (account-wide, via
+        app_settings in player data) into local state — covers another
+        device having changed theme/volume/last-played-track/etc. since this
+        session's own _load_settings() read the local file. Restart-required
+        keys (theme/scale) only prompt if they actually differ from what's
+        already running here; everything else applies immediately (or, for
+        last_view_*/last_played_track, is simply picked up by the normal
+        _restore_ui_state() flow that runs right after this)."""
+        if not isinstance(app_settings, dict) or not app_settings:
+            return
+
+        needs_restart = any(
+            key in app_settings and app_settings[key] != self._settings.get(key)
+            for key in _RESTART_REQUIRED_SETTINGS_KEYS
+        )
+        new_accent = app_settings.get("accent_color")
+        accent_changed = bool(new_accent) and new_accent != self._settings.get("accent_color")
+
+        self._settings.update(
+            {k: v for k, v in app_settings.items() if k not in _LOCAL_ONLY_SETTINGS_KEYS}
+        )
+        try:
+            with open(APP_SETTINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(self._settings, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+        if accent_changed:
+            set_accent_color(new_accent)
+            self._refresh_accent_widgets()
+
+        if "volume" in app_settings:
+            vol = app_settings["volume"]
+            self._controls.set_volume(vol)
+            self.player.set_volume(vol)
+        if "shuffle" in app_settings:
+            enabled = bool(app_settings["shuffle"])
+            self.player.shuffle_enabled = enabled
+            self._controls.set_shuffle(enabled)
+        if app_settings.get("repeat") in ("off", "track", "album"):
+            self.player.repeat_mode = app_settings["repeat"]
+            self._controls.set_repeat(app_settings["repeat"])
+        if "discord_rpc" in app_settings:
+            enabled = bool(app_settings["discord_rpc"])
+            self._settings_page.set_discord_rpc_enabled(enabled)
+            if enabled and not self._discord_rpc and not self._discord_connecting:
+                QTimer.singleShot(200, self._init_discord_rpc)
+            elif not enabled and self._discord_rpc:
+                self._dispose_discord_rpc()
+
+        if needs_restart:
+            self._offer_restart()
 
     def _restore_ui_state(self):
         if self._state_restored:
@@ -3250,32 +3512,54 @@ class MusicApp(QWidget):
         library = self.library_manager.get_library()
         artist_index = {(a.get("artist") or "").strip(): a for a in library}
 
-        # Preserve subscription order (newest appended last → reverse = newest first)
-        followed_artists = []
-        for name in reversed(self._subscriptions):
-            artist_obj = artist_index.get((name or "").strip())
-            if artist_obj and artist_obj not in followed_artists:
-                followed_artists.append(artist_obj)
-
-        # Resolve album subscriptions in subscription order (newest last → reverse = newest first)
-        liked_albums: list[tuple] = []
-        for key in reversed(self._album_subscriptions):
-            parts = key.split("||", 1)
+        def resolve_album(album_key: str):
+            parts = album_key.split("||", 1)
             if len(parts) != 2:
-                continue
+                return None
             artist_name, album_title = parts[0].strip(), parts[1].strip()
             artist_obj = artist_index.get(artist_name)
             if not artist_obj:
-                continue
+                return None
             for al in artist_obj.get("albums", []):
                 if (al.get("title") or "").strip() == album_title:
-                    liked_albums.append((al, artist_obj))
-                    break
+                    return (al, artist_obj)
+            return None
+
+        # follow_order is the user's own custom drag-and-drop arrangement
+        # (mixing artists and albums freely), persisted via player data —
+        # filter it down to what's still actually subscribed, then append
+        # anything subscribed but missing from it (older data from before
+        # this existed, newest last) so nothing silently disappears.
+        subscribed_keys = {f"artist::{n}" for n in self._subscriptions}
+        subscribed_keys |= {f"album::{k}" for k in self._album_subscriptions}
+
+        ordered_keys = [k for k in self._follow_order if k in subscribed_keys]
+        known = set(ordered_keys)
+        for name in self._subscriptions:
+            k = f"artist::{name}"
+            if k not in known:
+                ordered_keys.append(k)
+                known.add(k)
+        for album_key in self._album_subscriptions:
+            k = f"album::{album_key}"
+            if k not in known:
+                ordered_keys.append(k)
+                known.add(k)
+        self._follow_order = ordered_keys
+
+        entries = []
+        for key in ordered_keys:
+            if key.startswith("artist::"):
+                artist_obj = artist_index.get(key[len("artist::"):])
+                if artist_obj:
+                    entries.append(("artist", artist_obj))
+            elif key.startswith("album::"):
+                resolved = resolve_album(key[len("album::"):])
+                if resolved:
+                    entries.append(("album", resolved))
 
         has_liked = bool(self._liked_tracks)
-        self._sidebar.load_account_content(
-            liked=has_liked, artists=followed_artists, albums=liked_albums
-        )
+        self._sidebar.load_account_content(liked=has_liked, entries=entries)
 
     def _player_data_cache_path(self) -> str:
         """Local player-data cache path for the currently logged-in account —
@@ -3309,32 +3593,36 @@ class MusicApp(QWidget):
             "liked_tracks": self._liked_tracks,
             "subscriptions": self._subscriptions,
             "album_subscriptions": self._album_subscriptions,
+            "follow_order": self._follow_order,
+            "app_settings": {
+                k: v for k, v in self._settings.items() if k not in _LOCAL_ONLY_SETTINGS_KEYS
+            },
         }
         full.update(updates)
         # Write to local cache immediately so next startup sees it right away
         self._write_local_player_data(full)
-        worker = _PlayerDataSaveWorker(self._account_manager, full)
-        thread = QThread(QApplication.instance())
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.finished.connect(thread.quit)
-        thread.finished.connect(lambda: self._cleanup_save_thread(thread, worker))
-        thread.start()
-        self._download_threads.append(thread)
 
-    def _cleanup_save_thread(self, thread: QThread, worker):
-        try:
-            self._download_threads.remove(thread)
-        except ValueError:
-            pass
-        try:
-            worker.deleteLater()
-        except Exception:
-            pass
-        try:
-            thread.deleteLater()
-        except Exception:
-            pass
+        signal = _PlayerDataSaveSignal(self)
+        self._player_data_save_signals.append(signal)
+
+        def _cleanup(s=signal):
+            try:
+                self._player_data_save_signals.remove(s)
+            except ValueError:
+                pass
+
+        signal.finished.connect(_cleanup)
+
+        account_manager = self._account_manager
+
+        def _worker():
+            try:
+                account_manager.save_player_data(full)
+            except Exception:
+                pass
+            signal.finished.emit()
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     # ── Player setup ──────────────────────────────────────────────────────────
 
@@ -3511,6 +3799,13 @@ class MusicApp(QWidget):
     def _on_sidebar_album_selected(self, album: dict, artist: dict):
         self._current_artist = artist
         self._navigate_to_album(album, artist)
+
+    def _on_sidebar_order_changed(self, new_order: list):
+        """User dragged an artist/album row to a new position in the
+        sidebar — persist the custom order (synced via player data, same as
+        likes/settings)."""
+        self._follow_order = list(new_order)
+        self._save_player_data_async({"follow_order": self._follow_order})
 
     def _on_album_selected(self, album: dict, artist: dict):
         self._navigate_to_album(album, artist)
@@ -3779,13 +4074,19 @@ class MusicApp(QWidget):
         artist_name = (self._current_artist or {}).get("artist", "")
         album_title = self._current_album.get("title", "")
         key = self._album_key(artist_name, album_title)
+        order_key = f"album::{key}"
         if key in self._album_subscriptions:
             self._album_subscriptions.remove(key)
+            if order_key in self._follow_order:
+                self._follow_order.remove(order_key)
             self._album_page.set_album_liked(False)
         else:
             self._album_subscriptions.append(key)
+            self._follow_order.insert(0, order_key)  # newest like goes on top, mixed in with artists
             self._album_page.set_album_liked(True)
-        self._save_player_data_async({"album_subscriptions": self._album_subscriptions})
+        self._save_player_data_async({
+            "album_subscriptions": self._album_subscriptions, "follow_order": self._follow_order,
+        })
         self._update_sidebar_from_account()
 
     def _on_artist_like_clicked(self):
@@ -3794,13 +4095,19 @@ class MusicApp(QWidget):
         artist_name = (self._current_artist.get("artist") or "").strip()
         if not artist_name:
             return
+        order_key = f"artist::{artist_name}"
         if artist_name in self._subscriptions:
             self._subscriptions.remove(artist_name)
+            if order_key in self._follow_order:
+                self._follow_order.remove(order_key)
             self._artist_page.set_liked(False)
         else:
             self._subscriptions.append(artist_name)
+            self._follow_order.insert(0, order_key)  # newest like goes on top, mixed in with albums
             self._artist_page.set_liked(True)
-        self._save_player_data_async({"subscriptions": self._subscriptions})
+        self._save_player_data_async({
+            "subscriptions": self._subscriptions, "follow_order": self._follow_order,
+        })
         self._update_sidebar_from_account()
 
     def _on_accent_changed(self, color: str):
@@ -3808,7 +4115,13 @@ class MusicApp(QWidget):
         # (SettingsPage used to write the file itself, which got clobbered
         # by the next _save_ui_state()/_save_settings() call elsewhere).
         self._save_ui_state(accent_color=color)
+        self._refresh_accent_widgets()
 
+    def _refresh_accent_widgets(self):
+        """Re-apply the (already-set via set_accent_color()) accent color to
+        every widget that has its own color baked in — split out from
+        _on_accent_changed so a synced accent from another device (see
+        _apply_synced_settings) can reuse it without re-triggering a save."""
         self._controls.apply_accent()
         self._album_page.apply_accent()
         self._artist_page.apply_accent()
@@ -3825,7 +4138,7 @@ class MusicApp(QWidget):
         app = QApplication.instance()
         if app:
             palette = app.palette()
-            palette.setColor(QPalette.ColorRole.Highlight, QColor(color))
+            palette.setColor(QPalette.ColorRole.Highlight, QColor(c["PRIMARY"]))
             app.setPalette(palette)
 
     def _on_theme_changed(self, mode: str):
@@ -4242,13 +4555,10 @@ class MusicApp(QWidget):
                 self._search_thread.wait(500)
             except Exception:
                 pass
-        for t in (self._library_thread, self._player_data_thread):
-            if t:
-                try:
-                    t.quit()
-                    t.wait(300)
-                except Exception:
-                    pass
+        # Library refresh / player-data load+save all run on daemon threads
+        # (see _LibraryLoadSignal) — nothing to wait on, they can't block or
+        # crash process exit, and _closing (set above) stops their callbacks
+        # from touching the now-tearing-down UI if they finish after this.
         self._album_page._stop_duration_loader()
         for t in list(_dying_threads):
             try:
