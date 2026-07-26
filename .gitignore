@@ -1,0 +1,13 @@
+# Runtime user data — local cache, saved login credentials, settings.
+# Never commit this: data/login.json stores the saved account password.
+data/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# PyInstaller build output
+build/
+dist/

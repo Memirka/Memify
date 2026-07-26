@@ -1,0 +1,6 @@
+PyQt6==6.11.0
+PyQt6-Qt6==6.11.1
+PyQt6_sip==13.11.1
+requests==2.34.2
+pynput==1.8.2
+pypresence==4.6.2
