@@ -1,6 +1,8 @@
+import os
 import random
 from PyQt6.QtCore import QObject, pyqtSignal, QTimer, QUrl
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput, QMediaDevices
+from config import PLAYER_WARMUP_SOUND
 from utils.format_utils import clean_title, format_duration
 
 
@@ -34,6 +36,9 @@ class PlayerController(QObject):
 
         self.timer = QTimer()
         self.timer.setInterval(500)
+
+        self._warmup_player = None
+        self._warmup_output = None
 
         self.on_track_changed = None
         self.on_playback_state_changed = None
@@ -126,6 +131,67 @@ class PlayerController(QObject):
             return False
 
     # ── Playback control ──────────────────────────────────────────────────────
+
+    def warm_up(self, remote_url: str | None = None):
+        """Force the platform media backend to fully initialize now, instead
+        of on the very first real play_track() call. The first-ever
+        setSource()+play() on a QMediaPlayer pays a one-time cold-start cost
+        that blocks the main thread for a couple of seconds — every play
+        after that reuses the already-initialized pipeline and is fast.
+        Doing that cold start at startup, while the user is still looking at
+        their library, moves that freeze off of their first real click.
+
+        A local file (fallback when no remote_url is available yet, e.g.
+        library still loading) only warms up the generic decoder/audio-device
+        pipeline — it does NOT touch FFmpeg's network/HTTP protocol stack
+        (DNS, TLS, connection setup), which is a separate subsystem that
+        only gets initialized on the first *network* source. Since real
+        tracks are always streamed from the server, that network stack's own
+        cold start was still happening on the user's first real click even
+        with the local-file warmup in place — pass a real track URL here
+        (any track's URL, content doesn't matter) once one is known, so this
+        warms up the actual code path play_track() will use.
+
+        Uses its own throwaway QMediaPlayer/QAudioOutput instead of the real
+        self.player/self.audio_output. A previous version reused the real
+        ones and only ran if nothing was playing yet (to avoid hijacking a
+        real track's source) — but that meant a user who clicked play
+        quickly got no warmup at all and hit the exact freeze this is meant
+        to avoid. A separate instance can run unconditionally, as early as
+        possible, with zero risk of ever touching real playback — the
+        expensive part (backend/codec/network-stack init) is one-time,
+        process-wide setup that a throwaway player pays for just as well.
+        """
+        if remote_url:
+            source = QUrl(remote_url)
+        elif os.path.exists(PLAYER_WARMUP_SOUND):
+            source = QUrl.fromLocalFile(PLAYER_WARMUP_SOUND)
+        else:
+            return
+        try:
+            player = QMediaPlayer(self)
+            output = QAudioOutput(self)
+            output.setMuted(True)
+            output.setVolume(0.0)
+            player.setAudioOutput(output)
+            player.setSource(source)
+            player.play()
+            # Keep them alive until cleanup — nothing else references them.
+            self._warmup_player = player
+            self._warmup_output = output
+
+            def cleanup():
+                try:
+                    player.stop()
+                    player.setSource(QUrl())
+                except Exception:
+                    pass
+                self._warmup_player = None
+                self._warmup_output = None
+
+            QTimer.singleShot(600, cleanup)
+        except Exception:
+            pass
 
     def set_album(self, album: dict, artist: dict):
         self.current_playing_album = album

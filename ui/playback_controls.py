@@ -2,7 +2,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QSlider, QSizePolicy,
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QSize, QTimer, QPoint
+from PyQt6.QtCore import Qt, pyqtSignal, QSize, QTimer, QPoint, QRectF
 from PyQt6.QtCore import QPropertyAnimation, QSequentialAnimationGroup, QPauseAnimation
 from PyQt6.QtGui import QFont, QCursor, QPixmap, QPainter, QPainterPath, QColor, QBrush, QFontMetrics
 
@@ -14,15 +14,18 @@ from utils.image_utils import make_rounded_pixmap
 class ClickableLabel(QLabel):
     clicked = pyqtSignal()
 
-    def __init__(self, text: str = "", parent=None):
+    def __init__(self, text: str = "", primary: bool = False, parent=None):
         super().__init__(text, parent)
+        self._primary = primary
         self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self._update_style()
 
     def _update_style(self):
+        c = styles_module.COLORS
+        base = c["TEXT_PRIMARY"] if self._primary else c["TEXT_SECONDARY"]
         self.setStyleSheet(
-            "QLabel { color: #B3B3B3; padding: 0; margin: 0; border: none; }"
-            "QLabel:hover { color: #FFFFFF; text-decoration: underline; }"
+            f"QLabel {{ color: {base}; padding: 0; margin: 0; border: none; }}"
+            f"QLabel:hover {{ color: {c['TEXT_PRIMARY']}; text-decoration: underline; }}"
         )
 
     def mousePressEvent(self, event):
@@ -35,14 +38,14 @@ class MarqueeLabel(QWidget):
     """Sliding marquee label for long text."""
     clicked = pyqtSignal()
 
-    def __init__(self, text: str = "", parent=None):
+    def __init__(self, text: str = "", primary: bool = False, parent=None):
         super().__init__(parent)
         self._speed = 50.0
         self._start_pause = 600
         self._edge_pause = 700
         self._threshold = 6
 
-        self._label = ClickableLabel(text, self)
+        self._label = ClickableLabel(text, primary=primary, parent=self)
         self._label.clicked.connect(self.clicked.emit)
         self._label.setWordWrap(False)
         self._label.move(0, 0)
@@ -277,14 +280,36 @@ class ClickableSlider(QSlider):
 
 
 class _CircleButton(QPushButton):
-    """Round play/pause button with pixel-perfect centered text via paintEvent."""
+    """Round play/pause button with a hand-drawn, precisely centered icon.
 
-    def __init__(self, text: str = "", parent=None):
-        super().__init__(text, parent)
+    Went through two failed attempts before this one: drawing the "▶"
+    character (font metrics center inconsistently), then centering a
+    hand-drawn triangle's centroid instead of its bounding box (overcorrected
+    the other way). Both were actually verified with pixel measurements and
+    still came out visibly off — the real bug was more basic: QRect.center()
+    rounds DOWN for even widths/heights (QRect(0,0,40,40).center() == (19,19),
+    not (20,20), because QRect treats its bottom-right corner as inside the
+    rect). Every shape below was being centered on that rounded-down point
+    while the circle itself (drawEllipse, which uses the rect's true outer
+    bounds) rendered centered on the real (20,20) — a systematic ~1px
+    top-left bias on every glyph, on top of whatever centering math is used.
+    Building everything from a QRectF instead avoids this: QRectF.center()
+    returns the true (20.0, 20.0), no rounding.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__("", parent)
         self._hovered = False
+        self._playing = False
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setStyleSheet("background: transparent; border: none;")
+
+    def set_playing(self, playing: bool):
+        playing = bool(playing)
+        if self._playing != playing:
+            self._playing = playing
+            self.update()
 
     def enterEvent(self, event):
         self._hovered = True
@@ -299,20 +324,103 @@ class _CircleButton(QPushButton):
     def paintEvent(self, _event):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        r = self.rect()
+        rf = QRectF(self.rect())
         c = styles_module.COLORS
         bg = QColor(c["TEXT_SECONDARY"] if self._hovered else c["TEXT_PRIMARY"])
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QBrush(bg))
-        p.drawEllipse(r)
-        p.setPen(QColor("#000000"))
+        p.drawEllipse(rf)
+
+        # BACKGROUND is always the theme's max-contrast counterpart to
+        # TEXT_PRIMARY/TEXT_SECONDARY (the circle's fill), in both dark and
+        # light themes — a hardcoded black glyph would go invisible on a
+        # near-black light-theme circle.
+        p.setBrush(QBrush(QColor(c["BACKGROUND"])))
+        center = rf.center()
+        cx, cy = center.x(), center.y()
+        size = min(rf.width(), rf.height()) * 0.34
+
+        if self._playing:
+            bar_w = size * 0.34
+            gap = size * 0.32
+            bar_h = size * 1.15
+            for dx in (-(gap / 2 + bar_w / 2), gap / 2 + bar_w / 2):
+                p.drawRoundedRect(
+                    QRectF(cx + dx - bar_w / 2, cy - bar_h / 2, bar_w, bar_h), 1.0, 1.0
+                )
+        else:
+            h = size * 1.15
+            w = h * 0.87
+            path = QPainterPath()
+            path.moveTo(0, 0)
+            path.lineTo(0, h)
+            path.lineTo(w, h / 2)
+            path.closeSubpath()
+            # True bbox-centering (offset=0 below) measures as dead center,
+            # but reads as slightly left-leaning — the flat left edge is a
+            # hard vertical line while the right side tapers to a point, so
+            # the eye expects a bit more room on the right. A small optical
+            # nudge right fixes that without reintroducing the ~17%-of-width
+            # overcorrection the earlier centroid-based attempt had.
+            optical_nudge = w * 0.12
+            path.translate(cx - w / 2 + optical_nudge, cy - h / 2)
+            p.drawPath(path)
+        p.end()
+
+
+class _GlyphButton(QPushButton):
+    """Flat icon button with pixel-perfect centered text via paintEvent.
+
+    Plain QPushButton text rendering centers glyphs using font-line metrics,
+    which vary per glyph/font/platform — "⇄", "◀◀", "▶▶" and "↻" each ended
+    up sitting at slightly different vertical/horizontal offsets, so the row
+    looked unevenly aligned (worse on Windows, whose default fonts differ
+    from Linux). Centering by tightBoundingRect instead — the same technique
+    already used for the play/pause circle — centers each glyph's actual ink
+    within the button, regardless of font metrics.
+    """
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(text, parent)
+        self._hovered = False
+        self._active = False
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setStyleSheet("background: transparent; border: none;")
+
+    def set_active(self, active: bool):
+        active = bool(active)
+        if self._active != active:
+            self._active = active
+            self.update()
+
+    def enterEvent(self, event):
+        self._hovered = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hovered = False
+        self.update()
+        super().leaveEvent(event)
+
+    def setChecked(self, checked):
+        super().setChecked(checked)
+        self.update()
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        c = styles_module.COLORS
+        active = self._active or (self.isCheckable() and self.isChecked())
+        color = QColor(c["PRIMARY"] if (active or self._hovered) else c["TEXT_PRIMARY"])
+        p.setPen(color)
         f = self.font()
-        f.setPointSize(14)
-        f.setBold(True)
         p.setFont(f)
         text = self.text()
         fm = QFontMetrics(f)
         tb = fm.tightBoundingRect(text)
+        r = self.rect()
         cx = r.x() + r.width() / 2
         cy = r.y() + r.height() / 2
         x = int(cx - tb.x() - tb.width() / 2)
@@ -397,7 +505,7 @@ class PlaybackControls(QWidget):
         text_layout.setSpacing(4)
         text_layout.setContentsMargins(0, 0, 0, 0)
 
-        self.track_title = MarqueeLabel("Нет трека")
+        self.track_title = MarqueeLabel("Нет трека", primary=True)
         self.track_title.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
         self.track_title.clicked.connect(self._on_album_clicked)
         text_layout.addWidget(self.track_title)
@@ -447,43 +555,35 @@ class PlaybackControls(QWidget):
         btn_row.setAlignment(Qt.AlignmentFlag.AlignCenter)
         btn_row.setContentsMargins(0, 0, 0, 0)
 
-        c = styles_module.COLORS
-        btn_style = (
-            f"QPushButton {{ background: transparent; border: none; color: {c['TEXT_SECONDARY']}; font-size: 18px; }}"
-            f"QPushButton:hover {{ color: {c['TEXT_PRIMARY']}; }}"
-            f"QPushButton:checked {{ color: {c['PRIMARY']}; }}"
-        )
-        self.shuffle_btn = QPushButton("⇄")
+        icon_font = QFont("Segoe UI", 13)
+
+        self.shuffle_btn = _GlyphButton("⇄")
+        self.shuffle_btn.setFont(icon_font)
         self.shuffle_btn.setFixedSize(32, 32)
         self.shuffle_btn.setCheckable(True)
-        self.shuffle_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.shuffle_btn.setStyleSheet(btn_style)
         self.shuffle_btn.setToolTip("Перемешать")
         btn_row.addWidget(self.shuffle_btn)
 
-        self.prev_btn = QPushButton("⏮")
+        self.prev_btn = _GlyphButton("◀◀")
+        self.prev_btn.setFont(icon_font)
         self.prev_btn.setFixedSize(32, 32)
-        self.prev_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.prev_btn.setStyleSheet(btn_style)
         self.prev_btn.setToolTip("Назад")
         btn_row.addWidget(self.prev_btn)
 
-        self.play_btn = _CircleButton("▶")
+        self.play_btn = _CircleButton()
         self.play_btn.setFixedSize(40, 40)
         self.play_btn.setToolTip("Пауза / Воспроизведение")
         btn_row.addWidget(self.play_btn)
 
-        self.next_btn = QPushButton("⏭")
+        self.next_btn = _GlyphButton("▶▶")
+        self.next_btn.setFont(icon_font)
         self.next_btn.setFixedSize(32, 32)
-        self.next_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.next_btn.setStyleSheet(btn_style)
         self.next_btn.setToolTip("Далее")
         btn_row.addWidget(self.next_btn)
 
-        self.repeat_btn = QPushButton("↻")
+        self.repeat_btn = _GlyphButton("↻")
+        self.repeat_btn.setFont(icon_font)
         self.repeat_btn.setFixedSize(32, 32)
-        self.repeat_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.repeat_btn.setStyleSheet(btn_style)
         self.repeat_btn.setToolTip("Повтор")
         btn_row.addWidget(self.repeat_btn)
 
@@ -565,12 +665,15 @@ class PlaybackControls(QWidget):
         self.setStyleSheet(
             f"PlaybackControls {{ background-color: {c['SURFACE']}; border-top: 1px solid {c['BORDER']}; }}"
         )
-        # Refresh shuffle checked state style
-        self.shuffle_btn.setStyleSheet(
-            f"QPushButton {{ background: transparent; border: none; color: {c['TEXT_SECONDARY']}; font-size: 18px; }}"
-            f"QPushButton:hover {{ color: {c['TEXT_PRIMARY']}; }}"
-            f"QPushButton:checked {{ color: {c['PRIMARY']}; }}"
-        )
+        self.track_title._label._update_style()
+        self.album_label._label._update_style()
+        for chip_layout_idx in range(self.artist_row.layout().count()):
+            item = self.artist_row.layout().itemAt(chip_layout_idx)
+            w = item.widget() if item else None
+            if isinstance(w, ClickableLabel):
+                w._update_style()
+        for btn in (self.shuffle_btn, self.prev_btn, self.next_btn, self.repeat_btn):
+            btn.update()
 
     def apply_accent(self):
         """Re-apply styles after accent color change."""
@@ -616,7 +719,9 @@ class PlaybackControls(QWidget):
             if i < len(names) - 1:
                 sep = QLabel(", ")
                 sep.setFont(QFont("Segoe UI", 9))
-                sep.setStyleSheet("QLabel { color: #B3B3B3; padding: 0; margin: 0; border: none; }")
+                sep.setStyleSheet(
+                    f"QLabel {{ color: {styles_module.COLORS['TEXT_SECONDARY']}; padding: 0; margin: 0; border: none; }}"
+                )
                 layout.addWidget(sep)
                 sep.show()
 
@@ -634,7 +739,7 @@ class PlaybackControls(QWidget):
 
     def set_playing(self, is_playing: bool):
         self._is_playing = is_playing
-        self.play_btn.setText("⏸" if is_playing else "▶")
+        self.play_btn.set_playing(is_playing)
 
     def update_position(self, position_ms: int, duration_ms: int):
         if self._slider_down:
@@ -655,12 +760,7 @@ class PlaybackControls(QWidget):
         self._repeat_mode = mode
         icons = {"off": "↻", "album": "↻", "track": "↺"}
         self.repeat_btn.setText(icons.get(mode, "↻"))
-        c = styles_module.COLORS
-        color = c["PRIMARY"] if mode != "off" else c["TEXT_SECONDARY"]
-        self.repeat_btn.setStyleSheet(
-            f"QPushButton {{ background: transparent; border: none; color: {color}; font-size: 16px; }}"
-            f"QPushButton:hover {{ color: {c['TEXT_PRIMARY']}; }}"
-        )
+        self.repeat_btn.set_active(mode != "off")
 
     def set_like_state(self, liked: bool, enabled: bool = True):
         self._like_state = liked

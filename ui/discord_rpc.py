@@ -576,12 +576,24 @@ class DiscordRPC:
 
     def disconnect(self):
         """Закрывает соединение с Discord RPC."""
+        # pypresence opens its own asyncio event loop per connection. If
+        # rpc.close() raises partway through (e.g. the Discord IPC socket
+        # was already gone), the loop can end up abandoned — Python then
+        # prints a harmless-but-noisy "Exception ignored ... Invalid file
+        # descriptor" from its __del__ at garbage-collection time. Grab the
+        # loop up front and force-close it ourselves regardless.
+        loop = getattr(self.rpc, "loop", None) if self.rpc else None
         try:
             if self.rpc:
                 self.rpc.close()
         except Exception:
             pass
         finally:
+            try:
+                if loop is not None and not loop.is_closed():
+                    loop.close()
+            except Exception:
+                pass
             self.rpc = None
             self.connected = False
             try:

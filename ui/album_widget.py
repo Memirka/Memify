@@ -5,7 +5,7 @@ from PyQt6.QtGui import QFont, QPixmap, QFontMetrics
 from utils.format_utils import clean_title
 from utils.image_utils import make_rounded_pixmap
 from .shimmer_placeholder import ShimmerLabel
-from .styles import ALBUM_WIDGET_STYLE
+from .styles import COLORS, get_album_widget_style
 
 
 class AlbumWidget(QWidget):
@@ -25,7 +25,7 @@ class AlbumWidget(QWidget):
 
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setObjectName("albumCard")
-        self.setStyleSheet(ALBUM_WIDGET_STYLE)
+        self.setStyleSheet(get_album_widget_style())
         self.setFixedWidth(self._widget_size)
 
         root = QVBoxLayout(self)
@@ -35,8 +35,8 @@ class AlbumWidget(QWidget):
         self.cover_label = ShimmerLabel(
             objectName="cover",
             radius=self._cover_radius,
-            base_color="#262626",
-            highlight_color="#3A3A3A",
+            base_color=COLORS["SURFACE_LIGHT"],
+            highlight_color=COLORS["SURFACE_HOVER"],
         )
         self.cover_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.cover_label.setFixedSize(self._cover_size, self._cover_size)
@@ -51,7 +51,7 @@ class AlbumWidget(QWidget):
         self.title_label.setWordWrap(True)
         font = QFont("Segoe UI", 9, QFont.Weight.Medium)
         self.title_label.setFont(font)
-        self.title_label.setStyleSheet(f"color: #FFFFFF; background: transparent;")
+        self.title_label.setStyleSheet(f"color: {COLORS['TEXT_PRIMARY']}; background: transparent;")
         fm = QFontMetrics(font)
         self.title_label.setMaximumHeight(fm.height() * 2 + 4)
         self.title_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)

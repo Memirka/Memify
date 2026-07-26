@@ -48,6 +48,9 @@ COVER_CACHE_MAX_FILES = 2000
 ASSETS_DIR = os.path.join(BASE_DIR, "assets")
 ICONS_DIR = os.path.join(ASSETS_DIR, "icons")
 IMAGES_DIR = os.path.join(ASSETS_DIR, "images")
+SOUNDS_DIR = os.path.join(ASSETS_DIR, "sounds")
+
+PLAYER_WARMUP_SOUND = os.path.join(SOUNDS_DIR, "memify.wav")
 
 APP_ICON_ICO = os.path.join(ICONS_DIR, "memify.ico")
 APP_ICON_PNG = os.path.join(ICONS_DIR, "memify.png")

@@ -2,14 +2,44 @@
 
 import sys
 import os
+import json
 
 sys.path.insert(0, os.path.dirname(__file__))
 
+from config import APP_ICON, DATA_DIR, APP_SETTINGS_FILE
+
+
+def _load_saved_ui_scale() -> float:
+    """Read the saved UI scale directly from disk, before QApplication exists —
+    Qt only picks up QT_SCALE_FACTOR if it's set before the app is created."""
+    try:
+        if os.path.exists(APP_SETTINGS_FILE):
+            with open(APP_SETTINGS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            scale = float(data.get("ui_scale", 1.0))
+            if 0.5 <= scale <= 3.0:
+                return scale
+    except Exception:
+        pass
+    return 1.0
+
+
+_saved_scale = _load_saved_ui_scale()
+if _saved_scale != 1.0:
+    os.environ["QT_SCALE_FACTOR"] = str(_saved_scale)
+
 from PyQt6.QtWidgets import QApplication, QWidget, QStackedLayout
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QIcon, QPalette, QColor
+from PyQt6.QtGui import QIcon, QGuiApplication
 
-from config import APP_ICON, DATA_DIR
+# Qt6's default high-DPI rounding policy snaps a manual QT_SCALE_FACTOR like
+# 1.25/1.5 to the nearest "clean" factor, which is exactly why non-100% presets
+# can look subtly off (uneven padding, slightly wrong sizes) while 100% looks
+# fine. PassThrough uses the requested factor exactly, with no rounding.
+QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
+    Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+)
+
 from core.account import AccountManager
 from ui.auth_widget import AuthWidget
 from ui.splash_screen import SplashScreen
@@ -17,20 +47,7 @@ import ui.styles as styles_module
 
 
 def _apply_dark_palette(app: QApplication):
-    c = styles_module.COLORS
-    palette = QPalette()
-    palette.setColor(QPalette.ColorRole.Window, QColor(c["BACKGROUND"]))
-    palette.setColor(QPalette.ColorRole.WindowText, QColor(c["TEXT_PRIMARY"]))
-    palette.setColor(QPalette.ColorRole.Base, QColor(c["SURFACE"]))
-    palette.setColor(QPalette.ColorRole.AlternateBase, QColor(c["SURFACE"]))
-    palette.setColor(QPalette.ColorRole.ToolTipBase, QColor(c["SURFACE_LIGHT"]))
-    palette.setColor(QPalette.ColorRole.ToolTipText, QColor(c["TEXT_PRIMARY"]))
-    palette.setColor(QPalette.ColorRole.Text, QColor(c["TEXT_PRIMARY"]))
-    palette.setColor(QPalette.ColorRole.Button, QColor(c["SURFACE"]))
-    palette.setColor(QPalette.ColorRole.ButtonText, QColor(c["TEXT_PRIMARY"]))
-    palette.setColor(QPalette.ColorRole.Highlight, QColor(c["PRIMARY"]))
-    palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#000000"))
-    app.setPalette(palette)
+    styles_module.apply_palette(app)
 
 
 class AppWindow(QWidget):

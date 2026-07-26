@@ -7,8 +7,10 @@ Switching pages = setCurrentWidget() with no layout rebuild.
 
 import os
 import re
+import sys
 import json
 import time
+import threading
 from functools import partial
 
 from PyQt6.QtWidgets import (
@@ -21,9 +23,9 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import (
     Qt, QTimer, QThread, QUrl, QSize, QRectF, pyqtSignal, pyqtSlot, QObject, QPoint, QPointF,
-    QPropertyAnimation, pyqtProperty,
+    QPropertyAnimation, pyqtProperty, QEasingCurve,
 )
-from PyQt6.QtGui import QFont, QColor, QPalette, QIcon, QPixmap, QFontMetrics, QCursor, QPainter, QPainterPath
+from PyQt6.QtGui import QFont, QColor, QPalette, QIcon, QPixmap, QFontMetrics, QCursor, QPainter, QPainterPath, QPen, QBrush
 
 from config import SERVER_URL, APP_ICON, ICONS_DIR, APP_SETTINGS_FILE, PLAYER_DATA_CACHE_DIR, LIBRARY_CACHE_FILE, WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT, DATA_DIR
 from core.library import LibraryManager, SearchResult
@@ -36,7 +38,7 @@ from ui.playback_controls import PlaybackControls, ClickableLabel
 from ui.album_widget import AlbumWidget
 from ui.shimmer_placeholder import ShimmerLabel
 import ui.styles as styles_module
-from ui.styles import COLORS, SCROLLBAR_STYLE, set_accent_color
+from ui.styles import COLORS, get_scrollbar_style, set_accent_color, set_theme, get_theme
 from utils.format_utils import clean_title, clean_artist_name, format_duration, normalize_track_url
 from utils.image_utils import make_rounded_pixmap, load_pixmap_from_url
 from utils.cover_cache import cover_cache, cache_key
@@ -217,7 +219,7 @@ class AlbumGridWidget(QWidget):
         self._scroll.setWidgetResizable(True)
         self._scroll.setFrameShape(QFrame.Shape.NoFrame)
         self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self._scroll.setStyleSheet(SCROLLBAR_STYLE)
+        self._scroll.setStyleSheet(get_scrollbar_style())
 
         self._container = QWidget()
         self._grid = QGridLayout(self._container)
@@ -637,8 +639,8 @@ class TrackRow(QWidget):
 
     def contextMenuEvent(self, event):
         menu = QMenu(self)
-        dl_track = menu.addAction("⬇  Скачать трек")
-        dl_album = menu.addAction("⬇  Скачать альбом")
+        dl_track = menu.addAction("↓  Скачать трек")
+        dl_album = menu.addAction("↓  Скачать альбом")
         action = menu.exec(event.globalPos())
         if action == dl_track:
             self.download_requested.emit(self._index)
@@ -689,7 +691,9 @@ class AlbumPage(QWidget):
         )
         self._cover_label.mousePressEvent = lambda e: (
             self.cover_clicked.emit(self._current_album, self._current_artist)
-            if e.button() == Qt.MouseButton.LeftButton and self._current_album.get("cover")
+            if e.button() == Qt.MouseButton.LeftButton
+            and self._current_album.get("cover")
+            and not self._current_album.get("_is_liked_album")
             else None
         )
         header_row.addWidget(self._cover_label, 0, Qt.AlignmentFlag.AlignVCenter)
@@ -752,7 +756,7 @@ class AlbumPage(QWidget):
         btn_row.setSpacing(8)
         btn_row.addWidget(self._play_all_btn)
 
-        dl_btn = QPushButton("⬇ Скачать альбом")
+        dl_btn = QPushButton("↓ Скачать альбом")
         dl_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         dl_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         dl_btn.setFixedHeight(36)
@@ -803,7 +807,7 @@ class AlbumPage(QWidget):
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
         self._scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self._scroll.setStyleSheet(SCROLLBAR_STYLE)
+        self._scroll.setStyleSheet(get_scrollbar_style())
         self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
         self._tracks_container = QWidget()
@@ -850,13 +854,28 @@ class AlbumPage(QWidget):
         self._current_artist = artist
         self._stop_duration_loader()
 
+        is_liked_album = bool(album.get("_is_liked_album"))
+
         album_name = clean_title(album.get("title", "")) or "Неизвестно"
         artist_name = clean_artist_name(artist.get("artist", "")) or ""
         tracks = album.get("tracks", []) or []
 
         self._album_name_label.setText(album_name)
-        names = display_artist_names if display_artist_names else ([artist_name] if artist_name else [])
+        # The "liked tracks" virtual album isn't a real album and has no
+        # real artist — showing the "Альбом" type label and an artist chip
+        # that just reads "Неизвестно" (clean_artist_name's fallback for an
+        # empty name) is pure noise here, so both are hidden for it.
+        self._type_label.setVisible(not is_liked_album)
+        names = [] if is_liked_album else (
+            display_artist_names if display_artist_names else ([artist_name] if artist_name else [])
+        )
         self._set_artist_names(names)
+
+        self._cover_label.setCursor(
+            Qt.CursorShape.ArrowCursor if is_liked_album else Qt.CursorShape.PointingHandCursor
+        )
+        self._cover_label.setToolTip("" if is_liked_album else "Открыть обложку")
+
         count = len(tracks)
         self._track_count_label.setText(
             f"{count} трек" if count == 1 else
@@ -883,7 +902,6 @@ class AlbumPage(QWidget):
         self._clear_tracks()
         self._scroll.verticalScrollBar().setValue(0)
 
-        is_liked_album = bool(album.get("_is_liked_album"))
         discs = album.get("discs") or []
         show_disc_headers = len(discs) > 1
         disc_titles = {d.get("number"): d.get("title") for d in discs}
@@ -1177,7 +1195,7 @@ class CoverViewerOverlay(QWidget):
         self._caption_label.setStyleSheet("color: #FFFFFF; font: 600 12pt 'Segoe UI'; background: transparent;")
         center.addWidget(self._caption_label)
 
-        self._download_btn = QPushButton("⬇  Скачать обложку")
+        self._download_btn = QPushButton("↓  Скачать обложку")
         self._download_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._download_btn.setFixedHeight(38)
         self._download_btn.setEnabled(False)
@@ -1315,6 +1333,8 @@ class _SpinningDisc(QWidget):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self._pixmap: QPixmap | None = None
+        self._backdrop: QPixmap | None = None
+        self._backdrop_offset = QPoint(0, 0)
         self._angle = 0.0
         self._anim = QPropertyAnimation(self, b"angle", self)
         self._anim.setStartValue(0.0)
@@ -1333,6 +1353,14 @@ class _SpinningDisc(QWidget):
 
     def set_pixmap(self, pm: QPixmap | None):
         self._pixmap = pm
+        self.update()
+
+    def set_backdrop(self, pixmap: QPixmap | None, offset: QPoint):
+        """Backdrop image (and this disc's position within it), used to make
+        the spindle hole show what's behind the disc instead of a flat
+        color."""
+        self._backdrop = pixmap
+        self._backdrop_offset = offset
         self.update()
 
     def start_spin(self):
@@ -1370,16 +1398,31 @@ class _SpinningDisc(QWidget):
         y = (side - scaled.height()) / 2.0
         painter.drawPixmap(int(x), int(y), scaled)
 
-        # Punch a spindle hole through the middle, like a real record/CD —
-        # cleared to full transparency so the blurred backdrop shows through.
+        # Punch a spindle hole through the middle, like a real record/CD.
+        # CompositionMode_Clear only produces real transparency on a surface
+        # with an alpha channel — this widget is a plain (non-top-level)
+        # child painting into its ancestor's opaque backing store, so
+        # "clearing" here just wrote solid black instead of a see-through
+        # hole. Since the disc spins around its own center, the hole always
+        # lands at the widget's exact center regardless of rotation — reset
+        # the transform and paint the matching crop of the overlay's
+        # backdrop image there instead, so it looks like a real hole.
+        painter.resetTransform()
         painter.setClipping(False)
-        center = QPointF(side / 2.0, side / 2.0)
+        center = QPointF(self.width() / 2.0, self.height() / 2.0)
         hole_r = max(6.0, side * 0.07)
-        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(Qt.GlobalColor.black)
-        painter.drawEllipse(center, hole_r, hole_r)
-        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+        hole_rect = QRectF(center.x() - hole_r, center.y() - hole_r, hole_r * 2, hole_r * 2)
+        if self._backdrop and not self._backdrop.isNull():
+            src_rect = hole_rect.translated(self._backdrop_offset.x(), self._backdrop_offset.y())
+            hole_path = QPainterPath()
+            hole_path.addEllipse(center, hole_r, hole_r)
+            painter.setClipPath(hole_path)
+            painter.drawPixmap(hole_rect, self._backdrop, src_rect)
+            painter.setClipping(False)
+        else:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(10, 10, 12, 220))
+            painter.drawEllipse(center, hole_r, hole_r)
 
         # Thin rim around the hole for a bit of definition.
         painter.setPen(QColor(255, 255, 255, 60))
@@ -1430,6 +1473,7 @@ class NowPlayingDiscOverlay(QWidget):
         side = max(160, int(min(self.width(), self.height()) * 0.55))
         self._disc.setFixedSize(side, side)
         self._disc.move((self.width() - side) // 2, (self.height() - side) // 2)
+        self._disc.set_backdrop(self._backdrop_pixmap, self._disc.pos())
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -1478,6 +1522,56 @@ class NowPlayingDiscOverlay(QWidget):
             self._disc.stop_spin()
 
 
+class _LoadingSpinner(QWidget):
+    """Small rotating arc spinner for inline loading states."""
+
+    def __init__(self, parent=None, diameter: int = 20, line_width: int = 3):
+        super().__init__(parent)
+        self._diameter = diameter
+        self._line_width = line_width
+        self.setFixedSize(diameter, diameter)
+        self._angle = 0.0
+        self._anim = QPropertyAnimation(self, b"angle", self)
+        self._anim.setStartValue(0.0)
+        self._anim.setEndValue(360.0)
+        self._anim.setDuration(900)
+        self._anim.setLoopCount(-1)
+        self.hide()
+
+    def _get_angle(self):
+        return self._angle
+
+    def _set_angle(self, value):
+        self._angle = float(value)
+        self.update()
+
+    angle = pyqtProperty(float, fget=_get_angle, fset=_set_angle)
+
+    def start(self):
+        self.show()
+        if self._anim.state() != QPropertyAnimation.State.Running:
+            self._anim.start()
+
+    def stop(self):
+        self._anim.stop()
+        self.hide()
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        c = styles_module.COLORS
+        pen = QPen(QColor(c["PRIMARY"]))
+        pen.setWidth(self._line_width)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        half = self._line_width / 2.0
+        rect = QRectF(half, half, self._diameter - self._line_width, self._diameter - self._line_width)
+        span = 100 * 16
+        start = int(-self._angle * 16)
+        p.drawArc(rect, start, span)
+        p.end()
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Search page
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1491,6 +1585,7 @@ class SearchPage(QWidget):
         self._results: list[SearchResult] = []
         self._runners: list = []
         self._track_title_labels: list[tuple] = []  # (title_lbl, url_rel)
+        self._loading = False
         self._build_ui()
 
     def _build_ui(self):
@@ -1503,14 +1598,21 @@ class SearchPage(QWidget):
         hdr.setStyleSheet(f"color: {COLORS['TEXT_PRIMARY']};")
         layout.addWidget(hdr, 0)
 
+        status_row = QHBoxLayout()
+        status_row.setContentsMargins(0, 0, 0, 0)
+        status_row.setSpacing(8)
+        self._spinner = _LoadingSpinner(self)
+        status_row.addWidget(self._spinner)
         self._count_label = QLabel("")
         self._count_label.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']}; font: 9pt 'Segoe UI';")
-        layout.addWidget(self._count_label, 0)
+        status_row.addWidget(self._count_label)
+        status_row.addStretch(1)
+        layout.addLayout(status_row)
 
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
         self._scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self._scroll.setStyleSheet(SCROLLBAR_STYLE)
+        self._scroll.setStyleSheet(get_scrollbar_style())
         self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
         self._results_container = QWidget()
@@ -1522,7 +1624,16 @@ class SearchPage(QWidget):
         self._scroll.setWidget(self._results_container)
         layout.addWidget(self._scroll, 1)
 
+    def set_loading(self, loading: bool):
+        self._loading = loading
+        if loading:
+            self._spinner.start()
+            self._count_label.setText("Поиск…")
+        else:
+            self._spinner.stop()
+
     def update_results(self, results: list[SearchResult]):
+        self.set_loading(False)
         self._results = results
         self._rebuild_list()
 
@@ -1726,6 +1837,208 @@ class SearchPage(QWidget):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# All-artists browse page
+# ──────────────────────────────────────────────────────────────────────────────
+
+_LATIN_LETTERS = [chr(c) for c in range(ord('A'), ord('Z') + 1)]
+_CYRILLIC_LETTERS = list("АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ")
+_ALPHABET_LETTERS = _LATIN_LETTERS + _CYRILLIC_LETTERS
+
+
+def _artist_group_letter(name: str) -> str:
+    # clean_artist_name() falls back to the literal word "Неизвестно" for
+    # empty input (same as clean_title()) rather than returning "" — check
+    # for an empty name before cleaning, or a nameless artist would get
+    # miscategorized under "Н" instead of the "#" catch-all bucket.
+    raw = (name or "").strip()
+    if not raw:
+        return "#"
+    cleaned = clean_artist_name(raw).strip() or raw
+    ch = cleaned[0].upper()
+    return ch if ch in _ALPHABET_LETTERS else "#"
+
+
+class AllArtistsPage(QWidget):
+    """Full server artist catalog (independent of the user's own library/
+    subscriptions), grouped A-Z / А-Я with a clickable jump index."""
+
+    artist_selected = pyqtSignal(dict)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._runners: list = []
+        self._section_headers: dict[str, QWidget] = {}
+        self._index_buttons: dict[str, QLabel] = {}
+        self._build_ui()
+
+    def _build_ui(self):
+        root = QHBoxLayout(self)
+        root.setContentsMargins(20, 16, 8, 0)
+        root.setSpacing(4)
+
+        left_col = QVBoxLayout()
+        left_col.setSpacing(10)
+        left_col.setContentsMargins(0, 0, 0, 0)
+
+        hdr = QLabel("Все исполнители")
+        hdr.setFont(QFont("Segoe UI", 16, QFont.Weight.Bold))
+        hdr.setStyleSheet(f"color: {COLORS['TEXT_PRIMARY']};")
+        left_col.addWidget(hdr)
+
+        self._count_label = QLabel("")
+        self._count_label.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']}; font: 9pt 'Segoe UI';")
+        left_col.addWidget(self._count_label)
+
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setStyleSheet(get_scrollbar_style())
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+        self._container = QWidget()
+        self._container_layout = QVBoxLayout(self._container)
+        self._container_layout.setContentsMargins(0, 4, 8, 16)
+        self._container_layout.setSpacing(2)
+        self._container_layout.addStretch(1)
+
+        self._scroll.setWidget(self._container)
+        left_col.addWidget(self._scroll, 1)
+        root.addLayout(left_col, 1)
+
+        # Right: compact clickable A-Z / А-Я jump index — letters with no
+        # artists are dimmed and inert, so the index stays useful even
+        # though it always shows the full alphabet.
+        index_col = QVBoxLayout()
+        index_col.setContentsMargins(0, 40, 4, 16)
+        index_col.setSpacing(0)
+        for letter in _ALPHABET_LETTERS:
+            lbl = QLabel(letter)
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl.setFixedHeight(11)
+            lbl.setFont(QFont("Segoe UI", 7))
+            lbl.setStyleSheet(f"color: {COLORS['BORDER']};")
+            index_col.addWidget(lbl)
+            self._index_buttons[letter] = lbl
+        index_widget = QWidget()
+        index_widget.setFixedWidth(18)
+        index_widget.setLayout(index_col)
+        root.addWidget(index_widget, 0)
+
+    def load_artists(self, artists: list[dict]):
+        _stop_runners(self._runners)
+        groups: dict[str, list[dict]] = {}
+        for a in artists:
+            if not isinstance(a, dict):
+                continue
+            letter = _artist_group_letter(a.get("artist", ""))
+            groups.setdefault(letter, []).append(a)
+        for letter, items in groups.items():
+            items.sort(key=lambda a: clean_artist_name(a.get("artist", "")).lower())
+
+        total = sum(len(v) for v in groups.values())
+        self._count_label.setText(
+            f"{total} исполнитель" if total % 10 == 1 and total % 100 != 11 else
+            f"{total} исполнителя" if 2 <= total % 10 <= 4 and not (11 <= total % 100 <= 14) else
+            f"{total} исполнителей"
+        )
+
+        while self._container_layout.count() > 1:
+            item = self._container_layout.takeAt(0)
+            if item and item.widget():
+                item.widget().deleteLater()
+        self._section_headers.clear()
+        self._scroll.verticalScrollBar().setValue(0)
+
+        insert_pos = 0
+
+        def _insert(w):
+            nonlocal insert_pos
+            self._container_layout.insertWidget(insert_pos, w)
+            insert_pos += 1
+
+        ordered_letters = _ALPHABET_LETTERS + (["#"] if "#" in groups else [])
+        for letter in ordered_letters:
+            if letter not in groups:
+                continue
+            header = self._make_section_header(letter)
+            _insert(header)
+            self._section_headers[letter] = header
+            for artist in groups[letter]:
+                _insert(self._make_artist_row(artist))
+
+        available = set(groups.keys())
+        for letter, lbl in self._index_buttons.items():
+            enabled = letter in available
+            color = COLORS["TEXT_PRIMARY"] if enabled else COLORS["BORDER"]
+            lbl.setStyleSheet(f"color: {color};")
+            lbl.setCursor(Qt.CursorShape.PointingHandCursor if enabled else Qt.CursorShape.ArrowCursor)
+            if enabled:
+                lbl.mousePressEvent = partial(self._on_index_clicked, letter)
+            else:
+                lbl.mousePressEvent = lambda e: None
+
+    def _on_index_clicked(self, letter: str, event):
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        header = self._section_headers.get(letter)
+        if not header:
+            return
+        self._scroll.verticalScrollBar().setValue(max(0, header.pos().y() - 4))
+
+    def _make_section_header(self, letter: str) -> QWidget:
+        lbl = QLabel(letter)
+        lbl.setContentsMargins(8, 14, 8, 4)
+        lbl.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
+        lbl.setStyleSheet(f"color: {COLORS['PRIMARY']};")
+        return lbl
+
+    def _make_artist_row(self, artist: dict) -> QWidget:
+        row = QWidget()
+        row.setCursor(Qt.CursorShape.PointingHandCursor)
+        row.setObjectName("srRow")
+        row.setStyleSheet(
+            "QWidget#srRow { background: transparent; border-radius: 8px; }"
+            f"QWidget#srRow:hover {{ background-color: {COLORS['SURFACE_LIGHT']}; }}"
+        )
+        lay = QHBoxLayout(row)
+        lay.setContentsMargins(8, 7, 8, 7)
+        lay.setSpacing(14)
+
+        avatar = QLabel()
+        avatar.setFixedSize(42, 42)
+        avatar.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        avatar.setStyleSheet(f"background: {COLORS['COVER_BG']}; border-radius: 21px;")
+        cover_rel = artist.get("cover", "")
+        if cover_rel:
+            full = SERVER_URL + cover_rel if not cover_rel.startswith("http") else cover_rel
+            key = cache_key(full, 42, 21)
+            cached = cover_cache.get(key)
+            if cached and not cached.isNull():
+                avatar.setPixmap(cached)
+            else:
+                def _cb(loaded_url, img, sz, rad, lbl=avatar):
+                    try:
+                        pm = QPixmap.fromImage(img) if img else QPixmap()
+                        if not pm.isNull():
+                            cover_cache.set(cache_key(loaded_url, sz, rad), pm)
+                            lbl.setPixmap(pm)
+                    except Exception:
+                        pass
+                _start_image_loader([full], 42, 21, _cb, self._runners)
+        lay.addWidget(avatar)
+
+        name_lbl = QLabel(clean_artist_name(artist.get("artist", "")))
+        name_lbl.setStyleSheet(f"color: {COLORS['TEXT_PRIMARY']}; font: 10.5pt 'Segoe UI';")
+        lay.addWidget(name_lbl, 1)
+
+        def on_click(event, a=artist):
+            if event.button() == Qt.MouseButton.LeftButton:
+                self.artist_selected.emit(a)
+        row.mousePressEvent = on_click
+        return row
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Welcome page
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -1805,7 +2118,7 @@ class _SidebarItem(QWidget):
         self._cover_label.setText(text)
         self._cover_label.setStyleSheet(
             f"background: {bg}; border-radius: {self._radius}px; "
-            f"color: white; font-size: 18px; qproperty-alignment: AlignCenter;"
+            f"color: {COLORS['TEXT_PRIMARY']}; font-size: 18px; qproperty-alignment: AlignCenter;"
         )
 
     def set_selected(self, selected: bool):
@@ -1867,7 +2180,7 @@ class Sidebar(QWidget):
         self._scroll.setWidgetResizable(True)
         self._scroll.setFrameShape(QFrame.Shape.NoFrame)
         self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self._scroll.setStyleSheet(SCROLLBAR_STYLE + "QScrollArea { background: transparent; border: none; }")
+        self._scroll.setStyleSheet(get_scrollbar_style() + "QScrollArea { background: transparent; border: none; }")
 
         self._container = QWidget()
         self._container.setStyleSheet("background: transparent;")
@@ -1973,17 +2286,99 @@ class Sidebar(QWidget):
 # Settings panel
 # ──────────────────────────────────────────────────────────────────────────────
 
-class SettingsPage(QWidget):
-    logout_clicked = pyqtSignal()
-    accent_changed = pyqtSignal(str)
-    discord_rpc_toggled = pyqtSignal(bool)
-    cache_cleared = pyqtSignal()
+class _ToggleSwitch(QWidget):
+    """iOS-style animated on/off switch, used in place of a plain QCheckBox
+    for settings toggles."""
+
+    toggled = pyqtSignal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._discord_checkbox = None
+        self._checked = False
+        self._knob_pos = 0.0  # 0.0 = off, 1.0 = on
+        self.setFixedSize(44, 24)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._anim = QPropertyAnimation(self, b"knobPos", self)
+        self._anim.setDuration(160)
+        self._anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
+
+    def _get_knob_pos(self):
+        return self._knob_pos
+
+    def _set_knob_pos(self, value):
+        self._knob_pos = float(value)
+        self.update()
+
+    knobPos = pyqtProperty(float, fget=_get_knob_pos, fset=_set_knob_pos)
+
+    def isChecked(self) -> bool:
+        return self._checked
+
+    def setChecked(self, checked: bool):
+        checked = bool(checked)
+        if self._checked == checked:
+            return
+        self._checked = checked
+        self._animate_to(1.0 if checked else 0.0)
+
+    def _animate_to(self, target: float):
+        self._anim.stop()
+        self._anim.setStartValue(self._knob_pos)
+        self._anim.setEndValue(target)
+        self._anim.start()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._checked = not self._checked
+            self._animate_to(1.0 if self._checked else 0.0)
+            self.toggled.emit(self._checked)
+        super().mousePressEvent(event)
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        c = styles_module.COLORS
+        off = QColor(c["BORDER"])
+        on = QColor(c["PRIMARY"])
+        t = self._knob_pos
+        track = QColor(
+            int(off.red() + (on.red() - off.red()) * t),
+            int(off.green() + (on.green() - off.green()) * t),
+            int(off.blue() + (on.blue() - off.blue()) * t),
+        )
+
+        rect = QRectF(self.rect().adjusted(1, 1, -1, -1))
+        radius = rect.height() / 2.0
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(track))
+        p.drawRoundedRect(rect, radius, radius)
+
+        knob_d = rect.height() - 4
+        knob_x = rect.x() + 2 + (rect.width() - knob_d - 4) * t
+        knob_y = rect.y() + 2
+        p.setBrush(QBrush(QColor("#FFFFFF")))
+        p.drawEllipse(QRectF(knob_x, knob_y, knob_d, knob_d))
+        p.end()
+
+class SettingsPage(QWidget):
+    logout_clicked = pyqtSignal()
+    accent_changed = pyqtSignal(str)
+    theme_changed = pyqtSignal(str)
+    scale_changed = pyqtSignal(float)
+    discord_rpc_toggled = pyqtSignal(bool)
+    cache_cleared = pyqtSignal()
+
+    SCALE_PRESETS = [("75%", 0.75), ("100%", 1.0), ("125%", 1.25), ("150%", 1.5)]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._discord_toggle = None
         self._accent_btns: list[QPushButton] = []
         self._current_accent = ""
+        self._theme_btns: dict[str, QPushButton] = {}
+        self._current_theme = "dark"
+        self._scale_btns: dict[float, QPushButton] = {}
+        self._current_scale = 1.0
         self._build_ui()
 
     def _make_card(self, parent_layout: QVBoxLayout) -> QVBoxLayout:
@@ -2038,6 +2433,48 @@ class SettingsPage(QWidget):
         accent_card.addLayout(palette_row)
         self._restyle_accent_buttons()
 
+        # ── Appearance card (theme + UI scale) ──────────────────────────────
+        appearance_card = self._make_card(layout)
+        appearance_card.addWidget(self._section_label("Тема"))
+
+        theme_row = QHBoxLayout()
+        theme_row.setSpacing(10)
+        theme_row.setContentsMargins(0, 0, 0, 0)
+        for mode, label in (("dark", "Тёмная"), ("light", "Светлая")):
+            btn = QPushButton(label)
+            btn.setFixedHeight(32)
+            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(partial(self._on_theme_clicked, mode))
+            theme_row.addWidget(btn)
+            self._theme_btns[mode] = btn
+        theme_row.addStretch(1)
+        appearance_card.addLayout(theme_row)
+
+        appearance_card.addWidget(self._section_label("Масштаб интерфейса"))
+
+        scale_row = QHBoxLayout()
+        scale_row.setSpacing(10)
+        scale_row.setContentsMargins(0, 0, 0, 0)
+        for label, value in self.SCALE_PRESETS:
+            btn = QPushButton(label)
+            btn.setFixedHeight(32)
+            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(partial(self._on_scale_clicked, value))
+            scale_row.addWidget(btn)
+            self._scale_btns[value] = btn
+        scale_row.addStretch(1)
+        appearance_card.addLayout(scale_row)
+
+        restart_hint = QLabel("Тема и масштаб применяются после перезапуска приложения.")
+        restart_hint.setWordWrap(True)
+        restart_hint.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']}; font: 9pt 'Segoe UI';")
+        appearance_card.addWidget(restart_hint)
+
+        self._restyle_theme_buttons()
+        self._restyle_scale_buttons()
+
         # ── Integrations card ────────────────────────────────────────────────
         integ_card = self._make_card(layout)
         integ_card.addWidget(self._section_label("Интеграция"))
@@ -2050,14 +2487,9 @@ class SettingsPage(QWidget):
         discord_row.addWidget(discord_lbl)
         discord_row.addStretch(1)
 
-        from PyQt6.QtWidgets import QCheckBox
-        self._discord_checkbox = QCheckBox()
-        self._discord_checkbox.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._discord_checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._discord_checkbox.stateChanged.connect(
-            lambda s: self.discord_rpc_toggled.emit(s == Qt.CheckState.Checked.value)
-        )
-        discord_row.addWidget(self._discord_checkbox)
+        self._discord_toggle = _ToggleSwitch()
+        self._discord_toggle.toggled.connect(self.discord_rpc_toggled.emit)
+        discord_row.addWidget(self._discord_toggle)
         integ_card.addLayout(discord_row)
 
         # ── Data card ────────────────────────────────────────────────────────
@@ -2119,17 +2551,66 @@ class SettingsPage(QWidget):
         self._current_accent = color or ""
         self._restyle_accent_buttons()
 
+    def _style_choice_button(self, btn: QPushButton, selected: bool):
+        c = COLORS
+        if selected:
+            btn.setStyleSheet(
+                f"QPushButton {{ background: {c['PRIMARY']}; border: none; border-radius: 16px; "
+                f"color: #000; font: 600 9.5pt 'Segoe UI'; padding: 0 14px; }}"
+            )
+        else:
+            btn.setStyleSheet(
+                f"QPushButton {{ background: transparent; border: 1px solid {c['BORDER']}; border-radius: 16px; "
+                f"color: {c['TEXT_SECONDARY']}; font: 9.5pt 'Segoe UI'; padding: 0 14px; }}"
+                f"QPushButton:hover {{ border-color: {c['TEXT_PRIMARY']}; color: {c['TEXT_PRIMARY']}; }}"
+            )
+
+    def _restyle_theme_buttons(self):
+        for mode, btn in self._theme_btns.items():
+            self._style_choice_button(btn, mode == self._current_theme)
+
+    def _restyle_scale_buttons(self):
+        for value, btn in self._scale_btns.items():
+            self._style_choice_button(btn, abs(value - self._current_scale) < 0.01)
+
+    def set_selected_theme(self, mode: str):
+        self._current_theme = mode if mode in ("dark", "light") else "dark"
+        self._restyle_theme_buttons()
+
+    def set_selected_scale(self, scale: float):
+        try:
+            self._current_scale = float(scale)
+        except (TypeError, ValueError):
+            self._current_scale = 1.0
+        self._restyle_scale_buttons()
+
+    def apply_accent(self):
+        """Re-apply styles after accent color change (the 'selected' highlight
+        on theme/scale buttons uses the accent color)."""
+        self._restyle_theme_buttons()
+        self._restyle_scale_buttons()
+        if self._discord_toggle is not None:
+            self._discord_toggle.update()
+
     def set_discord_rpc_enabled(self, enabled: bool):
-        if self._discord_checkbox is None:
+        if self._discord_toggle is None:
             return
-        self._discord_checkbox.blockSignals(True)
-        self._discord_checkbox.setChecked(enabled)
-        self._discord_checkbox.blockSignals(False)
+        self._discord_toggle.blockSignals(True)
+        self._discord_toggle.setChecked(enabled)
+        self._discord_toggle.blockSignals(False)
 
     def _on_accent_clicked(self, color: str):
         set_accent_color(color)
         self.set_selected_accent(color)
         self.accent_changed.emit(color)
+
+    def _on_theme_clicked(self, mode: str):
+        self.set_selected_theme(mode)
+        self.theme_changed.emit(mode)
+
+    def _on_scale_clicked(self, scale: float):
+        self.set_selected_scale(scale)
+        self.scale_changed.emit(scale)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -2185,6 +2666,39 @@ class _PlayerDataSaveWorker(QObject):
         self.finished.emit()
 
 
+class _DiscordConnectSignal(QObject):
+    """Bridges a background Discord-connect attempt back to the main thread.
+    pypresence's connect() blocks synchronously (its own asyncio loop) while
+    it tries to reach Discord's IPC socket — if Discord isn't running that
+    would stall the caller for a noticeable moment, so it always runs on a
+    plain daemon thread (not QThread): daemon=True means it can never block
+    process exit or get torn down mid-run, so there's no thread-lifecycle
+    risk at all if the app closes while a connection attempt is in flight."""
+    finished = pyqtSignal(object, bool)  # (DiscordRPC instance, connected)
+
+
+class _SearchIcon(QWidget):
+    """Small drawn magnifying-glass icon. There's no safe monochrome 'search'
+    character outside the emoji-prone Unicode blocks, so this is hand-painted
+    instead of relying on a font glyph that can render as a color emoji on Windows."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(16, 16)
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(QColor(COLORS["TEXT_SECONDARY"]))
+        pen.setWidthF(1.6)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawEllipse(1, 1, 9, 9)
+        p.drawLine(9, 9, 14, 14)
+        p.end()
+
+
 class MusicApp(QWidget):
     logout_requested = pyqtSignal()
 
@@ -2222,11 +2736,14 @@ class MusicApp(QWidget):
         self._library_thread: QThread | None = None
 
         self._discord_rpc = None
+        self._discord_connecting = False
+        self._discord_connect_signal = None
         self._discord_refresh_timer: QTimer | None = None
         self._state_restored = False
         self._nav_restored = False   # True once page navigation succeeded
         self._playing_url: str = ""
         self._playing_track: dict | None = None
+        self._player_warmed_up = False
 
         self._load_settings()
         self._setup_ui()
@@ -2249,16 +2766,17 @@ class MusicApp(QWidget):
             pass
         accent = self._settings.get("accent_color", COLORS["PRIMARY"])
         set_accent_color(accent)
+        set_theme(self._settings.get("theme", "dark"))
         app = QApplication.instance()
         if app:
-            palette = app.palette()
-            palette.setColor(QPalette.ColorRole.Highlight, QColor(accent))
-            app.setPalette(palette)
+            styles_module.apply_palette(app)
         self._audio_device_id = self._settings.get("audio_output_device_id")
 
     def _apply_loaded_settings(self):
         """Apply settings that require UI to already be built (called after _setup_ui)."""
         self._settings_page.set_selected_accent(self._settings.get("accent_color", COLORS["PRIMARY"]))
+        self._settings_page.set_selected_theme(self._settings.get("theme", "dark"))
+        self._settings_page.set_selected_scale(self._settings.get("ui_scale", 1.0))
 
         rpc_enabled = bool(self._settings.get("discord_rpc", False))
         self._settings_page.set_discord_rpc_enabled(rpc_enabled)
@@ -2298,7 +2816,7 @@ class MusicApp(QWidget):
         palette.setColor(QPalette.ColorRole.Window, QColor(COLORS["BACKGROUND"]))
         palette.setColor(QPalette.ColorRole.WindowText, QColor(COLORS["TEXT_PRIMARY"]))
         self.setPalette(palette)
-        self.setStyleSheet(SCROLLBAR_STYLE)
+        self.setStyleSheet(get_scrollbar_style())
 
         main = QVBoxLayout(self)
         main.setContentsMargins(0, 0, 0, 0)
@@ -2327,10 +2845,11 @@ class MusicApp(QWidget):
         self._artist_page = ArtistPage()
         self._album_page = AlbumPage()
         self._search_page = SearchPage()
+        self._all_artists_page = AllArtistsPage()
         self._settings_page = SettingsPage()
 
         for page in [self._welcome_page, self._artist_page, self._album_page,
-                     self._search_page, self._settings_page]:
+                     self._search_page, self._all_artists_page, self._settings_page]:
             self._page_stack.addWidget(page)
 
         self._page_stack.setCurrentWidget(self._welcome_page)
@@ -2376,8 +2895,11 @@ class MusicApp(QWidget):
         self._album_page.album_like_clicked.connect(self._on_album_like_clicked)
         self._album_page.cover_clicked.connect(self._cover_viewer.show_for)
         self._search_page.result_selected.connect(self._on_search_result_selected)
+        self._all_artists_page.artist_selected.connect(self._navigate_to_artist)
         self._settings_page.logout_clicked.connect(self._on_logout)
         self._settings_page.accent_changed.connect(self._on_accent_changed)
+        self._settings_page.theme_changed.connect(self._on_theme_changed)
+        self._settings_page.scale_changed.connect(self._on_scale_changed)
         self._settings_page.discord_rpc_toggled.connect(self._on_discord_rpc_toggled)
         self._settings_page.cache_cleared.connect(self._on_cache_cleared)
 
@@ -2441,10 +2963,7 @@ class MusicApp(QWidget):
         sw_layout.setContentsMargins(12, 0, 14, 0)
         sw_layout.setSpacing(6)
 
-        search_icon_lbl = QLabel("⌕")
-        search_icon_lbl.setStyleSheet(
-            f"color: {COLORS['TEXT_SECONDARY']}; font-size: 16px; background: transparent;"
-        )
+        search_icon_lbl = _SearchIcon(self)
         sw_layout.addWidget(search_icon_lbl)
 
         self._search_bar = QLineEdit()
@@ -2469,7 +2988,21 @@ class MusicApp(QWidget):
         rp_layout.setSpacing(0)
         rp_layout.addStretch(1)
 
-        settings_btn = QPushButton("⚙")
+        artists_btn = QPushButton("Исполнители")
+        artists_btn.setFixedHeight(34)
+        artists_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        artists_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        artists_btn.setToolTip("Все исполнители на сервере")
+        artists_btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; border: 1px solid {COLORS['BORDER']}; border-radius: 17px; "
+            f"color: {COLORS['TEXT_SECONDARY']}; font: 9.5pt 'Segoe UI'; padding: 0 16px; }}"
+            f"QPushButton:hover {{ border-color: {COLORS['TEXT_PRIMARY']}; color: {COLORS['TEXT_PRIMARY']}; }}"
+        )
+        artists_btn.clicked.connect(self._show_all_artists)
+        rp_layout.addWidget(artists_btn)
+        rp_layout.addSpacing(10)
+
+        settings_btn = QPushButton("≡")
         settings_btn.setFixedSize(36, 36)
         settings_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         settings_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -2546,6 +3079,10 @@ class MusicApp(QWidget):
     def _on_library_loaded(self):
         self._loading = False
         self._library_thread = None
+        # Retry the player warm-up now that real track URLs may be available
+        # — on a fresh login (no local library cache yet) the earlier
+        # timer-based attempt had nothing to warm the network path up with.
+        self._try_warm_up_player()
         # Refresh sidebar now that library is available (artists/albums can be resolved)
         if self._account_manager:
             self._update_sidebar_from_account()
@@ -2815,6 +3352,40 @@ class MusicApp(QWidget):
         self.player.set_volume(saved_vol)
         if self._audio_device_id:
             self.player.set_audio_output_device(self._audio_device_id)
+        # Short delay so this doesn't compete with the very first paint of
+        # the window, but otherwise as early as possible: warm_up() now uses
+        # its own throwaway player (see PlayerController.warm_up()), so
+        # there's no risk in starting it early even if the user then clicks
+        # play immediately — the earlier this fires, the more likely it
+        # finishes before a real, fast first click. Also retried from
+        # _on_library_loaded(): a real track URL is needed to warm up the
+        # network-streaming path, not just local decoding, and the library
+        # may not be available yet at this point (fresh login, no local
+        # cache) — see _try_warm_up_player().
+        QTimer.singleShot(150, self._try_warm_up_player)
+
+    def _first_track_url(self) -> str | None:
+        try:
+            for artist in self.library_manager.get_library():
+                for album in (artist.get("albums") or []):
+                    for track in (album.get("tracks") or []):
+                        url = track.get("url")
+                        if url:
+                            return SERVER_URL + url if not url.startswith("http") else url
+        except Exception:
+            pass
+        return None
+
+    def _try_warm_up_player(self):
+        if self._player_warmed_up or self._closing:
+            return
+        url = self._first_track_url()
+        if url:
+            # Found a real track URL — this is the warmup that actually
+            # matters (it's what exercises the network/HTTP code path), so
+            # don't bother repeating it once done.
+            self._player_warmed_up = True
+        self.player.warm_up(url)
 
     def _setup_media_keys(self):
         if not _MEDIA_KEYS_AVAILABLE:
@@ -2843,6 +3414,7 @@ class MusicApp(QWidget):
         if text.strip():
             self._search_timer.start()
         else:
+            self._search_page.set_loading(False)
             if self._page_stack.currentWidget() == self._search_page:
                 self._go_home()
 
@@ -2854,6 +3426,7 @@ class MusicApp(QWidget):
         if self._page_stack.currentWidget() != self._search_page:
             self._prev_page_before_search = self._page_stack.currentWidget()
         self._page_stack.setCurrentWidget(self._search_page)
+        self._search_page.set_loading(True)
         if self._search_worker:
             self._search_worker.request.emit(query, self._search_generation)
 
@@ -2883,6 +3456,7 @@ class MusicApp(QWidget):
 
     def _go_home(self):
         self._search_bar.clear()
+        self._search_page.set_loading(False)
         if self._current_artist:
             self._page_stack.setCurrentWidget(self._artist_page)
         else:
@@ -2893,6 +3467,10 @@ class MusicApp(QWidget):
             self._go_home()
         else:
             self._page_stack.setCurrentWidget(self._settings_page)
+
+    def _show_all_artists(self):
+        self._all_artists_page.load_artists(self.library_manager.get_library())
+        self._page_stack.setCurrentWidget(self._all_artists_page)
 
     def _navigate_to_artist(self, artist: dict):
         self._current_artist = artist
@@ -3235,6 +3813,7 @@ class MusicApp(QWidget):
         self._album_page.apply_accent()
         self._artist_page.apply_accent()
         self._cover_viewer.apply_accent()
+        self._settings_page.apply_accent()
         c = COLORS
         # The search field's pill border lives on _search_wrapper, not on the
         # QLineEdit itself (which stays borderless) — just refresh it for the
@@ -3249,34 +3828,112 @@ class MusicApp(QWidget):
             palette.setColor(QPalette.ColorRole.Highlight, QColor(color))
             app.setPalette(palette)
 
+    def _on_theme_changed(self, mode: str):
+        self._save_ui_state(theme=mode)
+        self._offer_restart()
+
+    def _on_scale_changed(self, scale: float):
+        self._save_ui_state(ui_scale=scale)
+        self._offer_restart()
+
+    def _offer_restart(self):
+        """Theme and UI scale are baked into every widget at construction/
+        QApplication startup — rebuilding the whole app live isn't practical,
+        so ask to relaunch the process instead."""
+        reply = QMessageBox.question(
+            self,
+            "Перезапуск",
+            "Изменения применятся после перезапуска приложения. Перезапустить сейчас?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self._restart_app()
+
+    def _restart_app(self):
+        from PyQt6.QtCore import QProcess
+        try:
+            if getattr(sys, "frozen", False):
+                # Packaged build: sys.executable IS the app — sys.argv[0] is
+                # also the exe's own path here, so prepending sys.executable
+                # (the old bug) duplicated it as an extra argv[1] to itself.
+                program = sys.executable
+                args = list(sys.argv[1:])
+            else:
+                # Dev run: sys.executable is the interpreter, sys.argv[0] is
+                # the script path — both genuinely need to be passed along.
+                program = sys.executable
+                args = [os.path.abspath(sys.argv[0])] + list(sys.argv[1:])
+            ok, _pid = QProcess.startDetached(program, args)
+            if not ok:
+                print(f"[Restart] QProcess.startDetached failed for {program!r} {args!r}")
+                return
+        except Exception as e:
+            print(f"[Restart] failed: {e}")
+            return
+        # Close the real top-level window (not just this widget) so
+        # closeEvent/thread cleanup runs before the process actually exits.
+        top = self.window()
+        if top:
+            top.close()
+
     # ── Discord RPC ───────────────────────────────────────────────────────────
 
     def _on_discord_rpc_toggled(self, enabled: bool):
         if enabled:
-            ok = self._init_discord_rpc()
-            if not ok:
-                self._settings_page.set_discord_rpc_enabled(False)
-                self._settings["discord_rpc"] = False
-            else:
-                self._settings["discord_rpc"] = True
-                self._refresh_discord_presence()
+            self._settings["discord_rpc"] = True
+            # Connects in the background; _on_discord_connect_result flips the
+            # checkbox back off and updates the setting if it fails.
+            self._init_discord_rpc()
         else:
             self._dispose_discord_rpc()
             self._settings["discord_rpc"] = False
         self._save_settings()
 
-    def _init_discord_rpc(self) -> bool:
+    def _init_discord_rpc(self):
         if self._discord_rpc and getattr(self._discord_rpc, "connected", False):
-            return True
-        try:
+            return
+        if self._discord_rpc:
+            # A previous attempt exists but never connected (e.g. Discord
+            # wasn't running) — dispose it before starting a new one, or its
+            # Presence/asyncio loop is silently dropped and prints a "QThread/
+            # event loop destroyed" warning during garbage collection later.
+            self._dispose_discord_rpc()
+        if self._discord_connecting:
+            return  # already trying to connect
+
+        self._discord_connecting = True
+        signal = _DiscordConnectSignal(self)
+        signal.finished.connect(self._on_discord_connect_result)
+        self._discord_connect_signal = signal  # keep it alive until the callback fires
+
+        def worker():
             from ui.discord_rpc import DiscordRPC
-            self._discord_rpc = DiscordRPC()
-            self._discord_rpc.connect()
-            return getattr(self._discord_rpc, "connected", False)
-        except Exception as e:
-            print(f"[RPC] init error: {e}")
+            rpc = DiscordRPC()
+            try:
+                rpc.connect()
+            except Exception as e:
+                print(f"[RPC] init error: {e}")
+            signal.finished.emit(rpc, bool(getattr(rpc, "connected", False)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_discord_connect_result(self, rpc, connected: bool):
+        self._discord_connecting = False
+        self._discord_connect_signal = None
+        if connected:
+            self._discord_rpc = rpc
+            self._refresh_discord_presence()
+        else:
+            try:
+                rpc.disconnect()
+            except Exception:
+                pass
             self._discord_rpc = None
-            return False
+            if self._settings.get("discord_rpc"):
+                self._settings["discord_rpc"] = False
+                self._settings_page.set_discord_rpc_enabled(False)
+                self._save_settings()
 
     def _dispose_discord_rpc(self):
         if not self._discord_rpc:
@@ -3464,7 +4121,29 @@ class MusicApp(QWidget):
         self._controls.update_position(pos, dur)
 
     def _on_album_finished(self, artist: dict, album: dict) -> bool:
-        return False
+        """Repeat is off and the album just played through — instead of just
+        stopping, move on to the artist's next album (wrapping back to their
+        first once the last one finishes), so a whole artist keeps playing
+        continuously rather than going silent after one album."""
+        if not artist or not album or album.get("_is_liked_album"):
+            return False
+        artist_name = (artist.get("artist") or "").strip()
+        if not artist_name:
+            return False
+        full_artist = self.library_manager.get_artist_by_name(artist_name) or artist
+        albums = full_artist.get("albums") or []
+        if len(albums) < 1:
+            return False
+        current_title = clean_title(album.get("title", ""))
+        current_idx = next(
+            (i for i, al in enumerate(albums) if clean_title(al.get("title", "")) == current_title),
+            None,
+        )
+        if current_idx is None:
+            return False
+        next_album = albums[(current_idx + 1) % len(albums)]
+        self._play_track(0, next_album, full_artist)
+        return True
 
     def _on_album_previous(self, artist: dict, album: dict) -> bool:
         return False
@@ -3601,6 +4280,8 @@ class MusicApp(QWidget):
                 self._media_keys.listener.stop()
             except Exception:
                 pass
+        # Any in-flight Discord connect attempt runs on a daemon thread —
+        # nothing to wait on, it can't block or crash process exit.
         self._dispose_discord_rpc()
         super().closeEvent(event)
 
