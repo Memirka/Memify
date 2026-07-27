@@ -680,8 +680,7 @@ class AlbumPage(QWidget):
         self._track_rows: list[TrackRow] = []
         self._disc_headers: list[QWidget] = []
         self._album_liked: bool = False
-        self._duration_thread: QThread | None = None
-        self._duration_worker = None
+        self._duration_worker: TrackDurationWorker | None = None
         self._runners: list = []
         self._build_ui()
 
@@ -1042,13 +1041,12 @@ class AlbumPage(QWidget):
         urls = [u for _, u in index_url_pairs]
         idx_map = {u: i for i, u in index_url_pairs}
 
-        worker = TrackDurationWorker(urls)
-        thread = QThread(QApplication.instance())
-        worker.moveToThread(thread)
-
-        # Keep worker alive alongside thread
+        # TrackDurationWorker owns a real QMediaPlayer, so — unlike the old
+        # ffprobe-subprocess version — it must live on the main thread, not
+        # a QThread; it's internally async (signals/timers) so this doesn't
+        # block the UI.
+        worker = TrackDurationWorker(urls, parent=self)
         self._duration_worker = worker
-        self._duration_thread = thread
 
         def on_duration(url: str, ms: int):
             try:
@@ -1063,32 +1061,32 @@ class AlbumPage(QWidget):
             except Exception:
                 pass
 
+        def on_finished(w=worker):
+            if self._duration_worker is w:
+                self._duration_worker = None
+            w.deleteLater()
+
         worker.duration_ready.connect(on_duration)
-        worker.finished.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        thread.started.connect(worker.start)
-        thread.start()
+        worker.finished.connect(on_finished)
+        worker.start()
 
     def _stop_duration_loader(self):
-        if self._duration_thread and self._duration_worker:
-            old_thread = self._duration_thread
+        if self._duration_worker:
             old_worker = self._duration_worker
-            self._duration_thread = None
             self._duration_worker = None
             try:
                 old_worker.duration_ready.disconnect()
             except Exception:
                 pass
             try:
-                old_worker.stop()
-                old_thread.quit()
-                _dying_threads.append(old_thread)
-                old_thread.finished.connect(
-                    lambda t=old_thread: _dying_threads.remove(t) if t in _dying_threads else None
-                )
+                old_worker.finished.disconnect()
             except Exception:
                 pass
+            try:
+                old_worker.stop()
+            except Exception:
+                pass
+            old_worker.deleteLater()
 
     def _on_download_album(self):
         folder = QFileDialog.getExistingDirectory(self, "Выберите папку для скачивания")
@@ -4555,10 +4553,23 @@ class MusicApp(QWidget):
                 self._search_thread.wait(500)
             except Exception:
                 pass
-        # Library refresh / player-data load+save all run on daemon threads
-        # (see _LibraryLoadSignal) — nothing to wait on, they can't block or
-        # crash process exit, and _closing (set above) stops their callbacks
-        # from touching the now-tearing-down UI if they finish after this.
+        # Library/player-data *loads* run on daemon threads (see
+        # _LibraryLoadSignal) — safe to just let those go, _closing (set
+        # above) stops their callbacks from touching the tearing-down UI.
+        #
+        # Player-data *saves* (likes, follow_order, settings — anything via
+        # _save_player_data_async) are also daemon threads, but unlike loads
+        # they're not disposable: a daemon thread is killed outright the
+        # instant the process exits, mid-HTTP-request if that's where it is.
+        # Closing the app right after unliking something used to lose that
+        # unlike silently — it never reached the server, even though the
+        # local cache and this session's own UI already showed it gone. Give
+        # any in-flight save a brief grace period to actually finish first.
+        deadline = time.monotonic() + 2.0
+        while self._player_data_save_signals and time.monotonic() < deadline:
+            QApplication.processEvents()
+            time.sleep(0.02)
+
         self._album_page._stop_duration_loader()
         for t in list(_dying_threads):
             try:
