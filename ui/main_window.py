@@ -175,11 +175,20 @@ def _blurred_backdrop(pixmap: QPixmap, radius: float = 28.0, tint_alpha: int = 1
 
 
 def _track_like_keys(track: dict, url: str = "") -> set:
-    """Keys identifying a track for like/playing-state matching: its URL
-    variants, plus — when the track's album is shared across several artists
-    (has an album_id) — album_id + normalized title. That second key lets a
-    like or "now playing" state on one artist's copy of a duplicated track
-    also match the other artist's identical copy."""
+    """Keys identifying a track for like/playing-state matching.
+
+    A URL is authoritative whenever one is available — it points at one
+    specific file, so two tracks with different URLs are never "the same
+    track" for like/now-playing purposes, no matter what else matches.
+    Previously an album_id + normalized-title key was always added
+    alongside it (to let a like on one artist's copy of a shared/duplicated
+    album also match the other artist's identical copy) — but a title alone
+    doesn't actually identify a track: an album can genuinely contain two
+    different tracks that happen to share a title (e.g. two different
+    bonus-edition masters of one song), and that fallback key made them
+    collide — liking or playing one lit up both. The fallback is now only
+    used when a track has no URL at all to go on.
+    """
     keys = set()
     u = url or (track or {}).get("url", "") or ""
     if u:
@@ -188,6 +197,7 @@ def _track_like_keys(track: dict, url: str = "") -> set:
             keys.add(re.sub(r'^https?://[^/]+', '', u))
         else:
             keys.add(SERVER_URL + u)
+        return keys
     album_id = str((track or {}).get("album_id") or "").strip()
     title = (track or {}).get("title", "") or (track or {}).get("track_title", "") or ""
     if album_id and title:
