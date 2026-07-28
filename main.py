@@ -66,7 +66,9 @@ class AppWindow(QWidget):
         self._auth_pending = False
         self._splash = None
         self._update_check_thread = None
+        self._update_check_worker = None
         self._update_download_thread = None
+        self._update_download_worker = None
 
         self._stack = QStackedLayout(self)
         self._stack.setContentsMargins(0, 0, 0, 0)
@@ -135,7 +137,11 @@ class AppWindow(QWidget):
         worker.finished.connect(on_done)
         thread.started.connect(worker.run)
         thread.start()
+        # Keep both alive — the worker isn't parented to anything, so without
+        # a live Python reference it can get garbage-collected right after
+        # this method returns, before the thread ever delivers `started`.
         self._update_check_thread = thread
+        self._update_check_worker = worker
 
     def _begin_update(self, info: dict):
         from workers.download_worker import DownloadWorker
@@ -182,6 +188,7 @@ class AppWindow(QWidget):
         thread.started.connect(worker.run)
         thread.start()
         self._update_download_thread = thread
+        self._update_download_worker = worker
 
     def _after_update_check(self):
         if self._auth_pending and not self._main_ready:
