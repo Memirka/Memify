@@ -2599,7 +2599,25 @@ class SettingsPage(QWidget):
         return lbl
 
     def _build_ui(self):
-        layout = QVBoxLayout(self)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet(get_scrollbar_style())
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        root.addWidget(scroll)
+
+        container = QWidget()
+        scroll.setWidget(container)
+
+        # Cards below can require more height than the window's minimum size
+        # allows — without the QScrollArea above, a short window used to
+        # squeeze every fixed-height row into whatever space was left,
+        # rendering them stacked on top of each other instead of scrolling.
+        layout = QVBoxLayout(container)
         layout.setContentsMargins(30, 20, 30, 20)
         layout.setSpacing(20)
 
