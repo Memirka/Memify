@@ -6,7 +6,7 @@ import json
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from config import APP_ICON, DATA_DIR, APP_SETTINGS_FILE
+from config import APP_ICON, DATA_DIR, APP_SETTINGS_FILE, SERVER_URL, APP_VERSION
 
 
 def _load_saved_ui_scale() -> float:
@@ -28,8 +28,8 @@ _saved_scale = _load_saved_ui_scale()
 if _saved_scale != 1.0:
     os.environ["QT_SCALE_FACTOR"] = str(_saved_scale)
 
-from PyQt6.QtWidgets import QApplication, QWidget, QStackedLayout
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtWidgets import QApplication, QWidget, QStackedLayout, QProgressDialog
+from PyQt6.QtCore import Qt, QThread, QTimer
 from PyQt6.QtGui import QIcon, QGuiApplication
 
 # Qt6's default high-DPI rounding policy snaps a manual QT_SCALE_FACTOR like
@@ -65,6 +65,8 @@ class AppWindow(QWidget):
         self._splash_done = False
         self._auth_pending = False
         self._splash = None
+        self._update_check_thread = None
+        self._update_download_thread = None
 
         self._stack = QStackedLayout(self)
         self._stack.setContentsMargins(0, 0, 0, 0)
@@ -106,6 +108,82 @@ class AppWindow(QWidget):
 
     def _on_splash_finished(self):
         self._splash_done = True
+        self._start_update_check()
+
+    # ── Self-update ──────────────────────────────────────────────────────────
+
+    def _start_update_check(self):
+        from core.updater import is_frozen
+
+        if not is_frozen():
+            self._after_update_check()
+            return
+
+        from workers.update_check_worker import UpdateCheckWorker
+
+        worker = UpdateCheckWorker(SERVER_URL, APP_VERSION)
+        thread = QThread(QApplication.instance())
+        worker.moveToThread(thread)
+
+        def on_done(info):
+            thread.quit()
+            if info:
+                self._begin_update(info)
+            else:
+                self._after_update_check()
+
+        worker.finished.connect(on_done)
+        thread.started.connect(worker.run)
+        thread.start()
+        self._update_check_thread = thread
+
+    def _begin_update(self, info: dict):
+        from workers.download_worker import DownloadWorker
+        from core.updater import download_dest_path
+
+        download_url = (info or {}).get("download_url")
+        if not download_url:
+            self._after_update_check()
+            return
+
+        tmp_path = download_dest_path()
+
+        progress = QProgressDialog("Загрузка обновления...", None, 0, 100, self)
+        progress.setWindowTitle("Memify")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setCancelButton(None)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.show()
+
+        tasks = [{"url": download_url, "path": tmp_path, "label": "Memify"}]
+        worker = DownloadWorker(tasks)
+        thread = QThread(QApplication.instance())
+        worker.moveToThread(thread)
+
+        def on_progress(file_num, total_files, downloaded, total_bytes, label):
+            if total_bytes > 0:
+                progress.setValue(min(int(downloaded / total_bytes * 100), 99))
+
+        def on_finished(success, failed, cancelled):
+            progress.setValue(100)
+            progress.close()
+            thread.quit()
+            if success and not failed:
+                from core.updater import apply_update_and_exit
+
+                apply_update_and_exit(tmp_path)
+                QApplication.instance().quit()
+            else:
+                self._after_update_check()
+
+        worker.progress.connect(on_progress)
+        worker.finished.connect(on_finished)
+        thread.started.connect(worker.run)
+        thread.start()
+        self._update_download_thread = thread
+
+    def _after_update_check(self):
         if self._auth_pending and not self._main_ready:
             self._stack.setCurrentWidget(self._auth_widget)
             return
