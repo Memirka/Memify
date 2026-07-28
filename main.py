@@ -178,8 +178,10 @@ class AppWindow(QWidget):
             if success and not failed:
                 from core.updater import apply_update_and_exit
 
-                apply_update_and_exit(tmp_path)
-                QApplication.instance().quit()
+                if apply_update_and_exit(tmp_path):
+                    QApplication.instance().quit()
+                else:
+                    self._after_update_check()
             else:
                 self._after_update_check()
 
