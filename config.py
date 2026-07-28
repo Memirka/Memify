@@ -6,7 +6,7 @@ SERVER_URL = "http://93.116.83.14:5050"
 # Bump this on every release that gets built into dist/Memify (or Memify.exe)
 # and uploaded to the server — it's what the running app compares against
 # the server's version.txt to decide whether to self-update.
-APP_VERSION = "1.1.2"
+APP_VERSION = "1.1.3"
 
 CACHE_SIZE = 100
 IMAGE_CACHE_SIZE = 50
