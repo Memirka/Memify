@@ -28,7 +28,7 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import QFont, QColor, QPalette, QIcon, QPixmap, QFontMetrics, QCursor, QPainter, QPainterPath, QPen, QBrush
 
-from config import SERVER_URL, APP_ICON, ICONS_DIR, APP_SETTINGS_FILE, PLAYER_DATA_CACHE_DIR, LIBRARY_CACHE_FILE, WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT, DATA_DIR
+from config import SERVER_URL, APP_ICON, ICONS_DIR, APP_SETTINGS_FILE, PLAYER_DATA_CACHE_DIR, LIBRARY_CACHE_FILE, WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT, DATA_DIR, APP_VERSION
 from core.library import LibraryManager, SearchResult
 from core.player import PlayerController
 try:
@@ -2714,6 +2714,14 @@ class SettingsPage(QWidget):
         clear_cache_btn.clicked.connect(self.cache_cleared.emit)
         cache_row.addWidget(clear_cache_btn)
         data_card.addLayout(cache_row)
+
+        # ── About card ───────────────────────────────────────────────────────
+        about_card = self._make_card(layout)
+        about_card.addWidget(self._section_label("О приложении"))
+
+        version_lbl = QLabel(f"Версия {APP_VERSION}")
+        version_lbl.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']}; font: 9pt 'Segoe UI';")
+        about_card.addWidget(version_lbl)
 
         layout.addStretch(1)
 
