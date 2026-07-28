@@ -28,7 +28,7 @@ _saved_scale = _load_saved_ui_scale()
 if _saved_scale != 1.0:
     os.environ["QT_SCALE_FACTOR"] = str(_saved_scale)
 
-from PyQt6.QtWidgets import QApplication, QWidget, QStackedLayout, QProgressDialog
+from PyQt6.QtWidgets import QApplication, QWidget, QStackedLayout, QProgressDialog, QMessageBox
 from PyQt6.QtCore import Qt, QThread, QTimer
 from PyQt6.QtGui import QIcon, QGuiApplication
 
@@ -145,7 +145,7 @@ class AppWindow(QWidget):
 
     def _begin_update(self, info: dict):
         from workers.download_worker import DownloadWorker
-        from core.updater import download_dest_path
+        from core.updater import download_dest_path, log as update_log
 
         download_url = (info or {}).get("download_url")
         if not download_url:
@@ -153,6 +153,7 @@ class AppWindow(QWidget):
             return
 
         tmp_path = download_dest_path()
+        update_log(f"_begin_update: downloading {download_url} -> {tmp_path}")
 
         progress = QProgressDialog("Загрузка обновления...", None, 0, 100, self)
         progress.setWindowTitle("Memify")
@@ -167,25 +168,37 @@ class AppWindow(QWidget):
         thread = QThread(QApplication.instance())
         worker.moveToThread(thread)
 
+        download_error = {"msg": ""}
+
         def on_progress(file_num, total_files, downloaded, total_bytes, label):
             if total_bytes > 0:
                 progress.setValue(min(int(downloaded / total_bytes * 100), 99))
+
+        def on_file_failed(path, error):
+            download_error["msg"] = error
+            update_log(f"_begin_update: download failed: {error}")
 
         def on_finished(success, failed, cancelled):
             progress.setValue(100)
             progress.close()
             thread.quit()
             if success and not failed:
-                from core.updater import apply_update_and_exit
+                from core.updater import apply_update_and_exit, _log_path
 
-                if apply_update_and_exit(tmp_path):
+                ok, err = apply_update_and_exit(tmp_path)
+                if ok:
                     QApplication.instance().quit()
                 else:
+                    self._show_update_error(f"Не удалось применить обновление: {err}\n\nЛог: {_log_path()}")
                     self._after_update_check()
             else:
+                if not cancelled:
+                    reason = download_error["msg"] or "неизвестная ошибка"
+                    self._show_update_error(f"Не удалось скачать обновление: {reason}")
                 self._after_update_check()
 
         worker.progress.connect(on_progress)
+        worker.file_failed.connect(on_file_failed)
         worker.finished.connect(on_finished)
         thread.started.connect(worker.run)
         thread.start()
@@ -197,6 +210,14 @@ class AppWindow(QWidget):
             self._stack.setCurrentWidget(self._auth_widget)
             return
         self._maybe_show_main()
+
+    def _show_update_error(self, text: str):
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Memify")
+        box.setText("Автообновление не удалось")
+        box.setInformativeText(text)
+        box.exec()
 
     # ── Auth ──────────────────────────────────────────────────────────────────
 
