@@ -20,17 +20,17 @@ from PyQt6.QtWidgets import (
     QMenu, QFileDialog, QProgressDialog, QSpacerItem,
     QAbstractItemView, QFrame, QMessageBox, QGraphicsDropShadowEffect,
     QGraphicsScene, QGraphicsPixmapItem, QGraphicsBlurEffect,
-    QStyledItemDelegate, QStyle,
+    QStyledItemDelegate, QStyle, QSlider,
 )
 from PyQt6.QtCore import (
     Qt, QTimer, QThread, QUrl, QSize, QRectF, pyqtSignal, pyqtSlot, QObject, QPoint, QPointF,
     QPropertyAnimation, pyqtProperty, QEasingCurve,
 )
-from PyQt6.QtGui import QFont, QColor, QPalette, QIcon, QPixmap, QFontMetrics, QCursor, QPainter, QPainterPath, QPen, QBrush
+from PyQt6.QtGui import QFont, QColor, QPalette, QIcon, QPixmap, QFontMetrics, QCursor, QPainter, QPainterPath, QPen, QBrush, QLinearGradient
 
 from config import SERVER_URL, APP_ICON, ICONS_DIR, APP_SETTINGS_FILE, PLAYER_DATA_CACHE_DIR, LIBRARY_CACHE_FILE, WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT, DATA_DIR, APP_VERSION
 from core.library import LibraryManager, SearchResult
-from core.player import PlayerController
+from core.player_vlc import PlayerController, get_eq_band_frequencies
 try:
     from core.account import AccountManager as _AccountManager
 except ImportError:
@@ -216,7 +216,14 @@ def _liked_entry_matches(entry, keys: set) -> bool:
 # _settings keys that describe *this machine*, not the user's account —
 # never synced to the server (a different device's audio device ID or media
 # key support wouldn't mean anything here).
-_LOCAL_ONLY_SETTINGS_KEYS = {"audio_output_device_id", "global_media_keys"}
+_LOCAL_ONLY_SETTINGS_KEYS = {
+    "audio_output_device_id", "global_media_keys",
+    # Эквалайзер настроен под конкретные наушники/колонки этой машины — на
+    # другом устройстве (другой ПК, тем более телефон без поддержки EQ)
+    # тот же изгиб частот скорее всего будет звучать плохо, поэтому не
+    # синхронизируем это через аккаунт, как audio_output_device_id.
+    "eq_enabled", "eq_preamp", "eq_bands",
+}
 
 # _settings keys that are baked into every widget/the whole QApplication at
 # construction time — changing them live isn't practical, so a value that
@@ -2558,6 +2565,234 @@ class _ToggleSwitch(QWidget):
         p.drawEllipse(QRectF(knob_x, knob_y, knob_d, knob_d))
         p.end()
 
+
+def _format_eq_freq(hz: float) -> str:
+    """31.25 -> '31Hz', 1000.0 -> '1K', 16000.0 -> '16K' — matches how EQ
+    bands are usually labeled (foobar2000/Winamp-style), compact enough to
+    fit under a narrow vertical slider."""
+    if hz >= 1000:
+        val = hz / 1000
+        return f"{val:g}K"
+    return f"{hz:.0f}Hz"
+
+
+class _EqCurveWidget(QWidget):
+    """Graphic-EQ curve: draggable dots (one per band) joined by a smooth
+    line with a gradient fill underneath — the "мостик" the reference photo
+    showed, instead of a row of plain vertical sliders. Frequencies are
+    fixed (libVLC's 10 bands aren't configurable), so dragging only ever
+    moves a dot vertically; horizontal position is purely cosmetic/labeling.
+    """
+
+    bandChanged = pyqtSignal(int, float)
+
+    _MARGIN_LEFT = 40
+    _MARGIN_RIGHT = 14
+    _MARGIN_TOP = 16
+    _MARGIN_BOTTOM = 22
+    _DOT_RADIUS = 5.5
+    _HIT_RADIUS = 14  # px, generous click/touch target beyond the visible dot
+
+    def __init__(self, band_freqs: list[float], min_db: float = -12.0, max_db: float = 12.0, parent=None):
+        super().__init__(parent)
+        self._freqs = list(band_freqs)
+        self._min_db = min_db
+        self._max_db = max_db
+        self._values = [0.0] * len(self._freqs)
+        self._drag_index: int | None = None
+        self.setMinimumHeight(200)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def values(self) -> list[float]:
+        return list(self._values)
+
+    def set_values(self, values: list[float]):
+        n = len(self._values)
+        vals = (list(values) + [0.0] * n)[:n]
+        self._values = [max(self._min_db, min(self._max_db, v)) for v in vals]
+        self.update()
+
+    def set_value(self, index: int, db: float):
+        if 0 <= index < len(self._values):
+            self._values[index] = max(self._min_db, min(self._max_db, db))
+            self.update()
+
+    # ── Geometry helpers ─────────────────────────────────────────────────
+
+    def _plot_rect(self) -> QRectF:
+        return QRectF(
+            self._MARGIN_LEFT, self._MARGIN_TOP,
+            max(1, self.width() - self._MARGIN_LEFT - self._MARGIN_RIGHT),
+            max(1, self.height() - self._MARGIN_TOP - self._MARGIN_BOTTOM),
+        )
+
+    def _x_for_index(self, index: int) -> float:
+        rect = self._plot_rect()
+        n = len(self._freqs)
+        if n <= 1:
+            return rect.center().x()
+        return rect.left() + (index / (n - 1)) * rect.width()
+
+    def _y_for_db(self, db: float) -> float:
+        rect = self._plot_rect()
+        span = self._max_db - self._min_db
+        ratio = (self._max_db - db) / span if span else 0.5
+        return rect.top() + ratio * rect.height()
+
+    def _db_for_y(self, y: float) -> float:
+        rect = self._plot_rect()
+        ratio = (y - rect.top()) / rect.height() if rect.height() else 0.0
+        ratio = max(0.0, min(1.0, ratio))
+        return self._max_db - ratio * (self._max_db - self._min_db)
+
+    def _points(self) -> list[QPointF]:
+        return [QPointF(self._x_for_index(i), self._y_for_db(v)) for i, v in enumerate(self._values)]
+
+    @staticmethod
+    def _smooth_path(points: list[QPointF]) -> QPainterPath:
+        """Catmull-Rom through the band points, converted to cubic Bezier
+        segments — gives the gently curved line from the reference photo
+        instead of sharp straight-line joins between bands."""
+        path = QPainterPath()
+        if not points:
+            return path
+        path.moveTo(points[0])
+        if len(points) == 1:
+            return path
+        pts = [points[0]] + points + [points[-1]]
+        for i in range(1, len(pts) - 2):
+            p0, p1, p2, p3 = pts[i - 1], pts[i], pts[i + 1], pts[i + 2]
+            c1 = QPointF(p1.x() + (p2.x() - p0.x()) / 6.0, p1.y() + (p2.y() - p0.y()) / 6.0)
+            c2 = QPointF(p2.x() - (p3.x() - p1.x()) / 6.0, p2.y() - (p3.y() - p1.y()) / 6.0)
+            path.cubicTo(c1, c2, p2)
+        return path
+
+    # ── Painting ─────────────────────────────────────────────────────────
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = self._plot_rect()
+        accent = QColor(COLORS["PRIMARY"])
+        border = QColor(COLORS["BORDER"])
+        text_secondary = QColor(COLORS["TEXT_SECONDARY"])
+
+        # dB gridlines + labels (top/zero/bottom)
+        grid_pen = QPen(border)
+        grid_pen.setWidthF(1.0)
+        p.setFont(QFont("Segoe UI", 8))
+        for db, text in ((self._max_db, f"+{int(self._max_db)}dB"), (0.0, ""), (self._min_db, f"{int(self._min_db)}dB")):
+            y = self._y_for_db(db)
+            pen = QPen(border if db != 0 else border.lighter(130))
+            pen.setWidthF(1.0)
+            if db == 0:
+                pen.setStyle(Qt.PenStyle.DashLine)
+            p.setPen(pen)
+            p.drawLine(QPointF(rect.left(), y), QPointF(rect.right(), y))
+            if text:
+                p.setPen(QPen(text_secondary))
+                p.drawText(QRectF(0, y - 8, self._MARGIN_LEFT - 8, 16),
+                           Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, text)
+
+        # Vertical gridlines + frequency labels per band
+        p.setPen(QPen(border))
+        for i, freq in enumerate(self._freqs):
+            x = self._x_for_index(i)
+            p.drawLine(QPointF(x, rect.top()), QPointF(x, rect.bottom()))
+            p.setPen(QPen(text_secondary))
+            p.drawText(QRectF(x - 24, rect.bottom() + 4, 48, 16),
+                       Qt.AlignmentFlag.AlignCenter, _format_eq_freq(freq))
+            p.setPen(QPen(border))
+
+        if not self._freqs:
+            p.end()
+            return
+
+        points = self._points()
+        line_path = self._smooth_path(points)
+
+        # Gradient fill under the curve, down to the bottom of the plot.
+        fill_path = QPainterPath(line_path)
+        fill_path.lineTo(points[-1].x(), rect.bottom())
+        fill_path.lineTo(points[0].x(), rect.bottom())
+        fill_path.closeSubpath()
+        gradient = QLinearGradient(0, rect.top(), 0, rect.bottom())
+        fill_color = QColor(accent)
+        fill_color.setAlpha(110)
+        gradient.setColorAt(0.0, fill_color)
+        transparent = QColor(accent)
+        transparent.setAlpha(0)
+        gradient.setColorAt(1.0, transparent)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(gradient))
+        p.drawPath(fill_path)
+
+        # The curve line itself.
+        line_pen = QPen(QColor(COLORS["TEXT_PRIMARY"]))
+        line_pen.setWidthF(2.0)
+        line_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        line_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(line_pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(line_path)
+
+        # Draggable dots.
+        for i, pt in enumerate(points):
+            active = i == self._drag_index
+            radius = self._DOT_RADIUS + (1.5 if active else 0)
+            p.setPen(QPen(QColor(COLORS["TEXT_PRIMARY"]), 1.5))
+            p.setBrush(QBrush(accent if active else QColor(COLORS["TEXT_PRIMARY"])))
+            p.drawEllipse(pt, radius, radius)
+
+        p.end()
+
+    # ── Interaction ──────────────────────────────────────────────────────
+
+    def _nearest_index(self, x: float) -> int | None:
+        if not self._freqs:
+            return None
+        best_i, best_dist = None, None
+        for i in range(len(self._freqs)):
+            dist = abs(self._x_for_index(i) - x)
+            if best_dist is None or dist < best_dist:
+                best_i, best_dist = i, dist
+        rect = self._plot_rect()
+        col_width = rect.width() / max(1, len(self._freqs) - 1) if len(self._freqs) > 1 else rect.width()
+        if best_dist is not None and best_dist <= max(self._HIT_RADIUS, col_width / 2):
+            return best_i
+        return None
+
+    def _set_from_mouse(self, index: int, y: float):
+        db = self._db_for_y(y)
+        db = round(db)  # целые dB — как и раньше, не точный микшер
+        if db != self._values[index]:
+            self._values[index] = db
+            self.update()
+            self.bandChanged.emit(index, float(db))
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton or not self.isEnabled():
+            return
+        pos = event.position()
+        index = self._nearest_index(pos.x())
+        if index is None:
+            return
+        self._drag_index = index
+        self._set_from_mouse(index, pos.y())
+        self.update()
+
+    def mouseMoveEvent(self, event):
+        if self._drag_index is None:
+            return
+        self._set_from_mouse(self._drag_index, event.position().y())
+
+    def mouseReleaseEvent(self, event):
+        if self._drag_index is not None:
+            self._drag_index = None
+            self.update()
+
+
 class SettingsPage(QWidget):
     logout_clicked = pyqtSignal()
     accent_changed = pyqtSignal(str)
@@ -2565,10 +2800,14 @@ class SettingsPage(QWidget):
     scale_changed = pyqtSignal(float)
     discord_rpc_toggled = pyqtSignal(bool)
     cache_cleared = pyqtSignal()
+    eq_enabled_toggled = pyqtSignal(bool)
+    eq_band_changed = pyqtSignal(int, float)
+    eq_preamp_changed = pyqtSignal(float)
+    eq_reset_clicked = pyqtSignal()
 
     SCALE_PRESETS = [("75%", 0.75), ("100%", 1.0), ("125%", 1.25), ("150%", 1.5)]
 
-    def __init__(self, parent=None):
+    def __init__(self, eq_band_freqs: list[float] | None = None, parent=None):
         super().__init__(parent)
         self._discord_toggle = None
         self._accent_btns: list[QPushButton] = []
@@ -2577,6 +2816,12 @@ class SettingsPage(QWidget):
         self._current_theme = "dark"
         self._scale_btns: dict[float, QPushButton] = {}
         self._current_scale = 1.0
+        self._eq_band_freqs = eq_band_freqs or []
+        self._eq_toggle: _ToggleSwitch | None = None
+        self._eq_preamp_slider: QSlider | None = None
+        self._eq_preamp_value_lbl: QLabel | None = None
+        self._eq_curve: _EqCurveWidget | None = None
+        self._eq_controls_widget: QWidget | None = None
         self._build_ui()
 
     def _make_card(self, parent_layout: QVBoxLayout) -> QVBoxLayout:
@@ -2708,6 +2953,9 @@ class SettingsPage(QWidget):
         discord_row.addWidget(self._discord_toggle)
         integ_card.addLayout(discord_row)
 
+        # ── Equalizer card ───────────────────────────────────────────────────
+        self._build_eq_card(layout)
+
         # ── Data card ────────────────────────────────────────────────────────
         data_card = self._make_card(layout)
         data_card.addWidget(self._section_label("Данные"))
@@ -2755,6 +3003,119 @@ class SettingsPage(QWidget):
             f"QPushButton:hover {{ border-color: #ff7a7a; color: #ff7a7a; }}"
         )
         layout.addWidget(logout_btn)
+
+    def _build_eq_card(self, layout: QVBoxLayout):
+        eq_card = self._make_card(layout)
+
+        header_row = QHBoxLayout()
+        header_row.setContentsMargins(0, 0, 0, 0)
+        header_row.setSpacing(10)
+        header_row.addWidget(self._section_label("Эквалайзер"))
+        header_row.addStretch(1)
+
+        reset_btn = QPushButton("Сбросить")
+        reset_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        reset_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        reset_btn.setFixedHeight(26)
+        reset_btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; border: 1px solid {COLORS['BORDER']}; "
+            f"border-radius: 6px; color: {COLORS['TEXT_SECONDARY']}; font: 9pt 'Segoe UI'; padding: 0 10px; }}"
+            f"QPushButton:hover {{ border-color: {COLORS['TEXT_PRIMARY']}; color: {COLORS['TEXT_PRIMARY']}; }}"
+        )
+        reset_btn.clicked.connect(self._on_eq_reset_clicked)
+        header_row.addWidget(reset_btn)
+
+        self._eq_toggle = _ToggleSwitch()
+        self._eq_toggle.toggled.connect(self._on_eq_toggle_changed)
+        header_row.addWidget(self._eq_toggle)
+        eq_card.addLayout(header_row)
+
+        # Полосы у libVLC фиксированы (10 штук, не настраиваются) — если
+        # плеер не на VLC-бэкенде (см. player_vlc.py), список частот будет
+        # пустым и вместо графика показываем поясняющую подпись, а не
+        # пустую карточку без объяснений.
+        if not self._eq_band_freqs:
+            unavailable_lbl = QLabel("Недоступно с текущим бэкендом воспроизведения.")
+            unavailable_lbl.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']}; font: 9pt 'Segoe UI';")
+            eq_card.addWidget(unavailable_lbl)
+            return
+
+        self._eq_controls_widget = QWidget()
+        controls_col = QVBoxLayout(self._eq_controls_widget)
+        controls_col.setContentsMargins(0, 4, 0, 0)
+        controls_col.setSpacing(10)
+
+        preamp_row = QHBoxLayout()
+        preamp_row.setContentsMargins(0, 0, 0, 0)
+        preamp_row.setSpacing(10)
+        preamp_lbl = QLabel("Preamp")
+        preamp_lbl.setFixedWidth(52)
+        preamp_lbl.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']}; font: 9pt 'Segoe UI';")
+        preamp_row.addWidget(preamp_lbl)
+
+        self._eq_preamp_slider = QSlider(Qt.Orientation.Horizontal)
+        self._eq_preamp_slider.setRange(-12, 12)
+        self._eq_preamp_slider.setValue(0)
+        self._eq_preamp_slider.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._eq_preamp_slider.setStyleSheet(
+            f"QSlider::groove:horizontal {{ height: 4px; background: {COLORS['BORDER']}; border-radius: 2px; }}"
+            f"QSlider::handle:horizontal {{ background: {COLORS['PRIMARY']}; width: 14px; height: 14px; "
+            f"margin: -5px 0; border-radius: 7px; }}"
+            f"QSlider::sub-page:horizontal {{ background: {COLORS['PRIMARY']}; border-radius: 2px; }}"
+            f"QSlider::add-page:horizontal {{ background: {COLORS['BORDER']}; border-radius: 2px; }}"
+        )
+        self._eq_preamp_slider.valueChanged.connect(self._on_eq_preamp_slider_changed)
+        preamp_row.addWidget(self._eq_preamp_slider, stretch=1)
+
+        self._eq_preamp_value_lbl = QLabel("0dB")
+        self._eq_preamp_value_lbl.setFixedWidth(36)
+        self._eq_preamp_value_lbl.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']}; font: 9pt 'Segoe UI';")
+        preamp_row.addWidget(self._eq_preamp_value_lbl)
+        controls_col.addLayout(preamp_row)
+
+        self._eq_curve = _EqCurveWidget(self._eq_band_freqs)
+        self._eq_curve.bandChanged.connect(self.eq_band_changed.emit)
+        controls_col.addWidget(self._eq_curve)
+
+        eq_card.addWidget(self._eq_controls_widget)
+        self._eq_controls_widget.setEnabled(False)  # выключен, пока не включат тумблером
+
+    def _on_eq_toggle_changed(self, enabled: bool):
+        if self._eq_controls_widget is not None:
+            self._eq_controls_widget.setEnabled(enabled)
+        self.eq_enabled_toggled.emit(enabled)
+
+    def _on_eq_preamp_slider_changed(self, value: int):
+        self._eq_preamp_value_lbl.setText(f"{value:+d}dB" if value else "0dB")
+        self.eq_preamp_changed.emit(float(value))
+
+    def _on_eq_reset_clicked(self):
+        if self._eq_preamp_slider is not None:
+            self._eq_preamp_slider.blockSignals(True)
+            self._eq_preamp_slider.setValue(0)
+            self._eq_preamp_slider.blockSignals(False)
+            self._eq_preamp_value_lbl.setText("0dB")
+        if self._eq_curve is not None:
+            self._eq_curve.set_values([0.0] * len(self._eq_band_freqs))
+        self.eq_reset_clicked.emit()
+
+    def set_eq_enabled(self, enabled: bool):
+        if self._eq_toggle is None:
+            return
+        self._eq_toggle.blockSignals(True)
+        self._eq_toggle.setChecked(enabled)
+        self._eq_toggle.blockSignals(False)
+        if self._eq_controls_widget is not None:
+            self._eq_controls_widget.setEnabled(enabled)
+
+    def set_eq_values(self, preamp: float, bands: list[float]):
+        if self._eq_preamp_slider is not None:
+            self._eq_preamp_slider.blockSignals(True)
+            self._eq_preamp_slider.setValue(int(round(preamp)))
+            self._eq_preamp_slider.blockSignals(False)
+            self._eq_preamp_value_lbl.setText(f"{int(round(preamp)):+d}dB" if preamp else "0dB")
+        if self._eq_curve is not None:
+            self._eq_curve.set_values(bands)
 
     def _restyle_accent_buttons(self):
         """Redraw swatches, ring-highlighting + checkmark on whichever matches the current accent."""
@@ -2998,6 +3359,19 @@ class MusicApp(QWidget):
             self.player.repeat_mode = saved_repeat
             self._controls.set_repeat(saved_repeat)
 
+        band_count = len(get_eq_band_frequencies())
+        eq_enabled = bool(self._settings.get("eq_enabled", False))
+        eq_preamp = float(self._settings.get("eq_preamp", 0.0) or 0.0)
+        eq_bands = list(self._settings.get("eq_bands") or [0.0] * band_count)
+        if len(eq_bands) != band_count:
+            eq_bands = (eq_bands + [0.0] * band_count)[:band_count]
+        self._settings_page.set_eq_values(eq_preamp, eq_bands)
+        self._settings_page.set_eq_enabled(eq_enabled)
+        self.player.set_eq_preamp(eq_preamp)
+        for index, db in enumerate(eq_bands):
+            self.player.set_eq_band(index, db)
+        self.player.set_eq_enabled(eq_enabled)
+
     def _save_settings(self):
         try:
             self._settings["audio_output_device_id"] = self.player._preferred_audio_output_id
@@ -3068,7 +3442,7 @@ class MusicApp(QWidget):
         self._album_page = AlbumPage()
         self._search_page = SearchPage()
         self._all_artists_page = AllArtistsPage()
-        self._settings_page = SettingsPage()
+        self._settings_page = SettingsPage(eq_band_freqs=get_eq_band_frequencies())
 
         for page in [self._welcome_page, self._artist_page, self._album_page,
                      self._search_page, self._all_artists_page, self._settings_page]:
@@ -3124,6 +3498,10 @@ class MusicApp(QWidget):
         self._settings_page.scale_changed.connect(self._on_scale_changed)
         self._settings_page.discord_rpc_toggled.connect(self._on_discord_rpc_toggled)
         self._settings_page.cache_cleared.connect(self._on_cache_cleared)
+        self._settings_page.eq_enabled_toggled.connect(self._on_eq_enabled_toggled)
+        self._settings_page.eq_band_changed.connect(self._on_eq_band_changed)
+        self._settings_page.eq_preamp_changed.connect(self._on_eq_preamp_changed)
+        self._settings_page.eq_reset_clicked.connect(self._on_eq_reset)
 
     def _build_top_bar(self, parent_layout):
         bar = QWidget()
@@ -3234,7 +3612,7 @@ class MusicApp(QWidget):
             f"color: {COLORS['TEXT_SECONDARY']}; font-size: 17px; }}"
             f"QPushButton:hover {{ color: {COLORS['TEXT_PRIMARY']}; background: {COLORS['SURFACE_HOVER']}; }}"
         )
-        settings_btn.clicked.connect(self._toggle_settings)
+        settings_btn.clicked.connect(self._open_settings)
         rp_layout.addWidget(settings_btn)
 
         bar_layout.addWidget(left_panel, 1)
@@ -3784,11 +4162,8 @@ class MusicApp(QWidget):
         else:
             self._page_stack.setCurrentWidget(self._welcome_page)
 
-    def _toggle_settings(self):
-        if self._page_stack.currentWidget() == self._settings_page:
-            self._go_home()
-        else:
-            self._page_stack.setCurrentWidget(self._settings_page)
+    def _open_settings(self):
+        self._page_stack.setCurrentWidget(self._settings_page)
 
     def _show_all_artists(self):
         self._all_artists_page.load_artists(self.library_manager.get_library())
@@ -4223,6 +4598,27 @@ class MusicApp(QWidget):
         top = self.window()
         if top:
             top.close()
+
+    # ── Эквалайзер ───────────────────────────────────────────────────────────
+
+    def _on_eq_enabled_toggled(self, enabled: bool):
+        self.player.set_eq_enabled(enabled)
+        self._save_ui_state(eq_enabled=enabled)
+
+    def _on_eq_band_changed(self, index: int, db: float):
+        self.player.set_eq_band(index, db)
+        bands = list(self._settings.get("eq_bands") or [0.0] * len(get_eq_band_frequencies()))
+        if index < len(bands):
+            bands[index] = db
+            self._save_ui_state(eq_bands=bands)
+
+    def _on_eq_preamp_changed(self, db: float):
+        self.player.set_eq_preamp(db)
+        self._save_ui_state(eq_preamp=db)
+
+    def _on_eq_reset(self):
+        self.player.reset_eq()
+        self._save_ui_state(eq_preamp=0.0, eq_bands=[0.0] * len(get_eq_band_frequencies()))
 
     # ── Discord RPC ───────────────────────────────────────────────────────────
 

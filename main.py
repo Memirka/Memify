@@ -233,7 +233,26 @@ class AppWindow(QWidget):
             return
 
         # Lazy import to keep startup fast
-        from ui.main_window import MusicApp
+        try:
+            from ui.main_window import MusicApp
+        except (ImportError, OSError) as e:
+            # ui.main_window imports core.player_vlc, which imports the vlc
+            # module — that raises exactly these two error types when
+            # libVLC's shared library can't be found (missing python-vlc
+            # package -> ImportError; python-vlc installed but the actual
+            # libvlc.dll/.so isn't -> OSError from ctypes.CDLL). Both are
+            # effectively the same problem for the user: no working audio
+            # backend. A raw traceback here would be a dead end for them —
+            # this at least says what to do about it.
+            QMessageBox.critical(
+                self,
+                "Ошибка запуска",
+                "Не удалось загрузить компонент воспроизведения аудио (VLC).\n\n"
+                "Попробуйте установить VLC media player (videolan.org) и "
+                "запустить приложение снова.\n\n"
+                f"Подробности: {e}",
+            )
+            sys.exit(1)
 
         self._main_widget = MusicApp(account_manager=self._account_manager)
         self._main_widget.logout_requested.connect(self._on_logout)

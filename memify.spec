@@ -5,7 +5,9 @@
 # Output goes to dist/Memify (a single self-contained executable per OS —
 # users just download and run it, no Python or libraries required).
 
+import os
 import sys
+import glob
 
 from PyInstaller.utils.hooks import collect_all
 
@@ -14,6 +16,90 @@ block_cipher = None
 datas = [
     ("assets", "assets"),
 ]
+binaries = []
+
+
+def _find_vlc_files():
+    """Locate libVLC's shared library + "plugins" folder on the BUILD
+    machine, so PyInstaller can bundle them into the exe — python-vlc (in
+    requirements.txt) is only a thin ctypes wrapper; the actual libVLC
+    runtime has to come from wherever the CI step installed it
+    (choco/apt, see .github/workflows/build.yml), not from pip. Without
+    this, the built exe imports fine wherever VLC happens to already be
+    installed system-wide (e.g. this dev machine) but fails on a clean
+    end-user machine — which was the whole point of bundling.
+
+    Windows: bundled fully — libVLC's Windows build is fairly
+    self-contained, so this is the well-trodden, reliable path.
+
+    Linux: bundled best-effort. Several VLC plugins (mp3/alsa/pulse codecs)
+    dynamically link against other system libraries (libmpg123, libasound,
+    libpulse, ...) that this does NOT chase down and bundle too — doing
+    that reliably across arbitrary distros is its own large, fragile
+    undertaking (glibc/ABI differences make bundled Linux .so files far
+    less portable than bundled Windows DLLs to begin with). This works
+    correctly on Debian/Ubuntu-family desktops, where those libraries are
+    near-universal pre-existing packages — which is most desktop Linux
+    users, just not an absolute guarantee for every distro.
+    """
+    found_binaries = []
+    found_datas = []
+
+    if sys.platform == "win32":
+        candidates = [
+            os.environ.get("VLC_PATH", ""),
+            r"C:\Program Files\VideoLAN\VLC",
+            r"C:\Program Files (x86)\VideoLAN\VLC",
+        ]
+        vlc_dir = next((c for c in candidates if c and os.path.isdir(c)), None)
+        if not vlc_dir:
+            print("!! memify.spec: VLC install not found (checked VLC_PATH env + standard "
+                  "Program Files paths) — build will NOT have a working equalizer/player "
+                  "on machines without VLC installed.")
+            return found_binaries, found_datas
+        for dll_name in ("libvlc.dll", "libvlccore.dll"):
+            dll_path = os.path.join(vlc_dir, dll_name)
+            if os.path.isfile(dll_path):
+                found_binaries.append((dll_path, "."))
+        plugins_dir = os.path.join(vlc_dir, "plugins")
+        if os.path.isdir(plugins_dir):
+            found_datas.append((plugins_dir, "plugins"))
+    else:
+        lib_globs = [
+            "/usr/lib/x86_64-linux-gnu/libvlc.so*",
+            "/usr/lib/x86_64-linux-gnu/libvlccore.so*",
+            "/usr/lib/*/libvlc.so*",
+            "/usr/lib/*/libvlccore.so*",
+            "/usr/lib/libvlc.so*",
+            "/usr/lib/libvlccore.so*",
+        ]
+        seen = set()
+        for pattern in lib_globs:
+            for path in glob.glob(pattern):
+                if os.path.isfile(path) and path not in seen:
+                    seen.add(path)
+                    found_binaries.append((path, "."))
+        plugin_dir_globs = [
+            "/usr/lib/x86_64-linux-gnu/vlc/plugins",
+            "/usr/lib/*/vlc/plugins",
+            "/usr/lib/vlc/plugins",
+        ]
+        plugins_dir = next(
+            (p for pat in plugin_dir_globs for p in glob.glob(pat) if os.path.isdir(p)), None
+        )
+        if plugins_dir:
+            found_datas.append((plugins_dir, "plugins"))
+        if not found_binaries or not plugins_dir:
+            print("!! memify.spec: VLC install not found (checked standard apt/system lib "
+                  "paths) — build will NOT have a working equalizer/player on machines "
+                  "without VLC installed.")
+
+    return found_binaries, found_datas
+
+
+_vlc_binaries, _vlc_datas = _find_vlc_files()
+binaries += _vlc_binaries
+datas += _vlc_datas
 
 # PyQt6 ships its own plugins (platform, multimedia/ffmpeg backend, etc.) that
 # plain import-analysis won't find on its own — pull them in explicitly, then
@@ -46,6 +132,7 @@ def _keep_qt_entry(entry) -> bool:
 qt_datas = [d for d in qt_datas if _keep_qt_entry(d)]
 qt_binaries = [b for b in qt_binaries if _keep_qt_entry(b)]
 datas += qt_datas
+binaries += qt_binaries
 
 # Extra safety net: explicitly keep PyQt6's unused submodules out even if some
 # hook chain tries to pull one back in transitively.
@@ -65,7 +152,7 @@ _UNUSED_QT_MODULES = [
 a = Analysis(
     ["main.py"],
     pathex=[],
-    binaries=qt_binaries,
+    binaries=binaries,
     datas=datas,
     hiddenimports=[],
     hookspath=[],

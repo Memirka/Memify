@@ -1,0 +1,456 @@
+"""Прототип PlayerController на libVLC вместо Qt Multimedia (QMediaPlayer).
+
+Причина: QMediaPlayer/QAudioOutput в Qt6 не дают доступа к сырому аудиопотоку
+для наложения фильтров — нет штатного способа сделать эквалайзер. У libVLC
+эквалайзер встроен (10 фиксированных полос, см. get_eq_band_frequencies()).
+
+Публичный интерфейс класса (методы/атрибуты, которые дергают main_window.py и
+utils/media_keys.py) сохранён 1:1 с core/player.py — оба файла НЕ трогают
+внутренние объекты плеера напрямую, только вызывают методы PlayerController,
+поэтому этот файл можно подставить взамен оригинала простой заменой
+`from core.player import PlayerController` на `from core.player_vlc import
+PlayerController` в main_window.py, ничего больше менять не нужно.
+
+Не перенесено (см. TODO по тексту) — можно доделать отдельным проходом:
+- переключение аудиоустройства (get_audio_outputs/set_audio_output_device) —
+  у libVLC для этого совсем другое API (audio_output_device_enum), сделан
+  черновой вариант, но не проверен на реальном множественном выборе устройств
+  так тщательно, как остальное;
+- warm_up() упрощён — у VLC нет того же холодного старта FFmpeg-бэкенда Qt,
+  поэтому не переносился 1:1, а сделан заметно проще.
+
+Требует: pip install python-vlc (тонкая ctypes-обвязка) + сам libVLC,
+установленный в системе (на Windows — рантайм VLC нужно будет тащить в
+сборку PyInstaller, см. обсуждение в чате).
+"""
+
+import os
+import random
+import vlc
+from PyQt6.QtCore import QObject, pyqtSignal, QTimer
+from config import PLAYER_WARMUP_SOUND
+
+
+# 10 полос эквалайзера у libVLC фиксированы (не настраиваются) — в отличие от
+# скриншота-референса (60/150/400/1K/2.4K/15K), тут ровно эти частоты; узнаём
+# их у самой либы, а не хардкодим, на случай другой версии libVLC.
+def get_eq_band_frequencies() -> list[float]:
+    count = vlc.libvlc_audio_equalizer_get_band_count()
+    return [vlc.libvlc_audio_equalizer_get_band_frequency(i) for i in range(count)]
+
+
+class PlayerController(QObject):
+    currentUrlChanged = pyqtSignal(str)
+    audioOutputsUpdated = pyqtSignal(list)
+    audioOutputDeviceChanged = pyqtSignal(object)
+
+    def __init__(self):
+        super().__init__()
+        # --no-video: аудио-плеер, декодировать/показывать видеодорожку не нужно.
+        self._vlc_instance = vlc.Instance(["--no-video", "--quiet"])
+        self.player = self._vlc_instance.media_player_new()
+
+        self._preferred_audio_output_id = None
+        self._current_audio_output_id = None
+        self._has_emitted_audio_device = False
+        self._available_audio_outputs: list[dict] = []
+
+        # Эквалайзер живёт независимо от текущего трека — пересоздавать
+        # media на play_track() эквалайзер не сбрасывает (в отличие от
+        # некоторых свойств QMediaPlayer), но explicit set_equalizer()
+        # нужно дергать заново на каждый новый MediaPlayer (тут он один и
+        # тот же на весь процесс, так что один раз в конце __init__ и потом
+        # при каждом изменении полосы).
+        self._eq = vlc.AudioEqualizer()
+        self._eq_band_freqs = get_eq_band_frequencies()
+        self._eq_amps = [0.0] * len(self._eq_band_freqs)
+        self._eq_preamp = 0.0
+        self._eq_enabled = False
+        self._eq_apply_timer = QTimer()
+        self._eq_apply_timer.setSingleShot(True)
+        self._eq_apply_timer.setInterval(60)
+        self._eq_apply_timer.timeout.connect(self._apply_eq)
+
+        self.current_playing_album = None
+        self.current_playing_artist = None
+        self.current_track = None
+        self.current_track_idx = None
+        self.track_durations = {}
+        self.shuffle_enabled = False
+        self.repeat_mode = "off"
+        self.shuffled_indices = []
+        self._manual_track_switch = False
+        self._ended_handled = False  # чтобы _handle_track_end не сработал дважды на одном Ended-состоянии
+
+        self.timer = QTimer()
+        self.timer.setInterval(500)
+
+        self.on_track_changed = None
+        self.on_playback_state_changed = None
+        self.on_position_changed = None
+        self.on_duration_changed = None
+        self.on_album_finished = None
+        self.on_album_previous = None
+
+    def setup_connections(self):
+        # В отличие от QMediaPlayer, здесь нет Qt-сигналов positionChanged/
+        # durationChanged/mediaStatusChanged — libVLC шлёт события на своём
+        # внутреннем потоке (небезопасно дёргать оттуда Qt напрямую), поэтому
+        # всё состояние (позиция, длительность, конец трека) вычитывается по
+        # таймеру ниже, тем же самым, который раньше просто дублировал
+        # positionChanged для прогресс-бара.
+        self.timer.timeout.connect(self._on_timer_timeout)
+
+    def set_callbacks(self, track_changed=None, playback_state_changed=None,
+                      position_changed=None, duration_changed=None,
+                      album_finished=None, album_previous=None):
+        self.on_track_changed = track_changed
+        self.on_playback_state_changed = playback_state_changed
+        self.on_position_changed = position_changed
+        self.on_duration_changed = duration_changed
+        self.on_album_finished = album_finished
+        self.on_album_previous = album_previous
+
+    # ── Эквалайзер ───────────────────────────────────────────────────────────
+
+    def get_eq_bands(self) -> list[tuple[float, float]]:
+        """[(частота, текущий_дБ), ...] — для построения UI."""
+        return list(zip(self._eq_band_freqs, self._eq_amps))
+
+    def set_eq_band(self, index: int, db: float) -> None:
+        if not (0 <= index < len(self._eq_amps)):
+            return
+        db = max(-20.0, min(20.0, db))
+        self._eq_amps[index] = db
+        self._eq.set_amp_at_index(db, index)
+        self._schedule_eq_apply()
+
+    def set_eq_preamp(self, db: float) -> None:
+        db = max(-20.0, min(20.0, db))
+        self._eq_preamp = db
+        self._eq.set_preamp(db)
+        self._schedule_eq_apply()
+
+    def set_eq_enabled(self, enabled: bool) -> None:
+        self._eq_enabled = enabled
+        self._eq_apply_timer.stop()
+        self._apply_eq()
+
+    def reset_eq(self) -> None:
+        self._eq_amps = [0.0] * len(self._eq_band_freqs)
+        self._eq_preamp = 0.0
+        self._eq = vlc.AudioEqualizer()
+        self._eq_apply_timer.stop()
+        self._apply_eq()
+
+    def _schedule_eq_apply(self) -> None:
+        # libVLC пересобирает часть аудио-пайплайна на каждый
+        # set_equalizer() (проверено: mid-playback вызов на живом плеере
+        # приводит к пересозданию audio output) — при быстром перетаскивании
+        # ползунка это может слать десятки вызовов в секунду и заикать звук.
+        # Дебаунс коротким таймером схлопывает их в один вызов после того,
+        # как палец/мышь на мгновение остановились.
+        self._eq_apply_timer.start()
+
+    def _apply_eq(self) -> None:
+        # set_equalizer(None) в libVLC отключает эквалайзер полностью —
+        # используем это для тумблера "выкл", вместо обнуления полос (что
+        # оставило бы преамп/эквалайзер формально включённым на нулях).
+        self.player.set_equalizer(self._eq if self._eq_enabled else None)
+
+    # ── Audio device management (черновик, не так тщательно проверено,
+    #    как остальное — TODO) ──────────────────────────────────────────────
+
+    def get_audio_outputs(self) -> list:
+        devices = []
+        node = self.player.audio_output_device_enum()
+        head = node
+        while node:
+            d = node.contents
+            device_id = (d.device or b"").decode("utf-8", errors="ignore")
+            description = (d.description or b"").decode("utf-8", errors="ignore")
+            devices.append({"id": device_id, "description": description, "is_default": False})
+            node = d.next
+        if head:
+            vlc.libvlc_audio_output_device_list_release(head)
+        self._available_audio_outputs = devices
+        return list(devices)
+
+    def set_audio_output_device(self, device_id):
+        self._preferred_audio_output_id = device_id or None
+        try:
+            # module=None — рекомендуемый libVLC способ: применяется сразу,
+            # без пересоздания audio output (см. докстринг audio_output_device_set).
+            self.player.audio_output_device_set(None, device_id)
+            if self._current_audio_output_id != device_id or not self._has_emitted_audio_device:
+                self._current_audio_output_id = device_id
+                self._has_emitted_audio_device = True
+                try:
+                    self.audioOutputDeviceChanged.emit(device_id)
+                except Exception:
+                    pass
+            return True
+        except Exception as e:
+            print(f"Audio device error: {e}")
+            return False
+
+    # ── Playback control ──────────────────────────────────────────────────────
+
+    def warm_up(self, remote_url: str | None = None):
+        """Упрощённая версия — у VLC нет того же дорогого холодного старта,
+        какой был у Qt-бэкенда (FFmpeg/GStreamer инициализировался лениво на
+        первый setSource()+play()); Instance() в __init__ уже поднимает
+        libVLC. Здесь только проигрываем тишину доли секунды, чтобы прогреть
+        именно аудио-пайплайн ОС (открытие устройства вывода) — не полноценный
+        порт исходной логики, а заведомое упрощение под прототип."""
+        source = remote_url or (PLAYER_WARMUP_SOUND if os.path.exists(PLAYER_WARMUP_SOUND) else None)
+        if not source:
+            return
+        try:
+            warmup_player = self._vlc_instance.media_player_new()
+            warmup_player.audio_set_volume(0)
+            media = self._vlc_instance.media_new(source)
+            warmup_player.set_media(media)
+            warmup_player.play()
+            QTimer.singleShot(600, warmup_player.stop)
+        except Exception:
+            pass
+
+    def set_album(self, album: dict, artist: dict):
+        self.current_playing_album = album
+        self.current_playing_artist = artist
+        track_count = len(album.get("tracks", []))
+        self.shuffled_indices = list(range(track_count))
+        if self.shuffle_enabled:
+            random.shuffle(self.shuffled_indices)
+        self.current_track = None
+        self.current_track_idx = None
+
+    def play_track(self, index: int) -> bool:
+        if not self.current_playing_album:
+            return False
+        if not self.shuffled_indices:
+            track_count = len(self.current_playing_album.get("tracks", []))
+            self.shuffled_indices = list(range(track_count))
+            if self.shuffle_enabled:
+                random.shuffle(self.shuffled_indices)
+        if index >= len(self.shuffled_indices):
+            return False
+        try:
+            self._manual_track_switch = True
+            self._ended_handled = False
+            self.current_track = index
+            self.current_track_idx = self.shuffled_indices[index]
+            track = self.current_playing_album["tracks"][self.current_track_idx]
+
+            from config import SERVER_URL
+            track_url = SERVER_URL + track.get("url", "")
+            media = self._vlc_instance.media_new(track_url)
+            self.player.set_media(media)
+            self.player.play()
+            self.timer.start()
+
+            if self.on_track_changed:
+                self.on_track_changed(track, self.current_playing_artist, self.current_playing_album)
+            if self.on_playback_state_changed:
+                self.on_playback_state_changed(True)
+
+            QTimer.singleShot(300, lambda: setattr(self, "_manual_track_switch", False))
+            self.currentUrlChanged.emit(track_url)
+            return True
+        except Exception as e:
+            print(f"play_track error: {e}")
+            return False
+
+    def toggle_playback(self):
+        try:
+            if self.player.is_playing():
+                self.player.set_pause(1)
+                if self.on_playback_state_changed:
+                    self.on_playback_state_changed(False)
+            else:
+                if self.player.get_media() is None:
+                    if self.current_track is not None and self.current_playing_album:
+                        self.play_track(self.current_track)
+                    # нет media и нет альбома — ничего не делаем (не показываем "играет" без звука)
+                else:
+                    self.player.set_pause(0)
+                    if self.on_playback_state_changed:
+                        self.on_playback_state_changed(True)
+        except Exception as e:
+            print(f"toggle_playback error: {e}")
+
+    def play_next(self):
+        if getattr(self, "_processing_next", False):
+            return
+        try:
+            self._processing_next = True
+            if not self.current_playing_album or not self.shuffled_indices:
+                return
+            if self.current_track is None:
+                self.play_track(0)
+                return
+            if self.repeat_mode == "track":
+                self.play_track(self.current_track)
+                return
+            next_pos = self.current_track + 1
+            if next_pos < len(self.shuffled_indices):
+                self.play_track(next_pos)
+            elif self.repeat_mode == "album":
+                self.play_track(0)
+            else:
+                handled = False
+                try:
+                    if self.on_album_finished:
+                        handled = bool(self.on_album_finished(self.current_playing_artist, self.current_playing_album))
+                except Exception:
+                    pass
+                if not handled:
+                    self.stop()
+        except Exception as e:
+            print(f"play_next error: {e}")
+        finally:
+            QTimer.singleShot(200, lambda: setattr(self, "_processing_next", False))
+
+    def play_prev(self):
+        if getattr(self, "_processing_prev", False):
+            return
+        try:
+            self._processing_prev = True
+            if not self.current_playing_album or not self.shuffled_indices:
+                return
+            if self.current_track is None:
+                self.play_track(len(self.shuffled_indices) - 1)
+                return
+            if self.repeat_mode == "track":
+                self.play_track(self.current_track)
+                return
+            pos_ms = 0
+            try:
+                pos_ms = self.player.get_time()
+            except Exception:
+                pass
+            if pos_ms < 2000:
+                if self.repeat_mode == "off" and self.current_track == 0 and self.on_album_previous:
+                    if self.on_album_previous(self.current_playing_artist, self.current_playing_album):
+                        return
+                prev = self.current_track - 1 if self.current_track > 0 else len(self.shuffled_indices) - 1
+                self.play_track(prev)
+            else:
+                self.play_track(self.current_track)
+        except Exception as e:
+            print(f"play_prev error: {e}")
+        finally:
+            QTimer.singleShot(200, lambda: setattr(self, "_processing_prev", False))
+
+    def stop(self):
+        self.player.stop()
+        self.timer.stop()
+        if self.on_playback_state_changed:
+            self.on_playback_state_changed(False)
+
+    def seek_position(self, value: float):
+        try:
+            length = self.player.get_length()
+            if length > 0:
+                self.player.set_time(int(length * value / 100))
+        except Exception:
+            pass
+
+    def set_volume(self, value: int):
+        try:
+            # У QAudioOutput громкость была float 0.0-1.0 — libVLC сразу
+            # принимает int 0-100, конвертация больше не нужна.
+            self.player.audio_set_volume(max(0, min(100, int(value))))
+        except Exception:
+            pass
+
+    def get_volume(self) -> int:
+        try:
+            return max(0, min(100, int(self.player.audio_get_volume())))
+        except Exception:
+            return 100
+
+    def toggle_shuffle(self) -> bool:
+        self.shuffle_enabled = not self.shuffle_enabled
+        if self.current_playing_album:
+            old_idx = self.current_track_idx
+            track_count = len(self.current_playing_album["tracks"])
+            self.shuffled_indices = list(range(track_count))
+            if self.shuffle_enabled:
+                random.shuffle(self.shuffled_indices)
+            if old_idx is not None:
+                try:
+                    self.current_track = self.shuffled_indices.index(old_idx)
+                except ValueError:
+                    self.current_track = 0
+        return self.shuffle_enabled
+
+    def toggle_repeat(self) -> str:
+        modes = ["off", "album", "track"]
+        self.repeat_mode = modes[(modes.index(self.repeat_mode) + 1) % len(modes)]
+        return self.repeat_mode
+
+    def get_current_position(self) -> int:
+        try:
+            return max(0, self.player.get_time())
+        except Exception:
+            return 0
+
+    def get_duration(self) -> int:
+        try:
+            return max(0, self.player.get_length())
+        except Exception:
+            return 0
+
+    def is_playing(self) -> bool:
+        try:
+            return bool(self.player.is_playing())
+        except Exception:
+            return False
+
+    def get_current_track_real_index(self) -> int | None:
+        return self.current_track_idx
+
+    # ── Internal: таймер вместо Qt-сигналов от QMediaPlayer ────────────────
+
+    def _on_timer_timeout(self):
+        if self.on_position_changed:
+            self.on_position_changed()
+        if self._manual_track_switch:
+            return
+        try:
+            state = self.player.get_state()
+        except Exception:
+            return
+        if state == vlc.State.Ended and not self._ended_handled:
+            self._ended_handled = True
+            self._handle_track_end()
+        elif state == vlc.State.Error and not self._ended_handled:
+            # Битый/недоступный поток — не зависаем молча, ведём себя как
+            # обычный конец трека, чтобы очередь пошла дальше.
+            self._ended_handled = True
+            self._handle_track_end()
+
+    def _handle_track_end(self):
+        try:
+            if self.repeat_mode == "track":
+                self.play_next()
+            elif self.repeat_mode == "album":
+                self.play_next()
+            else:
+                if not self.current_playing_album or self.current_track is None:
+                    return
+                if self.current_track + 1 < len(self.shuffled_indices):
+                    self.play_next()
+                else:
+                    handled = False
+                    try:
+                        if self.on_album_finished:
+                            handled = bool(self.on_album_finished(self.current_playing_artist, self.current_playing_album))
+                    except Exception:
+                        pass
+                    if not handled:
+                        self.stop()
+        except Exception:
+            pass

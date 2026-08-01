@@ -6,7 +6,7 @@ SERVER_URL = "https://memify.memiras.net"
 # Bump this on every release that gets built into dist/Memify (or Memify.exe)
 # and uploaded to the server — it's what the running app compares against
 # the server's version.txt to decide whether to self-update.
-APP_VERSION = "1.1.5"
+APP_VERSION = "1.1.6"
 
 CACHE_SIZE = 100
 IMAGE_CACHE_SIZE = 50
@@ -20,6 +20,27 @@ else:
 
 DATA_DIR = os.path.join(APP_DIR, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
+
+# Frozen builds bundle libVLC's shared library + its "plugins" folder right
+# next to the executable (see memify.spec) — python-vlc's own auto-discovery
+# (Windows registry lookup, Linux ldconfig cache) only ever finds a
+# system-wide VLC install, never files sitting next to our own exe. Pointing
+# it there explicitly via these env vars (which python-vlc's find_lib()
+# checks FIRST, before any OS-specific discovery) is the officially
+# supported override — see python-vlc's vlc.py, PYTHON_VLC_LIB_PATH/
+# PYTHON_VLC_MODULE_PATH. This has to run before `import vlc` happens
+# ANYWHERE in the process (it resolves the library at import time), which is
+# why it lives here in config.py — the one module everything else already
+# imports first. In dev (unfrozen) runs this is a no-op; the system's own
+# installed VLC (e.g. via pacman/apt) is used instead, same as today.
+if getattr(sys, "frozen", False):
+    _vlc_lib_name = "libvlc.dll" if sys.platform == "win32" else "libvlc.so.5"
+    _vlc_lib_path = os.path.join(BASE_DIR, _vlc_lib_name)
+    _vlc_plugins_path = os.path.join(BASE_DIR, "plugins")
+    if os.path.isfile(_vlc_lib_path) and os.path.isdir(_vlc_plugins_path):
+        os.environ["PYTHON_VLC_LIB_PATH"] = _vlc_lib_path
+        os.environ["PYTHON_VLC_MODULE_PATH"] = _vlc_plugins_path
+        os.environ["VLC_PLUGIN_PATH"] = _vlc_plugins_path
 
 LOGIN_FILE = os.path.join(DATA_DIR, "login.json")
 
