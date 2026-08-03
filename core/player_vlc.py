@@ -32,10 +32,30 @@ from config import PLAYER_WARMUP_SOUND
 
 
 # 10 полос эквалайзера у libVLC фиксированы (не настраиваются) — в отличие от
-# скриншота-референса (60/150/400/1K/2.4K/15K), тут ровно эти частоты; узнаём
-# их у самой либы, а не хардкодим, на случай другой версии libVLC.
+# скриншота-референса (60/150/400/1K/2.4K/15K), тут ровно эти частоты.
+#
+# ВАЖНО: libvlc_audio_equalizer_get_band_frequency() (публичный API) всегда
+# возвращает ISO-сетку (31/62/125/250/500/1K/2K/4K/8K/16K, см. lib/audio.c
+# upstream) — но реальный DSP-фильтр, который применяет усиление
+# (modules/audio_filter/equalizer.c), по умолчанию считает по ДРУГОЙ,
+# "родной" сетке libVLC (60/170/310/600/1K/3K/6K/12K/14K/16K,
+# equalizer-vlcfreqs=true — дефолт модуля). Эти таблицы совпадают только на
+# индексах 5 (1K) и 9 (16K) — значит доверять публичному геттеру нельзя,
+# он подписывает 7 из 10 слайдеров чужими частотами (напр. "8K" в
+# реальности фильтрует ~14кГц). Пробовали форсировать DSP на ISO-сетку
+# флагом --equalizer-vlcfreqs=0 при создании инстанса — оказалось
+# ненадёжно: на стоковой Arch-сборке libVLC 3.0.23 (с установленным
+# libequalizer_plugin.so) эта CLI-опция не распознаётся вообще и
+# libvlc_new() возвращает NULL вместо предупреждения. Поэтому вместо
+# переключения DSP просто подписываем полосы РЕАЛЬНОЙ (родной) сеткой,
+# которую фильтр использует по умолчанию.
+_VLC_NATIVE_BAND_FREQS = (60.0, 170.0, 310.0, 600.0, 1000.0, 3000.0, 6000.0, 12000.0, 14000.0, 16000.0)
+
+
 def get_eq_band_frequencies() -> list[float]:
     count = vlc.libvlc_audio_equalizer_get_band_count()
+    if count == len(_VLC_NATIVE_BAND_FREQS):
+        return list(_VLC_NATIVE_BAND_FREQS)
     return [vlc.libvlc_audio_equalizer_get_band_frequency(i) for i in range(count)]
 
 
@@ -43,6 +63,15 @@ class PlayerController(QObject):
     currentUrlChanged = pyqtSignal(str)
     audioOutputsUpdated = pyqtSignal(list)
     audioOutputDeviceChanged = pyqtSignal(object)
+
+    # libVLC's own "Flat" equalizer preset uses a +12dB preamp with every
+    # band at 0dB (modules/audio_filter/equalizer_presets.h upstream) — the
+    # band filters lose ~12dB of headroom internally even at 0dB gain, so a
+    # bare vlc.AudioEqualizer() (preamp defaults to 0) plays ~12dB quieter
+    # than "no equalizer" the instant it's enabled, even with every slider
+    # left at its neutral position. Baking this in makes our UI's "0dB"
+    # preamp mean "same loudness as EQ off", like VLC's own reference.
+    _PREAMP_BASELINE_DB = 12.0
 
     def __init__(self):
         super().__init__()
@@ -62,6 +91,7 @@ class PlayerController(QObject):
         # тот же на весь процесс, так что один раз в конце __init__ и потом
         # при каждом изменении полосы).
         self._eq = vlc.AudioEqualizer()
+        self._eq.set_preamp(self._PREAMP_BASELINE_DB)
         self._eq_band_freqs = get_eq_band_frequencies()
         self._eq_amps = [0.0] * len(self._eq_band_freqs)
         self._eq_preamp = 0.0
@@ -128,7 +158,7 @@ class PlayerController(QObject):
     def set_eq_preamp(self, db: float) -> None:
         db = max(-20.0, min(20.0, db))
         self._eq_preamp = db
-        self._eq.set_preamp(db)
+        self._eq.set_preamp(db + self._PREAMP_BASELINE_DB)
         self._schedule_eq_apply()
 
     def set_eq_enabled(self, enabled: bool) -> None:
@@ -140,6 +170,7 @@ class PlayerController(QObject):
         self._eq_amps = [0.0] * len(self._eq_band_freqs)
         self._eq_preamp = 0.0
         self._eq = vlc.AudioEqualizer()
+        self._eq.set_preamp(self._PREAMP_BASELINE_DB)
         self._eq_apply_timer.stop()
         self._apply_eq()
 
@@ -243,8 +274,8 @@ class PlayerController(QObject):
             self.current_track_idx = self.shuffled_indices[index]
             track = self.current_playing_album["tracks"][self.current_track_idx]
 
-            from config import SERVER_URL
-            track_url = SERVER_URL + track.get("url", "")
+            from utils.format_utils import resolve_media_url
+            track_url = resolve_media_url(track.get("url", ""))
             media = self._vlc_instance.media_new(track_url)
             self.player.set_media(media)
             self.player.play()

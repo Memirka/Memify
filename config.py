@@ -6,7 +6,7 @@ SERVER_URL = "https://memify.memiras.net"
 # Bump this on every release that gets built into dist/Memify (or Memify.exe)
 # and uploaded to the server — it's what the running app compares against
 # the server's version.txt to decide whether to self-update.
-APP_VERSION = "1.1.6"
+APP_VERSION = "1.2.0"
 
 CACHE_SIZE = 100
 IMAGE_CACHE_SIZE = 50
@@ -20,6 +20,13 @@ else:
 
 DATA_DIR = os.path.join(APP_DIR, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
+
+# Where the user drops their own Artist/Album/track.mp3 folders (mirroring
+# the server's "Музыка" layout) for the local-library sidebar section. Not
+# created eagerly here — only on first enabling the feature, via
+# core.local_library.ensure_local_music_dir() — so a user who never turns
+# it on doesn't get an empty "music" folder cluttering their install.
+LOCAL_MUSIC_DIR = os.path.join(APP_DIR, "music")
 
 # Frozen builds bundle libVLC's shared library + its "plugins" folder right
 # next to the executable (see memify.spec) — python-vlc's own auto-discovery

@@ -26,10 +26,11 @@ from PyQt6.QtCore import (
     Qt, QTimer, QThread, QUrl, QSize, QRectF, pyqtSignal, pyqtSlot, QObject, QPoint, QPointF,
     QPropertyAnimation, pyqtProperty, QEasingCurve,
 )
-from PyQt6.QtGui import QFont, QColor, QPalette, QIcon, QPixmap, QFontMetrics, QCursor, QPainter, QPainterPath, QPen, QBrush, QLinearGradient
+from PyQt6.QtGui import QFont, QColor, QPalette, QIcon, QPixmap, QFontMetrics, QCursor, QPainter, QPainterPath, QPen, QBrush, QLinearGradient, QDesktopServices
 
-from config import SERVER_URL, APP_ICON, ICONS_DIR, APP_SETTINGS_FILE, PLAYER_DATA_CACHE_DIR, LIBRARY_CACHE_FILE, WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT, DATA_DIR, APP_VERSION
+from config import SERVER_URL, APP_ICON, ICONS_DIR, APP_SETTINGS_FILE, PLAYER_DATA_CACHE_DIR, LIBRARY_CACHE_FILE, WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT, DATA_DIR, APP_VERSION, LOCAL_MUSIC_DIR
 from core.library import LibraryManager, SearchResult
+from core.local_library import ensure_local_music_dir, scan_local_library
 from core.player_vlc import PlayerController, get_eq_band_frequencies
 try:
     from core.account import AccountManager as _AccountManager
@@ -40,7 +41,7 @@ from ui.album_widget import AlbumWidget
 from ui.shimmer_placeholder import ShimmerLabel
 import ui.styles as styles_module
 from ui.styles import COLORS, get_scrollbar_style, set_accent_color, set_theme, get_theme
-from utils.format_utils import clean_title, clean_artist_name, format_duration, normalize_track_url
+from utils.format_utils import clean_title, clean_artist_name, format_duration, normalize_track_url, resolve_media_url
 from utils.image_utils import make_rounded_pixmap, load_pixmap_from_url
 from utils.cover_cache import cover_cache, cache_key
 from workers.image_loader import ImageLoaderWorker
@@ -195,7 +196,10 @@ def _track_like_keys(track: dict, url: str = "") -> set:
         keys.add(u)
         if u.startswith("http"):
             keys.add(re.sub(r'^https?://[^/]+', '', u))
-        else:
+        elif not u.startswith("file://"):
+            # file:// (local-library track) is already an absolute,
+            # unique identifier on its own — no server-relative form to
+            # add an alternate key for.
             keys.add(SERVER_URL + u)
         return keys
     album_id = str((track or {}).get("album_id") or "").strip()
@@ -281,7 +285,7 @@ class AlbumGridWidget(QWidget):
         for i, album in enumerate(albums):
             cover_url = ""
             if album.get("cover"):
-                cover_url = SERVER_URL + album["cover"] if not album["cover"].startswith("http") else album["cover"]
+                cover_url = resolve_media_url(album["cover"])
 
             card = AlbumWidget(album, cover_url, widget_size=170, cover_size=150)
             card.clicked.connect(self.album_clicked.emit)
@@ -474,7 +478,7 @@ class ArtistPage(QWidget):
         # Load artist cover
         cover_rel = artist.get("cover", "")
         if cover_rel:
-            cover_url = SERVER_URL + cover_rel if not cover_rel.startswith("http") else cover_rel
+            cover_url = resolve_media_url(cover_rel)
             self._load_artist_cover(cover_url)
         else:
             self._cover_label.setPixmap(QPixmap())
@@ -670,6 +674,9 @@ class TrackRow(QWidget):
         super().mouseDoubleClickEvent(event)
 
     def contextMenuEvent(self, event):
+        if self._track.get("local"):
+            # Already a local file — nothing to download.
+            return
         menu = QMenu(self)
         dl_track = menu.addAction("↓  Скачать трек")
         dl_album = menu.addAction("↓  Скачать альбом")
@@ -787,7 +794,7 @@ class AlbumPage(QWidget):
         btn_row.setSpacing(8)
         btn_row.addWidget(self._play_all_btn)
 
-        dl_btn = QPushButton("↓ Скачать альбом")
+        self._dl_btn = dl_btn = QPushButton("↓ Скачать альбом")
         dl_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         dl_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         dl_btn.setFixedHeight(36)
@@ -891,6 +898,8 @@ class AlbumPage(QWidget):
         artist_name = clean_artist_name(artist.get("artist", "")) or ""
         tracks = album.get("tracks", []) or []
 
+        self._dl_btn.setVisible(not album.get("local"))
+
         self._album_name_label.setText(album_name)
         # The "liked tracks" virtual album isn't a real album and has no
         # real artist — showing the "Альбом" type label and an artist chip
@@ -924,7 +933,7 @@ class AlbumPage(QWidget):
                 else:
                     self._cover_label.setPixmap(QPixmap())
             else:
-                cover_url = SERVER_URL + cover_rel if not cover_rel.startswith("http") else cover_rel
+                cover_url = resolve_media_url(cover_rel)
                 self._load_album_cover(cover_url)
         else:
             self._cover_label.setPixmap(QPixmap())
@@ -968,7 +977,7 @@ class AlbumPage(QWidget):
                         self._load_track_cover(row, cover_rel)
 
                 if not track.get("duration"):
-                    url = SERVER_URL + track.get("url", "") if track.get("url") else ""
+                    url = resolve_media_url(track.get("url", ""))
                     if url:
                         urls_needing_duration.append((i, url))
         finally:
@@ -1012,7 +1021,7 @@ class AlbumPage(QWidget):
         _start_image_loader([url], 180, 14, on_loaded, self._runners)
 
     def _load_track_cover(self, row: 'TrackRow', cover_rel: str):
-        url = SERVER_URL + cover_rel if not cover_rel.startswith("http") else cover_rel
+        url = resolve_media_url(cover_rel)
         key = cache_key(url, 36, 4)
         cached = cover_cache.get(key)
         if cached and not cached.isNull():
@@ -1296,7 +1305,7 @@ class CoverViewerOverlay(QWidget):
             self._apply_pixmap(QPixmap(cover_rel))
             return
 
-        url = SERVER_URL + cover_rel if not cover_rel.startswith("http") else cover_rel
+        url = resolve_media_url(cover_rel)
         _stop_runners(self._runners)
 
         def on_loaded(_loaded_url, img, _size, _radius):
@@ -1533,7 +1542,7 @@ class NowPlayingDiscOverlay(QWidget):
             self.set_playing(is_playing)
             return
 
-        url = SERVER_URL + cover_rel if not cover_rel.startswith("http") else cover_rel
+        url = resolve_media_url(cover_rel)
         _stop_runners(self._runners)
 
         def on_loaded(_url, img, _size, _radius):
@@ -1721,7 +1730,7 @@ class SearchPage(QWidget):
     def _load_cover_into(self, cover_url: str, label: QLabel, size: int, radius: int):
         if not cover_url:
             return
-        full = (SERVER_URL + cover_url) if not cover_url.startswith("http") else cover_url
+        full = resolve_media_url(cover_url)
         key = cache_key(full, size, radius)
         cached = cover_cache.get(key)
         if cached and not cached.isNull():
@@ -2040,7 +2049,7 @@ class AllArtistsPage(QWidget):
         avatar.setStyleSheet(f"background: {COLORS['COVER_BG']}; border-radius: 21px;")
         cover_rel = artist.get("cover", "")
         if cover_rel:
-            full = SERVER_URL + cover_rel if not cover_rel.startswith("http") else cover_rel
+            full = resolve_media_url(cover_rel)
             key = cache_key(full, 42, 21)
             cached = cover_cache.get(key)
             if cached and not cached.isNull():
@@ -2275,14 +2284,61 @@ class _SidebarItem(QWidget):
         super().mousePressEvent(event)
 
 
+class _ChevronButton(QPushButton):
+    """Small hand-drawn disclosure triangle for collapsing a sidebar
+    section — points right when collapsed, down when expanded. Checkable
+    QPushButton so the inherited `toggled(bool)` signal already carries
+    the new expanded state, no custom signal needed."""
+
+    def __init__(self, parent=None):
+        super().__init__("", parent)
+        self.setCheckable(True)
+        self.setChecked(True)  # expanded by default
+        self.setFixedSize(20, 20)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setStyleSheet("background: transparent; border: none;")
+
+    def setExpanded(self, expanded: bool):
+        self.setChecked(bool(expanded))
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rf = QRectF(self.rect())
+        cx, cy = rf.center().x(), rf.center().y()
+        s = 4.5
+        path = QPainterPath()
+        if self.isChecked():
+            # Expanded — pointing down.
+            path.moveTo(cx - s, cy - s * 0.55)
+            path.lineTo(cx + s, cy - s * 0.55)
+            path.lineTo(cx, cy + s * 0.65)
+        else:
+            # Collapsed — pointing right.
+            path.moveTo(cx - s * 0.55, cy - s)
+            path.lineTo(cx - s * 0.55, cy + s)
+            path.lineTo(cx + s * 0.65, cy)
+        path.closeSubpath()
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(COLORS["TEXT_SECONDARY"]))
+        p.drawPath(path)
+        p.end()
+
+
 class Sidebar(QWidget):
     artist_selected = pyqtSignal(dict)
     album_selected = pyqtSignal(dict, dict)   # (album, artist)
     liked_tracks_selected = pyqtSignal()
     # Emitted after the user drags an artist/album row to a new position —
-    # carries the full new order as stable "artist::Name" / "album::Artist||Title"
-    # keys, ready to hand straight to follow_order.
-    order_changed = pyqtSignal(list)
+    # carries the section ("server"/"local") plus the full new order as
+    # stable "artist::Name" / "album::Artist||Title" keys, ready to hand
+    # straight to follow_order (server) or local_library_order (local).
+    order_changed = pyqtSignal(str, list)
+    # Emitted when the user clicks a section's chevron — carries the
+    # section ("server"/"local") and the new *collapsed* state, for
+    # persisting to settings.
+    section_collapsed_changed = pyqtSignal(str, bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2294,17 +2350,116 @@ class Sidebar(QWidget):
         )
         self._liked_item: _SidebarItem | None = None
         self._runners: list = []
-        # True while load_account_content() is rebuilding the list — the
-        # rebuild itself re-adds every row (a "move" as far as the model is
-        # concerned), which would otherwise be misread as a user drag and
-        # echo a bogus order_changed.
+        # True while set_server_collapsed()/set_local_collapsed() is
+        # applying a saved setting programmatically — suppresses
+        # section_collapsed_changed so loading settings doesn't
+        # immediately re-save/re-sync the same value right back out.
+        self._applying_saved_collapse = False
+        # True while load_account_content()/load_local_content() is
+        # rebuilding a list — the rebuild itself re-adds every row (a
+        # "move" as far as the model is concerned), which would otherwise
+        # be misread as a user drag and echo a bogus order_changed.
         self._rebuilding = False
         self._build_ui()
 
+    def _build_section(self, title: str, section: str, with_liked_slot: bool = False):
+        """Builds one collapsible section (header + chevron [+ liked slot]
+        + reorderable list) and returns (container_widget, list_widget,
+        chevron_button)."""
+        container = QWidget()
+        section_layout = QVBoxLayout(container)
+        section_layout.setContentsMargins(0, 0, 0, 0)
+        section_layout.setSpacing(6)
+
+        header_row = QHBoxLayout()
+        header_row.setContentsMargins(6, 0, 0, 0)
+        header_lbl = QLabel(title)
+        header_lbl.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
+        header_lbl.setStyleSheet(f"color: {COLORS['TEXT_PRIMARY']};")
+        header_row.addWidget(header_lbl)
+        header_row.addStretch(1)
+        chevron = _ChevronButton()
+        header_row.addWidget(chevron)
+        section_layout.addLayout(header_row)
+
+        if with_liked_slot:
+            # "Понравившиеся треки" is pinned above the reorderable list,
+            # not part of it — it isn't an artist or album, so dragging it
+            # around relative to them wouldn't mean anything.
+            self._liked_slot = QVBoxLayout()
+            self._liked_slot.setContentsMargins(0, 0, 0, 0)
+            section_layout.addLayout(self._liked_slot)
+
+        # Reorderable artist/album list. Rows are owner-drawn (see
+        # _SidebarItemDelegate) rather than embedded widgets — a widget set
+        # via setItemWidget() would intercept every mouse press itself,
+        # leaving the view's built-in InternalMove drag-and-drop with
+        # nothing to react to.
+        list_widget = QListWidget()
+        list_widget.setObjectName("sidebarList")
+        list_widget.setItemDelegate(_SidebarItemDelegate(list_widget))
+        list_widget.setFrameShape(QFrame.Shape.NoFrame)
+        list_widget.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # No internal scrolling — the list is always sized to its full
+        # content height (see _resize_list_to_content) so it never clips;
+        # the whole sidebar scrolls as one unit via the QScrollArea in
+        # _build_ui instead.
+        list_widget.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        list_widget.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        list_widget.setMouseTracking(True)   # needed for State_MouseOver per-row hover
+        list_widget.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        list_widget.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        list_widget.setDefaultDropAction(Qt.DropAction.MoveAction)
+        # Explicit alongside DragDropMode (which should already imply these)
+        # — belt and suspenders, since the previous setItemWidget-based
+        # attempt looked correctly configured too and still didn't drag.
+        list_widget.setDragEnabled(True)
+        list_widget.setAcceptDrops(True)
+        list_widget.setDropIndicatorShown(True)
+        list_widget.setSpacing(2)
+        list_widget.setStyleSheet(
+            get_scrollbar_style() +
+            "QListWidget#sidebarList { background: transparent; border: none; }"
+        )
+        list_widget.itemClicked.connect(self._on_item_clicked)
+        section_layout.addWidget(list_widget)
+
+        def _on_chevron_toggled(expanded, lw=list_widget):
+            lw.setVisible(expanded)
+            if with_liked_slot:
+                for i in range(self._liked_slot.count()):
+                    w = self._liked_slot.itemAt(i).widget()
+                    if w:
+                        w.setVisible(expanded)
+            if not self._applying_saved_collapse:
+                self.section_collapsed_changed.emit(section, not expanded)
+        chevron.toggled.connect(_on_chevron_toggled)
+
+        return container, list_widget, chevron
+
     def _build_ui(self):
-        layout = QVBoxLayout(self)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # The whole sidebar (username row + both library sections, however
+        # tall they get) scrolls together as one unit — each section's own
+        # list is sized to its full content height (_resize_list_to_content)
+        # rather than clipping internally, so there's exactly one scrollbar
+        # for the entire sidebar instead of one per list.
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setStyleSheet(get_scrollbar_style())
+        root.addWidget(scroll)
+
+        content = QWidget()
+        scroll.setWidget(content)
+
+        layout = QVBoxLayout(content)
         layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(6)
+        layout.setSpacing(14)
 
         # Username row
         self._user_row = QHBoxLayout()
@@ -2316,51 +2471,43 @@ class Sidebar(QWidget):
         self._user_row.addStretch(1)
         layout.addLayout(self._user_row)
 
-        header = QLabel("Библиотека")
-        header.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
-        header.setStyleSheet(f"color: {COLORS['TEXT_PRIMARY']}; padding: 4px 6px;")
-        layout.addWidget(header)
-
-        # "Понравившиеся треки" is pinned above the reorderable list, not
-        # part of it — it isn't an artist or album, so dragging it around
-        # relative to them wouldn't mean anything.
-        self._liked_slot = QVBoxLayout()
-        self._liked_slot.setContentsMargins(0, 0, 0, 0)
-        layout.addLayout(self._liked_slot)
-
-        # Reorderable artist/album list. Rows are owner-drawn (see
-        # _SidebarItemDelegate) rather than embedded widgets — a widget set
-        # via setItemWidget() would intercept every mouse press itself,
-        # leaving the view's built-in InternalMove drag-and-drop with
-        # nothing to react to.
-        self._list = QListWidget()
-        self._list.setObjectName("sidebarList")
-        self._list.setItemDelegate(_SidebarItemDelegate(self._list))
-        self._list.setFrameShape(QFrame.Shape.NoFrame)
-        self._list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self._list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
-        self._list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self._list.setMouseTracking(True)   # needed for State_MouseOver per-row hover
-        self._list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
-        self._list.setDefaultDropAction(Qt.DropAction.MoveAction)
-        # Explicit alongside DragDropMode (which should already imply these)
-        # — belt and suspenders, since the previous setItemWidget-based
-        # attempt looked correctly configured too and still didn't drag.
-        self._list.setDragEnabled(True)
-        self._list.setAcceptDrops(True)
-        self._list.setDropIndicatorShown(True)
-        self._list.setSpacing(2)
-        self._list.setStyleSheet(
-            get_scrollbar_style() +
-            "QListWidget#sidebarList { background: transparent; border: none; }"
+        server_container, self._list_server, self._chevron_server = self._build_section(
+            "Библиотека", "server", with_liked_slot=True
         )
-        self._list.model().rowsMoved.connect(self._on_rows_moved)
-        self._list.itemClicked.connect(self._on_item_clicked)
-        layout.addWidget(self._list, 1)
+        layout.addWidget(server_container)
+        self._list_server.model().rowsMoved.connect(lambda *_: self._on_rows_moved("server"))
+
+        self._local_container, self._list_local, self._chevron_local = self._build_section(
+            "Локальная библиотека", "local"
+        )
+        layout.addWidget(self._local_container)
+        self._list_local.model().rowsMoved.connect(lambda *_: self._on_rows_moved("local"))
+        self._local_container.setVisible(False)  # hidden until enabled in settings
+
+        layout.addStretch(1)
 
     def set_username(self, login: str):
         self._user_label.setText(login or "")
+
+    def set_local_section_visible(self, visible: bool):
+        self._local_container.setVisible(bool(visible))
+
+    def set_server_collapsed(self, collapsed: bool):
+        # Applying a saved setting, not a user click — don't echo it back
+        # out via section_collapsed_changed (would just re-save the same
+        # value, and schedule a pointless settings sync, on every launch).
+        self._applying_saved_collapse = True
+        try:
+            self._chevron_server.setExpanded(not collapsed)
+        finally:
+            self._applying_saved_collapse = False
+
+    def set_local_collapsed(self, collapsed: bool):
+        self._applying_saved_collapse = True
+        try:
+            self._chevron_local.setExpanded(not collapsed)
+        finally:
+            self._applying_saved_collapse = False
 
     def load_account_content(self, liked: bool, entries: list | None = None):
         """entries: ordered list of ("artist", artist_dict) /
@@ -2375,10 +2522,19 @@ class Sidebar(QWidget):
         if liked:
             self._liked_item = self._make_liked_item()
             self._liked_slot.addWidget(self._liked_item)
+            self._liked_item.setVisible(self._chevron_server.isChecked())
 
+        self._fill_list(self._list_server, entries)
+
+    def load_local_content(self, entries: list | None = None):
+        """Same shape as load_account_content's entries, for the local
+        library section — no "liked" concept there."""
+        self._fill_list(self._list_local, entries)
+
+    def _fill_list(self, list_widget: QListWidget, entries: list | None):
         self._rebuilding = True
         try:
-            self._list.clear()
+            list_widget.clear()
             for kind, payload in (entries or []):
                 if kind == "artist":
                     list_item = self._make_artist_row(payload)
@@ -2387,9 +2543,23 @@ class Sidebar(QWidget):
                     list_item = self._make_album_row(album, artist)
                 else:
                     continue
-                self._list.addItem(list_item)
+                list_widget.addItem(list_item)
         finally:
             self._rebuilding = False
+        self._resize_list_to_content(list_widget)
+
+    @staticmethod
+    def _resize_list_to_content(list_widget: QListWidget):
+        """No internal scrollbar (see _build_section) — the list's height
+        must track its own row count exactly, so the whole sidebar's single
+        outer scroll area sees the real total content height."""
+        count = list_widget.count()
+        if count == 0:
+            list_widget.setFixedHeight(0)
+            return
+        row_h = list_widget.sizeHintForRow(0)
+        total = row_h * count + list_widget.spacing() * (count + 1) + list_widget.frameWidth() * 2
+        list_widget.setFixedHeight(max(total, 0))
 
     def _make_liked_item(self) -> _SidebarItem:
         item = _SidebarItem("Понравившиеся треки", "_liked_tracks_", radius=6)
@@ -2415,7 +2585,7 @@ class Sidebar(QWidget):
 
         cover_rel = artist.get("cover", "")
         if cover_rel:
-            url = SERVER_URL + cover_rel if not cover_rel.startswith("http") else cover_rel
+            url = resolve_media_url(cover_rel)
             self._load_cover(list_item, url, 40, 20)
         return list_item
 
@@ -2433,7 +2603,7 @@ class Sidebar(QWidget):
 
         cover_rel = album.get("cover", "")
         if cover_rel:
-            url = SERVER_URL + cover_rel if not cover_rel.startswith("http") else cover_rel
+            url = resolve_media_url(cover_rel)
             self._load_cover(list_item, url, 40, 6)
         return list_item
 
@@ -2449,23 +2619,27 @@ class Sidebar(QWidget):
                 pm = QPixmap.fromImage(img) if img else QPixmap()
                 if not pm.isNull():
                     cover_cache.set(cache_key(loaded_url, s, r), pm)
-                    # list_item may have been deleted by a load_account_content()
-                    # rebuild that happened while this was in flight.
+                    # list_item may have been deleted by a load_account_content()/
+                    # load_local_content() rebuild that happened while this was
+                    # in flight. Repainting both lists is cheap and avoids
+                    # having to track which one this item belongs to.
                     list_item.setData(_SR_COVER, pm)
-                    self._list.viewport().update()
+                    self._list_server.viewport().update()
+                    self._list_local.viewport().update()
             except RuntimeError:
                 pass
 
         _start_image_loader([url], size, radius, on_loaded, self._runners)
 
     def select_artist(self, artist_name: str):
-        for row in range(self._list.count()):
-            list_item = self._list.item(row)
-            is_match = (
-                list_item.data(_SR_KIND) == "artist"
-                and (list_item.data(_SR_CLICK_DATA) or {}).get("artist") == artist_name
-            )
-            list_item.setSelected(is_match)
+        for list_widget in (self._list_server, self._list_local):
+            for row in range(list_widget.count()):
+                list_item = list_widget.item(row)
+                is_match = (
+                    list_item.data(_SR_KIND) == "artist"
+                    and (list_item.data(_SR_CLICK_DATA) or {}).get("artist") == artist_name
+                )
+                list_item.setSelected(is_match)
 
     def _on_item_clicked(self, list_item: QListWidgetItem):
         kind = list_item.data(_SR_KIND)
@@ -2476,15 +2650,16 @@ class Sidebar(QWidget):
             album, artist = data
             self.album_selected.emit(album, artist)
 
-    def _on_rows_moved(self, *_args):
+    def _on_rows_moved(self, section: str, *_args):
         if self._rebuilding:
             return
+        list_widget = self._list_server if section == "server" else self._list_local
         keys = []
-        for row in range(self._list.count()):
-            key = self._list.item(row).data(_SR_KEY)
+        for row in range(list_widget.count()):
+            key = list_widget.item(row).data(_SR_KEY)
             if key:
                 keys.append(key)
-        self.order_changed.emit(keys)
+        self.order_changed.emit(section, keys)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -2800,6 +2975,8 @@ class SettingsPage(QWidget):
     scale_changed = pyqtSignal(float)
     discord_rpc_toggled = pyqtSignal(bool)
     cache_cleared = pyqtSignal()
+    local_library_toggled = pyqtSignal(bool)
+    open_local_folder_clicked = pyqtSignal()
     eq_enabled_toggled = pyqtSignal(bool)
     eq_band_changed = pyqtSignal(int, float)
     eq_preamp_changed = pyqtSignal(float)
@@ -2810,6 +2987,7 @@ class SettingsPage(QWidget):
     def __init__(self, eq_band_freqs: list[float] | None = None, parent=None):
         super().__init__(parent)
         self._discord_toggle = None
+        self._local_lib_toggle: _ToggleSwitch | None = None
         self._accent_btns: list[QPushButton] = []
         self._current_accent = ""
         self._theme_btns: dict[str, QPushButton] = {}
@@ -2980,6 +3158,44 @@ class SettingsPage(QWidget):
         clear_cache_btn.clicked.connect(self.cache_cleared.emit)
         cache_row.addWidget(clear_cache_btn)
         data_card.addLayout(cache_row)
+
+        # ── Local library card ──────────────────────────────────────────────
+        local_lib_card = self._make_card(layout)
+        local_lib_card.addWidget(self._section_label("Локальная библиотека"))
+
+        local_lib_row = QHBoxLayout()
+        local_lib_row.setContentsMargins(0, 0, 0, 0)
+        local_lib_row.setSpacing(10)
+        local_lib_lbl = QLabel("Показывать папку music в сайдбаре")
+        local_lib_lbl.setStyleSheet(f"color: {COLORS['TEXT_PRIMARY']}; font: 10pt 'Segoe UI';")
+        local_lib_row.addWidget(local_lib_lbl)
+        local_lib_row.addStretch(1)
+
+        self._local_lib_toggle = _ToggleSwitch()
+        self._local_lib_toggle.toggled.connect(self.local_library_toggled.emit)
+        local_lib_row.addWidget(self._local_lib_toggle)
+        local_lib_card.addLayout(local_lib_row)
+
+        open_folder_row = QHBoxLayout()
+        open_folder_row.setContentsMargins(0, 0, 0, 0)
+        open_folder_row.setSpacing(10)
+        open_folder_lbl = QLabel("Папка с исполнителями")
+        open_folder_lbl.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']}; font: 9.5pt 'Segoe UI';")
+        open_folder_row.addWidget(open_folder_lbl)
+        open_folder_row.addStretch(1)
+
+        open_folder_btn = QPushButton("Открыть папку")
+        open_folder_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        open_folder_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        open_folder_btn.setFixedHeight(30)
+        open_folder_btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; border: 1px solid {COLORS['BORDER']}; "
+            f"border-radius: 6px; color: {COLORS['TEXT_SECONDARY']}; font: 9.5pt 'Segoe UI'; padding: 0 12px; }}"
+            f"QPushButton:hover {{ border-color: {COLORS['TEXT_PRIMARY']}; color: {COLORS['TEXT_PRIMARY']}; }}"
+        )
+        open_folder_btn.clicked.connect(self.open_local_folder_clicked.emit)
+        open_folder_row.addWidget(open_folder_btn)
+        local_lib_card.addLayout(open_folder_row)
 
         # ── About card ───────────────────────────────────────────────────────
         about_card = self._make_card(layout)
@@ -3184,6 +3400,13 @@ class SettingsPage(QWidget):
         self._discord_toggle.setChecked(enabled)
         self._discord_toggle.blockSignals(False)
 
+    def set_local_library_enabled(self, enabled: bool):
+        if self._local_lib_toggle is None:
+            return
+        self._local_lib_toggle.blockSignals(True)
+        self._local_lib_toggle.setChecked(enabled)
+        self._local_lib_toggle.blockSignals(False)
+
     def _on_accent_clicked(self, color: str):
         set_accent_color(color)
         self.set_selected_accent(color)
@@ -3270,6 +3493,12 @@ class MusicApp(QWidget):
 
         self._account_manager = account_manager
         self.library_manager = LibraryManager()
+        # Fully separate from library_manager — populated from disk (not
+        # network) via _init_local_library(), never merged into the server
+        # catalog so it can't leak into "browse all artists to subscribe"
+        # or similar server-catalog-only listings.
+        self.local_library_manager = LibraryManager()
+        self._last_search_query: str = ""
         self.player = PlayerController()
 
         self._current_artist: dict | None = None
@@ -3359,6 +3588,15 @@ class MusicApp(QWidget):
             self.player.repeat_mode = saved_repeat
             self._controls.set_repeat(saved_repeat)
 
+        self._sidebar.set_server_collapsed(bool(self._settings.get("library_collapsed", False)))
+        self._sidebar.set_local_collapsed(bool(self._settings.get("local_library_collapsed", False)))
+
+        local_lib_enabled = bool(self._settings.get("local_library_enabled", False))
+        self._settings_page.set_local_library_enabled(local_lib_enabled)
+        self._sidebar.set_local_section_visible(local_lib_enabled)
+        if local_lib_enabled:
+            self._init_local_library()
+
         band_count = len(get_eq_band_frequencies())
         eq_enabled = bool(self._settings.get("eq_enabled", False))
         eq_preamp = float(self._settings.get("eq_preamp", 0.0) or 0.0)
@@ -3431,6 +3669,7 @@ class MusicApp(QWidget):
         self._sidebar.album_selected.connect(self._on_sidebar_album_selected)
         self._sidebar.liked_tracks_selected.connect(self._on_liked_tracks_selected)
         self._sidebar.order_changed.connect(self._on_sidebar_order_changed)
+        self._sidebar.section_collapsed_changed.connect(self._on_sidebar_section_collapsed_changed)
         if self._account_manager and self._account_manager.active_login:
             self._sidebar.set_username(self._account_manager.active_login)
         body_row.addWidget(self._sidebar)
@@ -3498,6 +3737,8 @@ class MusicApp(QWidget):
         self._settings_page.scale_changed.connect(self._on_scale_changed)
         self._settings_page.discord_rpc_toggled.connect(self._on_discord_rpc_toggled)
         self._settings_page.cache_cleared.connect(self._on_cache_cleared)
+        self._settings_page.local_library_toggled.connect(self._on_local_library_toggled)
+        self._settings_page.open_local_folder_clicked.connect(self._on_open_local_folder_clicked)
         self._settings_page.eq_enabled_toggled.connect(self._on_eq_enabled_toggled)
         self._settings_page.eq_band_changed.connect(self._on_eq_band_changed)
         self._settings_page.eq_preamp_changed.connect(self._on_eq_preamp_changed)
@@ -3836,7 +4077,7 @@ class MusicApp(QWidget):
             self._nav_restored = True
             return
 
-        artist = self.library_manager.get_artist_by_name(artist_name)
+        artist = self._find_artist_any(artist_name)
         if not artist:
             # Library not ready yet — _on_library_loaded will retry
             return
@@ -3860,7 +4101,7 @@ class MusicApp(QWidget):
         if not artist_name or not album_title or not track_title:
             return
 
-        artist = self.library_manager.get_artist_by_name(artist_name)
+        artist = self._find_artist_any(artist_name)
         if not artist:
             return
 
@@ -3908,7 +4149,7 @@ class MusicApp(QWidget):
             self._nav_restored = True
             return
 
-        artist = self.library_manager.get_artist_by_name(artist_name)
+        artist = self._find_artist_any(artist_name)
         if not artist:
             return
 
@@ -4071,7 +4312,7 @@ class MusicApp(QWidget):
                     for track in (album.get("tracks") or []):
                         url = track.get("url")
                         if url:
-                            return SERVER_URL + url if not url.startswith("http") else url
+                            return resolve_media_url(url)
         except Exception:
             pass
         return None
@@ -4122,6 +4363,7 @@ class MusicApp(QWidget):
         query = self._search_bar.text().strip()
         if not query:
             return
+        self._last_search_query = query
         self._search_generation += 1
         if self._page_stack.currentWidget() != self._search_page:
             self._prev_page_before_search = self._page_stack.currentWidget()
@@ -4133,6 +4375,12 @@ class MusicApp(QWidget):
     def _on_search_results(self, results: list, generation: int):
         if generation != self._search_generation:
             return
+        if self._last_search_query and self.local_library_manager.library:
+            # Local scan is a small in-memory list — cheap enough to
+            # search synchronously on the GUI thread rather than routing
+            # through the background SearchWorker (which owns its own,
+            # separate LibraryManager instance for the server catalog).
+            results = results + self.local_library_manager.fast_search(self._last_search_query)
         self._search_page.update_results(results)
 
     def _on_search_result_selected(self, result: SearchResult):
@@ -4209,12 +4457,83 @@ class MusicApp(QWidget):
         self._current_artist = artist
         self._navigate_to_album(album, artist)
 
-    def _on_sidebar_order_changed(self, new_order: list):
+    def _on_sidebar_order_changed(self, section: str, new_order: list):
         """User dragged an artist/album row to a new position in the
-        sidebar — persist the custom order (synced via player data, same as
-        likes/settings)."""
+        sidebar — persist the custom order per section. The server section
+        syncs via player data (same as likes/settings); the local section
+        is machine-specific (local_library_order references folders that
+        only exist on this device) but still flows through the same
+        settings sync as everything else in _save_ui_state — harmless,
+        since _update_local_sidebar() already filters it down to whatever
+        artists are actually found on THIS machine's scan."""
+        if section == "local":
+            self._save_ui_state(local_library_order=list(new_order))
+            return
         self._follow_order = list(new_order)
         self._save_player_data_async({"follow_order": self._follow_order})
+
+    def _on_sidebar_section_collapsed_changed(self, section: str, collapsed: bool):
+        if section == "local":
+            self._save_ui_state(local_library_collapsed=collapsed)
+        else:
+            self._save_ui_state(library_collapsed=collapsed)
+
+    def _init_local_library(self):
+        """(Re)scan config.LOCAL_MUSIC_DIR and refresh the local-library
+        sidebar section + search index. Called on startup (if enabled) and
+        right after the settings toggle is switched on."""
+        ensure_local_music_dir()
+        self.local_library_manager.library = scan_local_library(LOCAL_MUSIC_DIR)
+        self.local_library_manager.build_search_index()
+        self._update_local_sidebar()
+
+    def _update_local_sidebar(self):
+        # NOT .get_library() — that method (core/library.py) always returns
+        # the process-wide server-catalog cache when it's populated,
+        # regardless of which LibraryManager instance calls it. The local
+        # manager's own scanned-from-disk list is only ever in .library.
+        library = self.local_library_manager.library
+        artist_index = {(a.get("artist") or "").strip(): a for a in library}
+        known_keys = {f"artist::{name}" for name in artist_index}
+
+        saved_order = self._settings.get("local_library_order") or []
+        ordered_keys = [k for k in saved_order if k in known_keys]
+        seen = set(ordered_keys)
+        for name in artist_index:
+            key = f"artist::{name}"
+            if key not in seen:
+                ordered_keys.append(key)
+                seen.add(key)
+
+        entries = []
+        for key in ordered_keys:
+            artist_obj = artist_index.get(key[len("artist::"):])
+            if artist_obj:
+                entries.append(("artist", artist_obj))
+        self._sidebar.load_local_content(entries)
+
+    def _on_local_library_toggled(self, enabled: bool):
+        self._save_ui_state(local_library_enabled=enabled)
+        self._sidebar.set_local_section_visible(enabled)
+        if enabled:
+            # This is the "rescan on enable" point — folders dropped in
+            # while the feature was off get picked up right now.
+            self._init_local_library()
+
+    def _on_open_local_folder_clicked(self):
+        ensure_local_music_dir()
+        QDesktopServices.openUrl(QUrl.fromLocalFile(LOCAL_MUSIC_DIR))
+
+    def _find_artist_any(self, artist_name: str) -> dict | None:
+        """get_artist_by_name against the server library, falling back to
+        the local library — used wherever an artist needs to be resolved
+        by name outside of a direct click on a sidebar row (session
+        restore, clicking the artist name in the now-playing bar), so
+        those keep working for locally-playing tracks too."""
+        return (
+            self.library_manager.get_artist_by_name(artist_name)
+            or self.local_library_manager.get_artist_by_name(artist_name)
+        )
 
     def _on_album_selected(self, album: dict, artist: dict):
         self._navigate_to_album(album, artist)
@@ -4235,7 +4554,7 @@ class MusicApp(QWidget):
                     continue
                 for track in album.get("tracks", []):
                     t_url = track.get("url", "")
-                    full_url = SERVER_URL + t_url if t_url and not t_url.startswith("http") else t_url
+                    full_url = resolve_media_url(t_url)
                     if url in (t_url, full_url):
                         result = dict(track)
                         result.setdefault("artist_name", artist.get("artist", ""))
@@ -4310,7 +4629,7 @@ class MusicApp(QWidget):
         self._load_library_then_player_data()
 
     def _on_controls_artist_clicked(self, artist_name: str):
-        artist = self.library_manager.get_artist_by_name(artist_name)
+        artist = self._find_artist_any(artist_name)
         if artist:
             self._navigate_to_artist(artist)
 
@@ -4334,7 +4653,7 @@ class MusicApp(QWidget):
             except (IndexError, KeyError, TypeError):
                 pass
 
-        artist = self.library_manager.get_artist_by_name(artist_name)
+        artist = self._find_artist_any(artist_name)
         if not artist:
             return
         album = self._find_album_in_artist(artist, album_id, album_title)
@@ -4377,7 +4696,7 @@ class MusicApp(QWidget):
         except (IndexError, KeyError, TypeError):
             return
         rel_url = track_obj.get("url", "")
-        track_url = (SERVER_URL + rel_url if rel_url and not rel_url.startswith("http") else rel_url)
+        track_url = resolve_media_url(rel_url)
         artist_name = track_obj.get("artist_name") or (artist or {}).get("artist", "") or ""
         # Use real album title if playing from liked tracks virtual album
         if album.get("_is_liked_album"):
@@ -4447,7 +4766,7 @@ class MusicApp(QWidget):
         if not self._account_manager:
             return
         rel_url = track.get("url", "")
-        track_url = (SERVER_URL + rel_url) if rel_url and not rel_url.startswith("http") else rel_url
+        track_url = resolve_media_url(rel_url)
         my_keys = _track_like_keys(track, rel_url)
         is_liked = bool(my_keys & self._liked_urls_set())
         if is_liked:
@@ -4731,7 +5050,11 @@ class MusicApp(QWidget):
             # Cover: prefer real album cover
             cover_rel = track.get("_real_album_cover") or album.get("cover", "")
             if cover_rel and not (os.path.isabs(cover_rel) and os.path.exists(cover_rel)):
-                rpc_cover = (SERVER_URL + cover_rel if not cover_rel.startswith("http") else cover_rel)
+                resolved_cover = resolve_media_url(cover_rel)
+                # Discord can only fetch public http(s) images — a local
+                # file:// cover isn't reachable from Discord's servers, so
+                # just omit the artwork rather than send an unusable URL.
+                rpc_cover = resolved_cover if resolved_cover.startswith("http") else None
             else:
                 rpc_cover = None
 
@@ -4820,7 +5143,7 @@ class MusicApp(QWidget):
         if not cover_rel or (os.path.isabs(cover_rel) and os.path.exists(cover_rel)):
             self._controls.set_cover(None)
             return
-        cover_url = SERVER_URL + cover_rel if not cover_rel.startswith("http") else cover_rel
+        cover_url = resolve_media_url(cover_rel)
         key = cache_key(cover_url, 56, 6)
         cached = cover_cache.get(key)
         if cached and not cached.isNull():
@@ -4904,7 +5227,7 @@ class MusicApp(QWidget):
             rel = track.get("url", "")
             if not rel:
                 continue
-            url = SERVER_URL + rel if not rel.startswith("http") else rel
+            url = resolve_media_url(rel)
             filename = f"{i + 1:02d} - {_safe_filename(clean_title(track.get('title', '') or 'track'))}.mp3"
             tasks.append({"url": url, "path": os.path.join(dest_dir, filename), "label": filename})
 
@@ -4920,7 +5243,7 @@ class MusicApp(QWidget):
         rel = track.get("url", "")
         if not rel:
             return
-        url = SERVER_URL + rel if not rel.startswith("http") else rel
+        url = resolve_media_url(rel)
         title = _safe_filename(clean_title(track.get("title", "") or "track"))
         filename = f"{track_idx + 1:02d} - {title}.mp3"
         tasks = [{"url": url, "path": os.path.join(folder, filename), "label": filename}]

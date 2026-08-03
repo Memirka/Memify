@@ -1,4 +1,4 @@
-from PyQt6.QtCore import QObject, pyqtSignal, Qt
+from PyQt6.QtCore import QObject, pyqtSignal, Qt, QUrl
 from PyQt6.QtGui import QImage, QPainter, QPainterPath
 import requests
 import time
@@ -47,27 +47,37 @@ class ImageLoaderWorker(QObject):
                     continue
 
                 try:
-                    try:
-                        req_url = requests.utils.requote_uri(url)
-                    except Exception:
-                        req_url = url
-                    resp = None
-                    for attempt in range(self._max_attempts):
-                        if self._stop:
-                            break
-                        resp = self._session.get(req_url, timeout=self._timeout)
-                        if resp.ok and resp.content:
-                            break
-                        if attempt + 1 < self._max_attempts:
-                            time.sleep(0.12 * (attempt + 1))
-                    if not resp or not resp.ok or not resp.content:
-                        continue
+                    if url.startswith("file://"):
+                        # Local-library cover — read straight off disk
+                        # instead of hitting the network.
+                        try:
+                            with open(QUrl(url).toLocalFile(), "rb") as f:
+                                content = f.read()
+                        except OSError:
+                            continue
+                    else:
+                        try:
+                            req_url = requests.utils.requote_uri(url)
+                        except Exception:
+                            req_url = url
+                        resp = None
+                        for attempt in range(self._max_attempts):
+                            if self._stop:
+                                break
+                            resp = self._session.get(req_url, timeout=self._timeout)
+                            if resp.ok and resp.content:
+                                break
+                            if attempt + 1 < self._max_attempts:
+                                time.sleep(0.12 * (attempt + 1))
+                        if not resp or not resp.ok or not resp.content:
+                            continue
+                        content = resp.content
 
                     if self._stop:
                         break
 
                     img = QImage()
-                    if not img.loadFromData(resp.content):
+                    if not img.loadFromData(content):
                         continue
 
                     # Подгоняем размер прямо здесь, чтобы разгрузить UI‑поток.

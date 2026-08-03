@@ -1,5 +1,20 @@
 import re
 import os
+from config import SERVER_URL
+
+def resolve_media_url(rel: str) -> str:
+    """Resolve a track/cover "url" field to something actually loadable.
+
+    Server-relative paths ("/music/Artist/..." ) get SERVER_URL prefixed —
+    that's the common case. Already-absolute http(s) URLs and local
+    file:// URIs (local-library tracks/covers, see core/local_library.py)
+    pass through unchanged.
+    """
+    if not rel:
+        return rel
+    if rel.startswith(("http://", "https://", "file://")):
+        return rel
+    return SERVER_URL + rel
 
 def normalize_track_url(url: str) -> str:
     """Normalize track URLs by stripping domain and leading slashes."""
