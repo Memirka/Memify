@@ -55,6 +55,12 @@ try:
 except ImportError:
     _MEDIA_KEYS_AVAILABLE = False
 
+try:
+    from utils.mpris_service import MPRISService, is_supported as _mpris_is_supported
+    _MPRIS_AVAILABLE = True
+except ImportError:
+    _MPRIS_AVAILABLE = False
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flow layout: wraps widgets like CSS flexbox row
@@ -2471,10 +2477,10 @@ class Sidebar(QWidget):
         self._user_row.addStretch(1)
         layout.addLayout(self._user_row)
 
-        server_container, self._list_server, self._chevron_server = self._build_section(
+        self._server_container, self._list_server, self._chevron_server = self._build_section(
             "Библиотека", "server", with_liked_slot=True
         )
-        layout.addWidget(server_container)
+        layout.addWidget(self._server_container)
         self._list_server.model().rowsMoved.connect(lambda *_: self._on_rows_moved("server"))
 
         self._local_container, self._list_local, self._chevron_local = self._build_section(
@@ -2488,9 +2494,20 @@ class Sidebar(QWidget):
 
     def set_username(self, login: str):
         self._user_label.setText(login or "")
+        self._user_label.setStyleSheet(f"color: {COLORS['TEXT_PRIMARY']};")
+
+    def set_offline_mode(self):
+        """No server reachable at startup — shown instead of a username;
+        see MusicApp's offline path (no in-app way back to online without
+        restarting, so this is a one-shot, not a toggle)."""
+        self._user_label.setText("ОФФЛАЙН")
+        self._user_label.setStyleSheet("color: #ff7a7a;")
 
     def set_local_section_visible(self, visible: bool):
         self._local_container.setVisible(bool(visible))
+
+    def set_server_section_visible(self, visible: bool):
+        self._server_container.setVisible(bool(visible))
 
     def set_server_collapsed(self, collapsed: bool):
         # Applying a saved setting, not a user click — don't echo it back
@@ -2974,7 +2991,9 @@ class SettingsPage(QWidget):
     theme_changed = pyqtSignal(str)
     scale_changed = pyqtSignal(float)
     discord_rpc_toggled = pyqtSignal(bool)
-    cache_cleared = pyqtSignal()
+    cover_cache_cleared = pyqtSignal()
+    library_cache_cleared = pyqtSignal()
+    player_data_cache_cleared = pyqtSignal()
     local_library_toggled = pyqtSignal(bool)
     open_local_folder_clicked = pyqtSignal()
     eq_enabled_toggled = pyqtSignal(bool)
@@ -3020,6 +3039,31 @@ class SettingsPage(QWidget):
             f"color: {COLORS['TEXT_SECONDARY']}; font: 600 8.5pt 'Segoe UI'; letter-spacing: 1px;"
         )
         return lbl
+
+    @staticmethod
+    def _add_clear_row(card_layout: QVBoxLayout, label_text: str) -> QPushButton:
+        """One "<label> ... [Очистить]" row for the Data card — returns the
+        button so the caller can wire up its own clear signal."""
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(10)
+        lbl = QLabel(label_text)
+        lbl.setStyleSheet(f"color: {COLORS['TEXT_PRIMARY']}; font: 10pt 'Segoe UI';")
+        lbl.setWordWrap(True)
+        row.addWidget(lbl, 1)
+
+        btn = QPushButton("Очистить")
+        btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setFixedHeight(30)
+        btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; border: 1px solid {COLORS['BORDER']}; "
+            f"border-radius: 6px; color: {COLORS['TEXT_SECONDARY']}; font: 9.5pt 'Segoe UI'; padding: 0 12px; }}"
+            f"QPushButton:hover {{ border-color: {COLORS['TEXT_PRIMARY']}; color: {COLORS['TEXT_PRIMARY']}; }}"
+        )
+        row.addWidget(btn)
+        card_layout.addLayout(row)
+        return btn
 
     def _build_ui(self):
         root = QVBoxLayout(self)
@@ -3135,29 +3179,21 @@ class SettingsPage(QWidget):
         self._build_eq_card(layout)
 
         # ── Data card ────────────────────────────────────────────────────────
+        # Three independent "Очистить" rows rather than one button that wipes
+        # everything — clearing the library cache used to also blow away the
+        # cover cache (and vice versa), which is surprising if you only
+        # wanted one of them gone.
         data_card = self._make_card(layout)
         data_card.addWidget(self._section_label("Данные"))
 
-        cache_row = QHBoxLayout()
-        cache_row.setContentsMargins(0, 0, 0, 0)
-        cache_row.setSpacing(10)
-        cache_lbl = QLabel("Кеш обложек и библиотеки")
-        cache_lbl.setStyleSheet(f"color: {COLORS['TEXT_PRIMARY']}; font: 10pt 'Segoe UI';")
-        cache_row.addWidget(cache_lbl)
-        cache_row.addStretch(1)
+        cover_btn = self._add_clear_row(data_card, "Кеш обложек")
+        cover_btn.clicked.connect(self.cover_cache_cleared.emit)
 
-        clear_cache_btn = QPushButton("Очистить кеш")
-        clear_cache_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        clear_cache_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        clear_cache_btn.setFixedHeight(30)
-        clear_cache_btn.setStyleSheet(
-            f"QPushButton {{ background: transparent; border: 1px solid {COLORS['BORDER']}; "
-            f"border-radius: 6px; color: {COLORS['TEXT_SECONDARY']}; font: 9.5pt 'Segoe UI'; padding: 0 12px; }}"
-            f"QPushButton:hover {{ border-color: {COLORS['TEXT_PRIMARY']}; color: {COLORS['TEXT_PRIMARY']}; }}"
-        )
-        clear_cache_btn.clicked.connect(self.cache_cleared.emit)
-        cache_row.addWidget(clear_cache_btn)
-        data_card.addLayout(cache_row)
+        library_btn = self._add_clear_row(data_card, "Кеш библиотеки")
+        library_btn.clicked.connect(self.library_cache_cleared.emit)
+
+        player_data_btn = self._add_clear_row(data_card, "Локальные данные аккаунта (лайки, подписки)")
+        player_data_btn.clicked.connect(self.player_data_cache_cleared.emit)
 
         # ── Local library card ──────────────────────────────────────────────
         local_lib_card = self._make_card(layout)
@@ -3204,6 +3240,27 @@ class SettingsPage(QWidget):
         version_lbl = QLabel(f"Версия {APP_VERSION}")
         version_lbl.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']}; font: 9pt 'Segoe UI';")
         about_card.addWidget(version_lbl)
+
+        links_row = QHBoxLayout()
+        links_row.setContentsMargins(0, 8, 0, 0)
+        links_row.setSpacing(12)
+        for icon_name, tooltip, url in (
+            ("discord_icon.png", "Discord", "https://discord.gg/m3eX7JBBwE"),
+            ("telegram_icon.png", "Telegram", "https://t.me/memifyapp"),
+            ("memify_link_icon.png", "memify.memiras.net", "https://memify.memiras.net"),
+        ):
+            link_lbl = ClickableLabel("")
+            link_lbl.setFixedSize(36, 36)
+            link_lbl.setToolTip(tooltip)
+            icon_path = os.path.join(ICONS_DIR, icon_name)
+            if os.path.exists(icon_path):
+                pm = QPixmap(icon_path)
+                if not pm.isNull():
+                    link_lbl.setPixmap(make_rounded_pixmap(pm, 36, 18))
+            link_lbl.clicked.connect(partial(QDesktopServices.openUrl, QUrl(url)))
+            links_row.addWidget(link_lbl)
+        links_row.addStretch(1)
+        about_card.addLayout(links_row)
 
         layout.addStretch(1)
 
@@ -3482,7 +3539,7 @@ class _SearchIcon(QWidget):
 class MusicApp(QWidget):
     logout_requested = pyqtSignal()
 
-    def __init__(self, account_manager=None):
+    def __init__(self, account_manager=None, offline: bool = False):
         super().__init__()
         self.setWindowTitle("Memify")
         self.resize(1280, 800)
@@ -3491,6 +3548,10 @@ class MusicApp(QWidget):
         if os.path.exists(APP_ICON):
             self.setWindowIcon(QIcon(APP_ICON))
 
+        # No server reachable at startup (see main.py) — server library/
+        # account features are skipped entirely; only the local library
+        # works. One-shot for this process, no in-app way back online.
+        self._offline = offline
         self._account_manager = account_manager
         self.library_manager = LibraryManager()
         # Fully separate from library_manager — populated from disk (not
@@ -3513,6 +3574,7 @@ class MusicApp(QWidget):
         self._closing = False  # set once closeEvent starts, so scheduled/async
         # callbacks don't spawn more background threads after teardown began.
         self._media_keys = None
+        self._mpris_service = None
 
         # Account state
         self._liked_tracks: list = []        # list of track dicts from server
@@ -3544,6 +3606,7 @@ class MusicApp(QWidget):
         self._setup_ui()
         self._setup_player()
         self._setup_media_keys()
+        self._setup_mpris()
         self._setup_search_worker()
         self._apply_loaded_settings()
 
@@ -3593,9 +3656,18 @@ class MusicApp(QWidget):
 
         local_lib_enabled = bool(self._settings.get("local_library_enabled", False))
         self._settings_page.set_local_library_enabled(local_lib_enabled)
-        self._sidebar.set_local_section_visible(local_lib_enabled)
-        if local_lib_enabled:
+        if self._offline:
+            # Nothing else can work without a connection — show the local
+            # library regardless of the saved toggle. Not persisted (no
+            # _save_ui_state call): the real preference is untouched for
+            # the next, hopefully-online, launch.
+            self._sidebar.set_server_section_visible(False)
+            self._sidebar.set_local_section_visible(True)
             self._init_local_library()
+        else:
+            self._sidebar.set_local_section_visible(local_lib_enabled)
+            if local_lib_enabled:
+                self._init_local_library()
 
         band_count = len(get_eq_band_frequencies())
         eq_enabled = bool(self._settings.get("eq_enabled", False))
@@ -3670,7 +3742,9 @@ class MusicApp(QWidget):
         self._sidebar.liked_tracks_selected.connect(self._on_liked_tracks_selected)
         self._sidebar.order_changed.connect(self._on_sidebar_order_changed)
         self._sidebar.section_collapsed_changed.connect(self._on_sidebar_section_collapsed_changed)
-        if self._account_manager and self._account_manager.active_login:
+        if self._offline:
+            self._sidebar.set_offline_mode()
+        elif self._account_manager and self._account_manager.active_login:
             self._sidebar.set_username(self._account_manager.active_login)
         body_row.addWidget(self._sidebar)
 
@@ -3736,7 +3810,9 @@ class MusicApp(QWidget):
         self._settings_page.theme_changed.connect(self._on_theme_changed)
         self._settings_page.scale_changed.connect(self._on_scale_changed)
         self._settings_page.discord_rpc_toggled.connect(self._on_discord_rpc_toggled)
-        self._settings_page.cache_cleared.connect(self._on_cache_cleared)
+        self._settings_page.cover_cache_cleared.connect(self._on_cover_cache_cleared)
+        self._settings_page.library_cache_cleared.connect(self._on_library_cache_cleared)
+        self._settings_page.player_data_cache_cleared.connect(self._on_player_data_cache_cleared)
         self._settings_page.local_library_toggled.connect(self._on_local_library_toggled)
         self._settings_page.open_local_folder_clicked.connect(self._on_open_local_folder_clicked)
         self._settings_page.eq_enabled_toggled.connect(self._on_eq_enabled_toggled)
@@ -3882,6 +3958,15 @@ class MusicApp(QWidget):
         if self._loading or self._closing:
             return
         self._loading = True
+
+        if self._offline:
+            # No account, no server reachable — local library only (already
+            # initialized in _apply_loaded_settings), nothing here should
+            # touch the network or even a stale server-library cache, since
+            # the whole "Библиотека" section is hidden anyway.
+            self._sidebar.load_account_content(liked=False, entries=[])
+            self._loading = False
+            return
 
         # Step 1: Instantaneously load library from local file cache so navigation works right away
         try:
@@ -4339,6 +4424,20 @@ class MusicApp(QWidget):
         except Exception:
             self._media_keys = None
 
+    def _setup_mpris(self):
+        # Registers Memify as an MPRIS2 player on the session D-Bus (Linux
+        # only) so Bluetooth headset play/pause/next/prev buttons — routed
+        # via AVRCP into MPRIS by the desktop, not into synthetic media
+        # keys — actually reach it. See utils/mpris_service.py.
+        if not _MPRIS_AVAILABLE or not _mpris_is_supported():
+            return
+        try:
+            service = MPRISService(self.player, self)
+            if service.start():
+                self._mpris_service = service
+        except Exception:
+            self._mpris_service = None
+
     # ── Search ────────────────────────────────────────────────────────────────
 
     def _setup_search_worker(self):
@@ -4610,23 +4709,31 @@ class MusicApp(QWidget):
         )
         self.logout_requested.emit()
 
-    def _on_cache_cleared(self):
+    def _on_cover_cache_cleared(self):
         cover_cache.clear()
         cover_cache.clear_disk_cache()
+
+    def _on_library_cache_cleared(self):
+        if self._offline:
+            return
         try:
             if os.path.exists(LIBRARY_CACHE_FILE):
                 os.remove(LIBRARY_CACHE_FILE)
         except Exception:
             pass
+        self.library_manager.clear_cache()
+        self._loading = False
+        self._load_library_then_player_data()
+
+    def _on_player_data_cache_cleared(self):
         try:
             path = self._player_data_cache_path()
             if os.path.exists(path):
                 os.remove(path)
         except Exception:
             pass
-        self.library_manager.clear_cache()
-        self._loading = False
-        self._load_library_then_player_data()
+        if self._account_manager and not self._offline:
+            self._fetch_player_data()
 
     def _on_controls_artist_clicked(self, artist_name: str):
         artist = self._find_artist_any(artist_name)
@@ -5103,6 +5210,8 @@ class MusicApp(QWidget):
         self._controls.update_track_info(track, artist, album, display_artist_names=display_artist_names)
         self._controls.set_playing(True)
         self._load_controls_cover(album)
+        if self._mpris_service:
+            self._mpris_service.update_track(track, artist, album)
         self._sync_like_button()
         self._schedule_discord_presence_refresh(90)
         self._schedule_discord_presence_refresh(650)
@@ -5175,11 +5284,15 @@ class MusicApp(QWidget):
         self._disc_overlay.set_playing(is_playing)
         self._schedule_discord_presence_refresh(90)
         self._schedule_discord_presence_refresh(650)
+        if self._mpris_service:
+            self._mpris_service.update_playback_state(is_playing)
 
     def _on_position_changed(self):
         pos = self.player.get_current_position()
         dur = self.player.get_duration()
         self._controls.update_position(pos, dur)
+        if self._mpris_service:
+            self._mpris_service.update_position(pos, dur)
 
     def _on_duration_changed(self):
         pos = self.player.get_current_position()
@@ -5354,6 +5467,11 @@ class MusicApp(QWidget):
         if self._media_keys:
             try:
                 self._media_keys.listener.stop()
+            except Exception:
+                pass
+        if self._mpris_service:
+            try:
+                self._mpris_service.stop()
             except Exception:
                 pass
         # Any in-flight Discord connect attempt runs on a daemon thread —

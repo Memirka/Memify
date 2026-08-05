@@ -82,8 +82,20 @@ class AppWindow(QWidget):
         if self._account_manager.activate_saved_login():
             # Has saved credentials → build main right away
             self._build_main_widget()
-        else:
+        elif self._account_manager.last_error == "network_error":
+            # Saved credentials exist but verifying them against the server
+            # failed with a connection error (not e.g. a wrong password) —
+            # no point showing a login screen the user can't do anything
+            # useful with; launch straight into offline mode instead.
+            self._build_main_widget(offline=True)
+        elif self._account_manager.is_server_reachable():
             self._auth_pending = True
+        else:
+            # No saved credentials at all, so activate_saved_login() never
+            # even attempted a network request — a dedicated reachability
+            # check is the only way to tell "brand new install, offline"
+            # apart from "brand new install, just needs to sign in".
+            self._build_main_widget(offline=True)
 
     # ── Splash ────────────────────────────────────────────────────────────────
 
@@ -228,7 +240,7 @@ class AppWindow(QWidget):
 
     # ── Main widget ───────────────────────────────────────────────────────────
 
-    def _build_main_widget(self):
+    def _build_main_widget(self, offline: bool = False):
         if self._main_ready:
             return
 
@@ -254,7 +266,7 @@ class AppWindow(QWidget):
             )
             sys.exit(1)
 
-        self._main_widget = MusicApp(account_manager=self._account_manager)
+        self._main_widget = MusicApp(account_manager=self._account_manager, offline=offline)
         self._main_widget.logout_requested.connect(self._on_logout)
         self._main_ready = True
         self._stack.addWidget(self._main_widget)

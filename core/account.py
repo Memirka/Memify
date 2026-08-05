@@ -242,6 +242,18 @@ class AccountManager:
             self.last_error = "network_error"
             return False
 
+    def is_server_reachable(self, timeout: float = 3.0) -> bool:
+        """Lightweight connectivity probe — used at startup when there's no
+        saved login to naturally test reachability with (see main.py's
+        offline-mode branch): any response at all means the network and
+        server are both up; any exception (timeout, DNS failure, connection
+        refused, ...) means they're not."""
+        try:
+            requests.get(SERVER_URL, timeout=timeout)
+            return True
+        except Exception:
+            return False
+
     # === player data ===
     def fetch_player_data(self) -> dict:
         if not self.active_login or not self._password:

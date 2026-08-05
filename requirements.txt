@@ -5,3 +5,9 @@ requests==2.34.2
 pynput==1.8.2
 pypresence==4.6.2
 python-vlc==3.0.21203
+# MPRIS2 D-Bus service (utils/mpris_service.py) — lets Bluetooth headset
+# play/pause/next/prev buttons control Memify on Linux desktops, where
+# AVRCP commands are routed via MPRIS rather than synthetic media keys.
+# Pure Python, no system libdbus/GObject deps (unlike dbus-python/pydbus),
+# and there's no D-Bus session bus on Windows anyway — Linux only.
+jeepney>=0.9; sys_platform == "linux"
