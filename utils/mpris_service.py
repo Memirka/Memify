@@ -20,6 +20,7 @@ are painful to get into a single-file PyInstaller build. jeepney has no
 by hand against its low-level Message API.
 """
 
+import os
 import sys
 import threading
 
@@ -37,7 +38,20 @@ except Exception as e:  # pragma: no cover - Linux-only optional dependency
     _JEEPNEY_IMPORT_ERROR = e
 
 
-BUS_NAME = "org.mpris.MediaPlayer2.memify"
+# Per-instance name (org.mpris.MediaPlayer2.memify.instance<pid>), per the
+# MPRIS spec's own recommendation for exactly this situation — see
+# specifications.freedesktop.org/mpris-spec: "...must be of the form
+# org.mpris.MediaPlayer2.name[.instance]... e.g.
+# org.mpris.MediaPlayer2.vlc.instance7834". Using a fixed shared name here
+# instead caused a real, reproducible bug: bluez-utils' mpris-proxy tracks
+# registered players by this well-known name, and if one Memify process
+# exits and a new one claims the SAME name shortly after, mpris-proxy can
+# get stuck believing the (now-dead) old registration is still current —
+# it never notices the new process, and Bluetooth headset buttons stop
+# reaching Memify until mpris-proxy itself is restarted. A PID-suffixed
+# name is never reused, so that whole class of stale-registration bug
+# can't happen — every launch looks like a brand new player to mpris-proxy.
+BASE_BUS_NAME = "org.mpris.MediaPlayer2.memify"
 OBJECT_PATH = "/org/mpris/MediaPlayer2"
 IFACE_ROOT = "org.mpris.MediaPlayer2"
 IFACE_PLAYER = "org.mpris.MediaPlayer2.Player"
@@ -120,6 +134,7 @@ class MPRISService(QObject):
     def __init__(self, player_controller, parent=None):
         super().__init__(parent)
         self.player_controller = player_controller
+        self._bus_name = f"{BASE_BUS_NAME}.instance{os.getpid()}"
         self._conn = None
         self._thread = None
         self._running = False
@@ -144,10 +159,10 @@ class MPRISService(QObject):
             self._conn = open_dbus_connection(bus="SESSION")
             with DBusRouter(self._conn) as router:
                 reply = Proxy(message_bus, router, timeout=5).RequestName(
-                    BUS_NAME, DBusNameFlags.do_not_queue
+                    self._bus_name, DBusNameFlags.do_not_queue
                 )
             if reply[0] != 1:  # not DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER
-                print(f"MPRIS: could not claim {BUS_NAME} (reply={reply[0]}), skipping")
+                print(f"MPRIS: could not claim {self._bus_name} (reply={reply[0]}), skipping")
                 self._conn.close()
                 self._conn = None
                 return False
