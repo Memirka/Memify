@@ -1,19 +1,31 @@
 from collections import deque
 
 from PyQt6.QtCore import QObject, pyqtSignal, QTimer, QUrl
-from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
+from PyQt6.QtMultimedia import QMediaPlayer
 
 
 class TrackDurationWorker(QObject):
     """Sequential track-duration prober.
 
-    Uses a muted QMediaPlayer rather than shelling out to the `ffprobe` CLI:
-    Qt's multimedia backend links FFmpeg as shared libraries used internally
-    by QMediaPlayer, not as an invokable command, so a standalone `ffprobe`
+    Uses a QMediaPlayer rather than shelling out to the `ffprobe` CLI: Qt's
+    multimedia backend links FFmpeg as shared libraries used internally by
+    QMediaPlayer, not as an invokable command, so a standalone `ffprobe`
     binary is not part of a PyInstaller build of this app and generally
     isn't present on a user's machine either — every duration probe was
     silently failing (caught by a broad except, returning 0), leaving every
     track's duration column blank.
+
+    Deliberately does NOT call setAudioOutput() at all (an earlier version
+    attached a QAudioOutput and just muted it) — QMediaPlayer decodes and
+    reports duration() regardless of whether an audio sink is attached, and
+    with none attached there is no route to any audio device at all. The
+    muted-QAudioOutput approach had a real bug on Windows: Qt6's
+    FFmpeg-backed QAudioOutput has a mute-timing race where a brief moment
+    of each probed track's actual audio reached the speakers before the
+    mute took effect, audible as a random extra track playing on top of
+    whatever the user actually chose — once per probed track, and with no
+    UI control able to stop it since the transport controls only ever
+    touched the real VLC-based player, never this one.
 
     Must be constructed and used on the main/GUI thread — QMediaPlayer needs
     a live Qt event loop, so despite the name this is NOT a QThread worker.
@@ -34,10 +46,6 @@ class TrackDurationWorker(QObject):
         self._current_url: str | None = None
 
         self._player = QMediaPlayer(self)
-        self._output = QAudioOutput(self)
-        self._output.setMuted(True)
-        self._output.setVolume(0.0)
-        self._player.setAudioOutput(self._output)
         self._player.durationChanged.connect(self._on_duration_changed)
         self._player.errorOccurred.connect(self._on_error)
 
