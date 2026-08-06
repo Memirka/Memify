@@ -140,6 +140,12 @@ def _apply_update_windows(target: str, new_file_path: str) -> tuple[bool, str]:
     bat_path = os.path.join(os.path.dirname(target), "memify_update.bat")
     script = (
         "@echo off\n"
+        # attempt is both set and read inside the same `if ( )` block below
+        # — without delayed expansion, %attempt% there would resolve to its
+        # value from before that block's own `set /a`, since plain %...%
+        # substitution happens once when a parenthesized block is parsed,
+        # not as each line inside it runs.
+        "setlocal enabledelayedexpansion\n"
         ":wait\n"
         f'tasklist /FI "PID eq {pid}" 2>NUL | find "{pid}" >NUL\n'
         "if not errorlevel 1 (\n"
@@ -150,7 +156,28 @@ def _apply_update_windows(target: str, new_file_path: str) -> tuple[bool, str]:
         "  ping 127.0.0.1 -n 2 >NUL\n"
         "  goto wait\n"
         ")\n"
+        # The exe is no longer running by this point, but `move` can still
+        # fail transiently right after a fresh download — most commonly
+        # Windows Defender (or another AV) doing an on-access scan of the
+        # newly-written .update file, which holds its own lock on it for a
+        # while independent of our process. Observed in the wild taking
+        # several launch-and-quit cycles (a few minutes) to clear before
+        # this retry loop was added, since the old script had no error
+        # check here at all and just deleted itself unconditionally after
+        # one failed attempt — leaving the .update file stuck until
+        # find_pending_update() got another chance on the next manual
+        # relaunch. Retrying here first means most cases resolve within
+        # this single run instead of needing that.
+        "set attempt=0\n"
+        ":move_retry\n"
         f'move /Y "{new_file_path}" "{target}"\n'
+        "if errorlevel 1 (\n"
+        "  set /a attempt+=1\n"
+        "  if !attempt! lss 30 (\n"
+        "    ping 127.0.0.1 -n 2 >NUL\n"
+        "    goto move_retry\n"
+        "  )\n"
+        ")\n"
         'del "%~f0"\n'
     )
     try:
