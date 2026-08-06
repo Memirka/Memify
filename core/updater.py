@@ -143,7 +143,11 @@ def _apply_update_windows(target: str, new_file_path: str) -> tuple[bool, str]:
         ":wait\n"
         f'tasklist /FI "PID eq {pid}" 2>NUL | find "{pid}" >NUL\n'
         "if not errorlevel 1 (\n"
-        "  timeout /t 1 /nobreak >NUL\n"
+        # `timeout` refuses to run ("Input redirection is not supported")
+        # when launched without a real console, which this helper always is
+        # (see creationflags below) — `ping` needs no console/stdin and is
+        # the standard batch-script sleep workaround for that case.
+        "  ping 127.0.0.1 -n 2 >NUL\n"
         "  goto wait\n"
         ")\n"
         f'move /Y "{new_file_path}" "{target}"\n'
@@ -152,11 +156,66 @@ def _apply_update_windows(target: str, new_file_path: str) -> tuple[bool, str]:
     try:
         with open(bat_path, "w", encoding="utf-8") as f:
             f.write(script)
-        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
-        subprocess.Popen(["cmd.exe", "/c", bat_path], creationflags=creationflags)
+        # CREATE_NO_WINDOW alone is enough to launch cmd.exe hidden and
+        # detached from this process's lifetime. Combined with
+        # DETACHED_PROCESS, CreateProcess can fail outright on some Windows
+        # versions (the two flags describe contradictory console setups) —
+        # that failure was silent (caught below) and left the .bat written
+        # to disk but never run, which is exactly the "leftover files, exe
+        # never swaps" symptom this was fixed for.
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        subprocess.Popen(
+            ["cmd.exe", "/c", bat_path],
+            creationflags=creationflags,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
         log(f"apply_update_and_exit: windows helper launched ({bat_path})")
         return True, ""
     except Exception as e:
         err = f"{e!r}\n{traceback.format_exc()}"
         log(f"apply_update_and_exit: windows helper launch FAILED: {err}")
         return False, str(e)
+
+
+def find_pending_update() -> str | None:
+    """Path to a previously-downloaded update that never got swapped in
+    (e.g. the Windows helper batch script failed to launch or run to
+    completion last time) — or None if there's nothing pending.
+
+    Reusing it lets the app finish an interrupted update on the next launch
+    instead of leaving `.exe.update`/`memify_update.bat` on disk forever and
+    silently re-downloading the same build every single startup.
+    """
+    pending = download_dest_path()
+    if not os.path.isfile(pending):
+        return None
+    if not _looks_like_complete_build(pending):
+        # Most likely the app was killed mid-download (the only path that
+        # doesn't already clean up a partial file — see
+        # DownloadWorker._cleanup_partial_file for the normal-failure case).
+        # Applying a truncated file would replace a working build with a
+        # broken one, so discard it and let a normal update check re-download.
+        log(f"find_pending_update: discarding corrupt/truncated leftover {pending}")
+        try:
+            os.remove(pending)
+        except Exception:
+            pass
+        return None
+    return pending
+
+
+def _looks_like_complete_build(path: str) -> bool:
+    try:
+        # A real Memify build is well over 100MB; anything far smaller is a
+        # truncated download, not a valid executable.
+        if os.path.getsize(path) < 1_000_000:
+            return False
+        if sys.platform == "win32":
+            with open(path, "rb") as f:
+                return f.read(2) == b"MZ"
+        return True
+    except Exception:
+        return False

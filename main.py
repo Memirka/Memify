@@ -127,10 +127,19 @@ class AppWindow(QWidget):
     # ── Self-update ──────────────────────────────────────────────────────────
 
     def _start_update_check(self):
-        from core.updater import is_frozen
+        from core.updater import is_frozen, find_pending_update, log as update_log
 
         if not is_frozen():
             self._after_update_check()
+            return
+
+        pending = find_pending_update()
+        if pending:
+            # A previous update was fully downloaded but never got swapped
+            # in (e.g. the Windows helper script failed to run) — finish it
+            # now instead of downloading the same build all over again.
+            update_log(f"_start_update_check: retrying pending update: {pending}")
+            self._apply_downloaded_update(pending)
             return
 
         from workers.update_check_worker import UpdateCheckWorker
@@ -195,14 +204,7 @@ class AppWindow(QWidget):
             progress.close()
             thread.quit()
             if success and not failed:
-                from core.updater import apply_update_and_exit, _log_path
-
-                ok, err = apply_update_and_exit(tmp_path)
-                if ok:
-                    QApplication.instance().quit()
-                else:
-                    self._show_update_error(f"Не удалось применить обновление: {err}\n\nЛог: {_log_path()}")
-                    self._after_update_check()
+                self._apply_downloaded_update(tmp_path)
             else:
                 if not cancelled:
                     reason = download_error["msg"] or "неизвестная ошибка"
@@ -216,6 +218,16 @@ class AppWindow(QWidget):
         thread.start()
         self._update_download_thread = thread
         self._update_download_worker = worker
+
+    def _apply_downloaded_update(self, file_path: str):
+        from core.updater import apply_update_and_exit, _log_path
+
+        ok, err = apply_update_and_exit(file_path)
+        if ok:
+            QApplication.instance().quit()
+        else:
+            self._show_update_error(f"Не удалось применить обновление: {err}\n\nЛог: {_log_path()}")
+            self._after_update_check()
 
     def _after_update_check(self):
         if self._auth_pending and not self._main_ready:
