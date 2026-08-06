@@ -15,6 +15,7 @@ in, not a literal "Internet" string anywhere in this file.
 
 import os
 import shutil
+import subprocess
 import sys
 
 
@@ -54,9 +55,31 @@ def install_desktop_entry() -> None:
             "Categories=Network;\n"
             "Terminal=false\n"
         )
+
+        try:
+            with open(desktop_path, "r", encoding="utf-8") as f:
+                unchanged = f.read() == entry
+        except Exception:
+            unchanged = False
+        if unchanged:
+            return
+
         with open(desktop_path, "w", encoding="utf-8") as f:
             f.write(entry)
         os.chmod(desktop_path, 0o755)
+
+        # KDE (and to a lesser extent other DEs) caches the application
+        # menu's contents (ksycoca) rather than re-scanning ~/.local/share/
+        # applications on every open — without this, a *changed* Exec=/
+        # Icon= (e.g. after running Memify from a new location) can still
+        # show the previous, stale entry in the menu for a while even
+        # though this file on disk is already correct. Both are best-effort
+        # and commonly absent outside their own DE, hence the broad except.
+        for cmd in (["update-desktop-database", apps_dir], ["kbuildsycoca6"]):
+            try:
+                subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            except Exception:
+                pass
     except Exception:
         pass
 
