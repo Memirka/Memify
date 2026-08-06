@@ -245,6 +245,24 @@ class PlayerController(QObject):
         себе при каждом запуске приложения (и, соответственно, сразу после
         применения автообновления, когда новый .exe запускается впервые).
 
+        НЕ мьютит и НЕ обнуляет громкость throwaway-плеера (было так в
+        предыдущей версии) — WASAPI на Windows и PulseAudio на Linux у
+        libVLC оба группируют звуковые потоки процесса в ОДНУ сессию/запись
+        в системном микшере, а не по отдельности на каждый MediaPlayer.
+        audio_set_mute(True)/audio_set_volume(0) на этом отдельном
+        throwaway-плеере откатывали ГРОМКОСТЬ ВСЕГО ПРОЦЕССА в микшере до
+        0 — ту самую, которую self.player.set_volume(saved_vol) секундой
+        раньше (main_window.py) уже корректно выставил — и, в отличие от
+        обычной паузы, эта настройка микшера не привязана к времени жизни
+        конкретного плеера: play_track()'ы через self.player продолжали
+        идти на 0% громкости в микшере ОС даже после warmup_player.stop(),
+        пока пользователь не поднимал её сам вручную. Раз set_volume(
+        saved_vol) уже отработал до вызова warm_up(), throwaway-плеер просто
+        наследует уже правильно выставленную громкость сессии — секунда
+        собственного короткого звука приложения на нормальной громкости
+        это приемлемая цена за то, что реальное воспроизведение больше не
+        остаётся молчать.
+
         Сетевой путь по-прежнему прогревается, если remote_url передан — но
         только через parse_with_options(..., network), который качает ровно
         столько байт, сколько нужно, чтобы определить формат, и никогда не
@@ -258,8 +276,6 @@ class PlayerController(QObject):
             return
         try:
             warmup_player = self._vlc_instance.media_player_new()
-            warmup_player.audio_set_mute(True)
-            warmup_player.audio_set_volume(0)
             media = self._vlc_instance.media_new(PLAYER_WARMUP_SOUND)
             warmup_player.set_media(media)
             warmup_player.play()
