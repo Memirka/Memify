@@ -140,44 +140,48 @@ def _apply_update_windows(target: str, new_file_path: str) -> tuple[bool, str]:
     bat_path = os.path.join(os.path.dirname(target), "memify_update.bat")
     script = (
         "@echo off\n"
-        # attempt is both set and read inside the same `if ( )` block below
-        # — without delayed expansion, %attempt% there would resolve to its
-        # value from before that block's own `set /a`, since plain %...%
-        # substitution happens once when a parenthesized block is parsed,
-        # not as each line inside it runs.
+        # attempt is both set and read within the same retry pass — without
+        # delayed expansion, %attempt% could resolve to a stale value read
+        # at block-parse time rather than the one just assigned to it.
         "setlocal enabledelayedexpansion\n"
         ":wait\n"
         f'tasklist /FI "PID eq {pid}" 2>NUL | find "{pid}" >NUL\n'
-        "if not errorlevel 1 (\n"
+        # `if errorlevel 1` here means the PID was NOT found (process
+        # exited) — deliberately flat, one `goto` per line, no `goto`
+        # nested inside `( )` blocks: cmd.exe pre-tokenizes an entire
+        # parenthesized block before running any line inside it, and a
+        # `goto` that jumps back into/out of a NESTED `if ( if ( ... ) )`
+        # (an earlier version of this script had exactly that, in the
+        # retry loop below) is a well-known source of batch scripts that
+        # silently never reach their own last line — which would explain
+        # reports of the .update file AND this .bat both still sitting
+        # there afterward, since `del "%~f0"` would then never run either.
+        "if errorlevel 1 goto move_retry_init\n"
         # `timeout` refuses to run ("Input redirection is not supported")
         # when launched without a real console, which this helper always is
         # (see creationflags below) — `ping` needs no console/stdin and is
         # the standard batch-script sleep workaround for that case.
-        "  ping 127.0.0.1 -n 2 >NUL\n"
-        "  goto wait\n"
-        ")\n"
+        "ping 127.0.0.1 -n 2 >NUL\n"
+        "goto wait\n"
+        ":move_retry_init\n"
         # The exe is no longer running by this point, but `move` can still
         # fail transiently right after a fresh download — most commonly
         # Windows Defender (or another AV) doing an on-access scan of the
         # newly-written .update file, which holds its own lock on it for a
         # while independent of our process. Observed in the wild taking
         # several launch-and-quit cycles (a few minutes) to clear before
-        # this retry loop was added, since the old script had no error
-        # check here at all and just deleted itself unconditionally after
-        # one failed attempt — leaving the .update file stuck until
-        # find_pending_update() got another chance on the next manual
-        # relaunch. Retrying here first means most cases resolve within
-        # this single run instead of needing that.
+        # this retry loop was added, since an even earlier version had no
+        # error check here at all and just deleted itself unconditionally
+        # after one failed attempt.
         "set attempt=0\n"
         ":move_retry\n"
+        "set /a attempt+=1\n"
         f'move /Y "{new_file_path}" "{target}"\n'
-        "if errorlevel 1 (\n"
-        "  set /a attempt+=1\n"
-        "  if !attempt! lss 30 (\n"
-        "    ping 127.0.0.1 -n 2 >NUL\n"
-        "    goto move_retry\n"
-        "  )\n"
-        ")\n"
+        "if not errorlevel 1 goto done\n"
+        "if !attempt! geq 30 goto done\n"
+        "ping 127.0.0.1 -n 2 >NUL\n"
+        "goto move_retry\n"
+        ":done\n"
         'del "%~f0"\n'
     )
     try:
