@@ -112,6 +112,7 @@ class PlayerController(QObject):
         self.shuffled_indices = []
         self._manual_track_switch = False
         self._ended_handled = False  # чтобы _handle_track_end не сработал дважды на одном Ended-состоянии
+        self._last_volume: int | None = None
 
         self.timer = QTimer()
         self.timer.setInterval(500)
@@ -268,6 +269,20 @@ class PlayerController(QObject):
         столько байт, сколько нужно, чтобы определить формат, и никогда не
         создаёт MediaPlayer/не трогает звуковое устройство вообще, так что
         утечка в принципе невозможна.
+
+        До самого первого play() на любом MediaPlayer этого процесса
+        реального WASAPI/PulseAudio output-устройства ещё не существует —
+        set_volume(saved_vol), вызванный до warm_up() (main_window.py),
+        применяется к player'у, у которого ещё нет живой аудио-сессии, и
+        может быть потерян: когда устройство физически открывается (первый
+        реальный play(), которым как раз и оказывается play() этого
+        throwaway-плеера), ОС может проинициализировать НОВУЮ сессию своим
+        собственным запомненным ранее значением, а не тем, что просили
+        мы — соответствие сообщённому на Windows поведению, когда громкость
+        в приложении стоит на максимуме, а в системном микшере после этого
+        видно заметно меньше. Поэтому здесь же, вскоре после того как
+        warmup-плеер действительно откроет устройство, громкость
+        принудительно переприменяется на РЕАЛЬНОМ self.player.
         """
         if remote_url:
             self._start_warmup_network_parse(remote_url)
@@ -279,9 +294,14 @@ class PlayerController(QObject):
             media = self._vlc_instance.media_new(PLAYER_WARMUP_SOUND)
             warmup_player.set_media(media)
             warmup_player.play()
+            QTimer.singleShot(300, self._reapply_volume_after_warmup)
             QTimer.singleShot(600, warmup_player.stop)
         except Exception:
             pass
+
+    def _reapply_volume_after_warmup(self) -> None:
+        if self._last_volume is not None:
+            self.set_volume(self._last_volume)
 
     def _start_warmup_network_parse(self, remote_url: str) -> None:
         try:
@@ -447,7 +467,17 @@ class PlayerController(QObject):
         try:
             # У QAudioOutput громкость была float 0.0-1.0 — libVLC сразу
             # принимает int 0-100, конвертация больше не нужна.
-            self.player.audio_set_volume(max(0, min(100, int(value))))
+            #
+            # audio_set_mute(False) здесь обязателен, не опционален: mute —
+            # ОТДЕЛЬНЫЙ булев флаг у WASAPI/PulseAudio-сессии, независимый
+            # от уровня громкости — если он где-то остался включённым
+            # (например, из-за более раннего бага в warm_up(), который до
+            # этого мьютил всю сессию процесса), один только
+            # audio_set_volume(...) с ненулевым значением его НЕ снимает.
+            volume = max(0, min(100, int(value)))
+            self._last_volume = volume
+            self.player.audio_set_mute(False)
+            self.player.audio_set_volume(volume)
         except Exception:
             pass
 
