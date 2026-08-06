@@ -28,6 +28,10 @@ _saved_scale = _load_saved_ui_scale()
 if _saved_scale != 1.0:
     os.environ["QT_SCALE_FACTOR"] = str(_saved_scale)
 
+from utils.desktop_entry import install_desktop_entry
+
+install_desktop_entry()
+
 from PyQt6.QtWidgets import QApplication, QWidget, QStackedLayout, QProgressDialog, QMessageBox
 from PyQt6.QtCore import Qt, QThread, QTimer
 from PyQt6.QtGui import QIcon, QGuiApplication
