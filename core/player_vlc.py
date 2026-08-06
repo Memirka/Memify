@@ -63,6 +63,7 @@ class PlayerController(QObject):
     currentUrlChanged = pyqtSignal(str)
     audioOutputsUpdated = pyqtSignal(list)
     audioOutputDeviceChanged = pyqtSignal(object)
+    _warmupNetworkParsed = pyqtSignal()
 
     # libVLC's own "Flat" equalizer preset uses a +12dB preamp with every
     # band at 0dB (modules/audio_filter/equalizer_presets.h upstream) — the
@@ -121,6 +122,9 @@ class PlayerController(QObject):
         self.on_duration_changed = None
         self.on_album_finished = None
         self.on_album_previous = None
+
+        self._warmup_network_media = None
+        self._warmupNetworkParsed.connect(self._on_warmup_network_parsed)
 
     def setup_connections(self):
         # В отличие от QMediaPlayer, здесь нет Qt-сигналов positionChanged/
@@ -228,24 +232,59 @@ class PlayerController(QObject):
     # ── Playback control ──────────────────────────────────────────────────────
 
     def warm_up(self, remote_url: str | None = None):
-        """Упрощённая версия — у VLC нет того же дорогого холодного старта,
-        какой был у Qt-бэкенда (FFmpeg/GStreamer инициализировался лениво на
-        первый setSource()+play()); Instance() в __init__ уже поднимает
-        libVLC. Здесь только проигрываем тишину доли секунды, чтобы прогреть
-        именно аудио-пайплайн ОС (открытие устройства вывода) — не полноценный
-        порт исходной логики, а заведомое упрощение под прототип."""
-        source = remote_url or (PLAYER_WARMUP_SOUND if os.path.exists(PLAYER_WARMUP_SOUND) else None)
-        if not source:
+        """Прогревает audio-пайплайн ОС (открытие устройства вывода), играя
+        только собственный короткий bundled-звук — НИКОГДА реальный трек из
+        библиотеки пользователя. Раньше сюда передавался url первого
+        попавшегося трека библиотеки, чтобы заодно прогреть сетевой
+        HTTP/TLS-стек; на Windows у libVLC та же проблема, что и у
+        Qt6/FFmpeg-бэкенда в TrackDurationWorker (см. его докстринг) — mute
+        (audio_set_volume(0)) применяется не мгновенно, и в момент открытия
+        устройства вывода долю секунды звучит настоящее содержимое трека.
+        Раз в библиотеке первым мог оказаться чей угодно трек, слышимый
+        результат выглядел как случайный чужой трек, включающийся сам по
+        себе при каждом запуске приложения (и, соответственно, сразу после
+        применения автообновления, когда новый .exe запускается впервые).
+
+        Сетевой путь по-прежнему прогревается, если remote_url передан — но
+        только через parse_with_options(..., network), который качает ровно
+        столько байт, сколько нужно, чтобы определить формат, и никогда не
+        создаёт MediaPlayer/не трогает звуковое устройство вообще, так что
+        утечка в принципе невозможна.
+        """
+        if remote_url:
+            self._start_warmup_network_parse(remote_url)
+
+        if not os.path.exists(PLAYER_WARMUP_SOUND):
             return
         try:
             warmup_player = self._vlc_instance.media_player_new()
+            warmup_player.audio_set_mute(True)
             warmup_player.audio_set_volume(0)
-            media = self._vlc_instance.media_new(source)
+            media = self._vlc_instance.media_new(PLAYER_WARMUP_SOUND)
             warmup_player.set_media(media)
             warmup_player.play()
             QTimer.singleShot(600, warmup_player.stop)
         except Exception:
             pass
+
+    def _start_warmup_network_parse(self, remote_url: str) -> None:
+        try:
+            media = self._vlc_instance.media_new(remote_url)
+            self._warmup_network_media = media  # keep alive until parsed
+            media.event_manager().event_attach(
+                vlc.EventType.MediaParsedChanged, self._on_warmup_network_parsed_event
+            )
+            media.parse_with_options(vlc.MediaParseFlag.network, 8000)
+        except Exception:
+            self._warmup_network_media = None
+
+    def _on_warmup_network_parsed_event(self, event):
+        # Runs on a libVLC-internal thread — hop to the Qt thread via a
+        # queued signal before touching self/Qt state.
+        self._warmupNetworkParsed.emit()
+
+    def _on_warmup_network_parsed(self):
+        self._warmup_network_media = None
 
     def set_album(self, album: dict, artist: dict):
         self.current_playing_album = album
