@@ -2,6 +2,12 @@ COLORS = {
     "PRIMARY": "#1DB954",
     "PRIMARY_HOVER": "#1ED760",
     "PRIMARY_PRESSED": "#179F47",
+    # Same as PRIMARY when the accent is a single solid color; a CSS
+    # `qlineargradient(...)` string when the user picked a second color —
+    # see set_accent_color(). Only usable in QSS `background:` contexts
+    # (native QColor(...) painting and `color:`/`border-color:` in QSS can't
+    # render a gradient, so those keep using plain PRIMARY everywhere).
+    "PRIMARY_GRADIENT": "#1DB954",
     "BACKGROUND": "#121212",
     "SURFACE": "#1E1E1E",
     "SURFACE_LIGHT": "#2A2A2A",
@@ -52,10 +58,14 @@ THEMES = {
 }
 
 _accent = COLORS["PRIMARY"]
+_accent2: str | None = None  # None => solid accent; a hex string => gradient's 2nd stop
 _theme = "dark"
 
 
 def _normalize_hex(color: str | None) -> str:
+    """Always returns a valid hex color — falls back to the default green
+    when given anything invalid/empty. Used for the primary accent color,
+    which must always have *some* value."""
     default = "#1DB954"
     if not color:
         return default
@@ -71,9 +81,36 @@ def _normalize_hex(color: str | None) -> str:
     return "#" + v.upper()
 
 
-def set_accent_color(color: str) -> str:
-    global _accent
+def _try_normalize_hex(color: str | None) -> str | None:
+    """Like _normalize_hex, but returns None instead of falling back to a
+    default — used for the optional gradient 2nd color, where "not given"
+    has to mean "no gradient", not "green"."""
+    if not color:
+        return None
+    v = color.strip().lstrip("#")
+    if len(v) == 3:
+        v = "".join(c * 2 for c in v)
+    if len(v) != 6:
+        return None
+    try:
+        int(v, 16)
+    except ValueError:
+        return None
+    return "#" + v.upper()
+
+
+def set_accent_color(color: str, color2: str | None = None) -> str:
+    """Sets the accent to a solid color, or — when color2 is given and
+    differs from color — a two-stop gradient. COLORS['PRIMARY'] always
+    stays a flat, valid color (color1) so every existing QColor(...)/`color:`
+    /`border-color:` usage keeps working untouched; COLORS['PRIMARY_GRADIENT']
+    holds the CSS gradient string (or just falls back to the flat color) for
+    the QSS `background:` spots built to use it."""
+    global _accent, _accent2
     _accent = _normalize_hex(color)
+    color2_norm = _try_normalize_hex(color2)
+    _accent2 = color2_norm if (color2_norm and color2_norm != _accent) else None
+
     COLORS["PRIMARY"] = _accent
     # Compute hover (slightly brighter) and pressed (slightly darker) variants
     try:
@@ -86,7 +123,51 @@ def set_accent_color(color: str) -> str:
         COLORS["PRIMARY_PRESSED"] = pressed_c.name().upper()
     except Exception:
         pass
+
+    COLORS["PRIMARY_GRADIENT"] = (
+        f"qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 {_accent}, stop:1 {_accent2})"
+        if _accent2 else _accent
+    )
     return _accent
+
+
+def get_accent_secondary() -> str | None:
+    return _accent2
+
+
+def is_gradient_accent() -> bool:
+    return _accent2 is not None
+
+
+def accent_brush(x1: float, y1: float, x2: float, y2: float):
+    """QBrush spanning the given local line — a genuine 2-stop gradient
+    when the accent has a 2nd color, otherwise a plain solid-color brush.
+    Safe to use unconditionally in any QPainter fill/stroke that wants "the
+    accent color" (toggle switches, active glyphs, spinners, dots, ...) —
+    callers don't need their own if/else for solid vs. gradient mode."""
+    from PyQt6.QtGui import QBrush, QColor, QLinearGradient
+    if _accent2:
+        grad = QLinearGradient(x1, y1, x2, y2)
+        grad.setColorAt(0.0, QColor(_accent))
+        grad.setColorAt(1.0, QColor(_accent2))
+        return QBrush(grad)
+    return QBrush(QColor(_accent))
+
+
+def accent_fade_brush(x1: float, y1: float, x2: float, y2: float, alpha_start: int = 255, alpha_end: int = 0):
+    """Like accent_brush(), but fading in alpha from alpha_start (at the
+    line's start) to alpha_end (at its end) — e.g. a glow/fill that fades
+    to transparent. Blends both accent colors along the same line when a
+    gradient is set, so the fade isn't just a flat color's opacity ramp."""
+    from PyQt6.QtGui import QBrush, QColor, QLinearGradient
+    c1 = QColor(_accent)
+    c1.setAlpha(alpha_start)
+    c2 = QColor(_accent2 or _accent)
+    c2.setAlpha(alpha_end)
+    grad = QLinearGradient(x1, y1, x2, y2)
+    grad.setColorAt(0.0, c1)
+    grad.setColorAt(1.0, c2)
+    return QBrush(grad)
 
 
 def get_accent() -> str:

@@ -10,6 +10,7 @@ import re
 import sys
 import json
 import time
+import random
 import threading
 from functools import partial
 
@@ -20,7 +21,7 @@ from PyQt6.QtWidgets import (
     QMenu, QFileDialog, QProgressDialog, QSpacerItem,
     QAbstractItemView, QFrame, QMessageBox, QGraphicsDropShadowEffect,
     QGraphicsScene, QGraphicsPixmapItem, QGraphicsBlurEffect,
-    QStyledItemDelegate, QStyle, QSlider,
+    QStyledItemDelegate, QStyle, QSlider, QColorDialog,
 )
 from PyQt6.QtCore import (
     Qt, QTimer, QThread, QUrl, QSize, QRectF, pyqtSignal, pyqtSlot, QObject, QPoint, QPointF,
@@ -38,6 +39,7 @@ except ImportError:
     _AccountManager = None
 from ui.playback_controls import PlaybackControls, ClickableLabel
 from ui.album_widget import AlbumWidget
+from ui.changelog_data import CHANGELOG
 from ui.shimmer_placeholder import ShimmerLabel
 import ui.styles as styles_module
 from ui.styles import COLORS, get_scrollbar_style, set_accent_color, set_theme, get_theme
@@ -242,6 +244,49 @@ _LOCAL_ONLY_SETTINGS_KEYS = {
 # is deliberately not here — unlike theme/scale, it already applies live
 # (see _refresh_accent_widgets()).
 _RESTART_REQUIRED_SETTINGS_KEYS = {"theme", "ui_scale"}
+
+
+class _AccentGradientLabel(QLabel):
+    """A QLabel whose text renders in the accent color — a genuine two-stop
+    horizontal gradient brush when the user picked a second accent color,
+    otherwise identical to plain QLabel painting (driven by whatever
+    stylesheet is already set on it, e.g. `color: {PRIMARY}`). Drop-in
+    replacement for QLabel anywhere text is colored with the accent —
+    playing-track titles, section headers, the logo, etc.
+
+    Defaults to always-accent (matches labels whose text is permanently
+    accent-colored, e.g. the logo or a section header). For a label that
+    only sometimes shows the accent color (e.g. a track title that's
+    accent-colored while playing but plain white otherwise), the caller
+    MUST call set_accent_active(False) for the "otherwise" case — without
+    it this widget has no way to know the accent gradient shouldn't apply
+    right now, and would gradient-paint the label's text unconditionally
+    any time gradient mode is on, regardless of what color it's actually
+    supposed to be at that moment."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._accent_active = True
+
+    def set_accent_active(self, active: bool):
+        active = bool(active)
+        if self._accent_active != active:
+            self._accent_active = active
+            self.update()
+
+    def paintEvent(self, event):
+        if not (self._accent_active and styles_module.is_gradient_accent()):
+            super().paintEvent(event)
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setFont(self.font())
+        grad = QLinearGradient(0, 0, self.width(), 0)
+        grad.setColorAt(0.0, QColor(styles_module.get_accent()))
+        grad.setColorAt(1.0, QColor(styles_module.get_accent_secondary() or styles_module.get_accent()))
+        p.setPen(QPen(QBrush(grad), 0))
+        p.drawText(self.rect(), int(self.alignment()), self.text())
+        p.end()
 
 
 class AlbumGridWidget(QWidget):
@@ -541,6 +586,58 @@ class ArtistPage(QWidget):
 # Album / tracklist page
 # ──────────────────────────────────────────────────────────────────────────────
 
+class _TrackPlayGlyph(QWidget):
+    """Hand-drawn play triangle / pause bars for the track-number column —
+    the exact same shapes as the big circular play/pause button in the
+    bottom bar (see _CircleButton in playback_controls.py), just without
+    the circle backing and filled with the accent color/gradient instead of
+    a fixed one. Drawn rather than a font glyph so it matches that button
+    pixel-for-pixel instead of depending on font/size-dependent rendering."""
+
+    _GLYPH_SIZE = 11.0  # fixed visual size, independent of the widget's own box
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._playing = False  # True => bars, False => triangle
+
+    def set_playing(self, playing: bool):
+        playing = bool(playing)
+        if self._playing != playing:
+            self._playing = playing
+            self.update()
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rf = QRectF(self.rect())
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(styles_module.accent_brush(rf.left(), 0, rf.right(), 0))
+        cx, cy = rf.center().x(), rf.center().y()
+        size = self._GLYPH_SIZE
+
+        if self._playing:
+            bar_w = size * 0.26
+            gap = size * 0.28
+            bar_h = size * 0.95
+            for dx in (-(gap / 2 + bar_w / 2), gap / 2 + bar_w / 2):
+                p.drawRoundedRect(
+                    QRectF(cx + dx - bar_w / 2, cy - bar_h / 2, bar_w, bar_h), 1.0, 1.0
+                )
+        else:
+            h = size * 0.95
+            w = h * 0.87
+            path = QPainterPath()
+            path.moveTo(0, 0)
+            path.lineTo(0, h)
+            path.lineTo(w, h / 2)
+            path.closeSubpath()
+            # Same optical-centering nudge as _CircleButton's triangle.
+            optical_nudge = w * 0.12
+            path.translate(cx - w / 2 + optical_nudge, cy - h / 2)
+            p.drawPath(path)
+        p.end()
+
+
 class TrackRow(QWidget):
     """Single row in the tracklist."""
     play_requested = pyqtSignal(int)  # track index
@@ -553,7 +650,8 @@ class TrackRow(QWidget):
         self._track = track
         self._display_number = display_number if display_number is not None else index + 1
         self._liked = False
-        self._is_playing_state = False
+        self._is_playing_state = False  # this row is the current track (playing or paused)
+        self._is_paused_state = False   # only meaningful while _is_playing_state is True
         self.setObjectName("trackRow")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setStyleSheet(
@@ -567,11 +665,22 @@ class TrackRow(QWidget):
         row.setContentsMargins(8, 6, 8, 6)
         row.setSpacing(8)
 
-        self._num_label = QLabel(str(self._display_number))
+        self._num_label = _AccentGradientLabel(str(self._display_number))
+        self._num_label.set_accent_active(False)  # plain TEXT_SECONDARY until this row is the playing track
         self._num_label.setFixedWidth(24)
         self._num_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self._num_label.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']}; font: 10pt 'Segoe UI';")
         row.addWidget(self._num_label)
+
+        # Same fixed width as the label, its own glyph drawn at a fixed
+        # visual size regardless of that box (see _GLYPH_SIZE) — only one
+        # of the two is ever visible (toggled in _update_playing_icon()),
+        # a hidden widget takes no layout space, so whichever is shown
+        # ends up sitting in the exact same slot the other one just left.
+        self._num_icon = _TrackPlayGlyph()
+        self._num_icon.setFixedSize(24, 20)
+        self._num_icon.hide()
+        row.addWidget(self._num_icon, 0, Qt.AlignmentFlag.AlignVCenter)
 
         self._cover_label = QLabel()
         self._cover_label.setFixedSize(36, 36)
@@ -581,7 +690,8 @@ class TrackRow(QWidget):
         row.addWidget(self._cover_label)
 
         title = clean_title(self._track.get("title", "")) or "Неизвестно"
-        self._title_label = QLabel(title)
+        self._title_label = _AccentGradientLabel(title)
+        self._title_label.set_accent_active(False)  # plain TEXT_PRIMARY until this row is the playing track
         self._title_label.setStyleSheet(f"color: {COLORS['TEXT_PRIMARY']}; font: 10pt 'Segoe UI';")
         self._title_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         row.addWidget(self._title_label, 1)
@@ -649,17 +759,38 @@ class TrackRow(QWidget):
         return _track_like_keys(self._track)
 
     def set_playing(self, is_playing: bool):
+        """Marks this row as the current track (playing OR paused) — call
+        set_paused() separately to say which of the two it actually is."""
         self._is_playing_state = is_playing
         accent = COLORS["PRIMARY"]
-        self._num_label.setText("▶" if is_playing else str(self._display_number))
+        self._update_playing_icon()
+        self._num_label.set_accent_active(is_playing)
         self._num_label.setStyleSheet(
             f"color: {accent}; font: 10pt 'Segoe UI';" if is_playing
             else f"color: {COLORS['TEXT_SECONDARY']}; font: 10pt 'Segoe UI';"
         )
+        self._title_label.set_accent_active(is_playing)
         self._title_label.setStyleSheet(
             f"color: {accent}; font: 10pt 'Segoe UI';" if is_playing
             else f"color: {COLORS['TEXT_PRIMARY']}; font: 10pt 'Segoe UI';"
         )
+
+    def set_paused(self, is_paused: bool):
+        """Only changes the icon on the current-track row — actively playing
+        shows the "||" bars, paused shows "▶" (harmless no-op on every other
+        row, since _update_playing_icon() only branches on it when this row
+        is also the current track)."""
+        self._is_paused_state = is_paused
+        self._update_playing_icon()
+
+    def _update_playing_icon(self):
+        if not self._is_playing_state:
+            self._num_icon.hide()
+            self._num_label.show()
+            return
+        self._num_icon.set_playing(not self._is_paused_state)
+        self._num_label.hide()
+        self._num_icon.show()
 
     def apply_accent(self):
         """Re-apply accent-dependent colors after the accent changes."""
@@ -791,7 +922,7 @@ class AlbumPage(QWidget):
         self._play_all_btn.clicked.connect(lambda: self.track_play_requested.emit(0, self._current_album, self._current_artist))
         c = COLORS
         self._play_all_btn.setStyleSheet(
-            f"QPushButton {{ background: {c['PRIMARY']}; border: none; border-radius: 18px; "
+            f"QPushButton {{ background: {c['PRIMARY_GRADIENT']}; border: none; border-radius: 18px; "
             f"color: #000; font: 10pt 'Segoe UI'; font-weight: 600; padding: 0 24px; }}"
             f"QPushButton:hover {{ background: {c['PRIMARY_HOVER']}; }}"
         )
@@ -892,7 +1023,7 @@ class AlbumPage(QWidget):
         self._artist_names_widget.setVisible(bool(names))
 
     def load_album(self, album: dict, artist: dict, playing_url: str = "", display_artist_names: list | None = None,
-                    playing_track: dict | None = None):
+                    playing_track: dict | None = None, is_paused: bool = False):
         """Update this page for a different album."""
         self._current_album = album
         self._current_artist = artist
@@ -994,6 +1125,7 @@ class AlbumPage(QWidget):
 
         if playing_url or playing_track:
             self.mark_playing_url(playing_url, playing_track)
+        self.set_paused(is_paused)
 
     def mark_playing(self, track_idx: int):
         for i, row in enumerate(self._track_rows):
@@ -1005,6 +1137,12 @@ class AlbumPage(QWidget):
         keys = _track_like_keys(track or {}, url)
         for row in self._track_rows:
             row.set_playing(bool(keys) and bool(row.track_identity_keys() & keys))
+
+    def set_paused(self, is_paused: bool):
+        """Switches the current-track row's icon between "||" (actually
+        playing) and "▶" (paused) — see TrackRow.set_paused()."""
+        for row in self._track_rows:
+            row.set_paused(is_paused)
 
     def _load_album_cover(self, url: str):
         key = cache_key(url, 180, 14)
@@ -1165,7 +1303,7 @@ class AlbumPage(QWidget):
     def apply_accent(self):
         c = COLORS
         self._play_all_btn.setStyleSheet(
-            f"QPushButton {{ background: {c['PRIMARY']}; border: none; border-radius: 18px; "
+            f"QPushButton {{ background: {c['PRIMARY_GRADIENT']}; border: none; border-radius: 18px; "
             f"color: #000; font: 10pt 'Segoe UI'; font-weight: 600; padding: 0 24px; }}"
             f"QPushButton:hover {{ background: {c['PRIMARY_HOVER']}; }}"
         )
@@ -1254,7 +1392,7 @@ class CoverViewerOverlay(QWidget):
     def apply_accent(self):
         c = COLORS
         self._download_btn.setStyleSheet(
-            f"QPushButton {{ background: {c['PRIMARY']}; border: none; border-radius: 19px; "
+            f"QPushButton {{ background: {c['PRIMARY_GRADIENT']}; border: none; border-radius: 19px; "
             f"color: #000; font: 600 10.5pt 'Segoe UI'; padding: 0 22px; }}"
             f"QPushButton:hover {{ background: {c['PRIMARY_HOVER']}; }}"
             f"QPushButton:disabled {{ background: {c['SURFACE_LIGHT']}; color: {c['TEXT_SECONDARY']}; }}"
@@ -1604,8 +1742,8 @@ class _LoadingSpinner(QWidget):
     def paintEvent(self, _event):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        c = styles_module.COLORS
-        pen = QPen(QColor(c["PRIMARY"]))
+        pen = QPen()
+        pen.setBrush(styles_module.accent_brush(0, 0, self._diameter, 0))
         pen.setWidth(self._line_width)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         p.setPen(pen)
@@ -1841,7 +1979,8 @@ class SearchPage(QWidget):
         txt = QVBoxLayout()
         txt.setSpacing(1)
         txt.setContentsMargins(0, 0, 0, 0)
-        title_lbl = QLabel(clean_title(result.track_title or ""))
+        title_lbl = _AccentGradientLabel(clean_title(result.track_title or ""))
+        title_lbl.set_accent_active(False)  # plain TEXT_PRIMARY until refresh_playing() says otherwise
         title_lbl.setStyleSheet(f"color: {COLORS['TEXT_PRIMARY']}; font: 10pt 'Segoe UI';")
         txt.addWidget(title_lbl)
         sub_parts = [result.artists_display()]
@@ -1875,6 +2014,7 @@ class SearchPage(QWidget):
         keys = _track_like_keys(track or {}, url)
         for title_lbl, row_keys in self._track_title_labels:
             is_playing = bool(keys) and bool(row_keys & keys)
+            title_lbl.set_accent_active(is_playing)
             title_lbl.setStyleSheet(
                 f"color: {accent}; font: 10pt 'Segoe UI';" if is_playing
                 else f"color: {COLORS['TEXT_PRIMARY']}; font: 10pt 'Segoe UI';"
@@ -2031,7 +2171,7 @@ class AllArtistsPage(QWidget):
         self._scroll.verticalScrollBar().setValue(max(0, header.pos().y() - 4))
 
     def _make_section_header(self, letter: str) -> QWidget:
-        lbl = QLabel(letter)
+        lbl = _AccentGradientLabel(letter)
         lbl.setContentsMargins(8, 14, 8, 4)
         lbl.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
         lbl.setStyleSheet(f"color: {COLORS['PRIMARY']};")
@@ -2098,6 +2238,492 @@ class WelcomePage(QWidget):
         lbl.setFont(QFont("Segoe UI", 14))
         lbl.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']};")
         layout.addWidget(lbl)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Home page — the "main menu" opened via the Memify logo: a random spread of
+# albums and artists pulled from the whole library, reshuffled on every visit.
+# ──────────────────────────────────────────────────────────────────────────────
+
+class _NoWheelScrollArea(QScrollArea):
+    """A wheel event here is deliberately never accepted — Qt bubbles an
+    ignored wheel event up to the parent widget on its own, so hovering one
+    of these horizontal strips scrolls the *page* instead of doing nothing
+    (or worse, nudging the strip itself by a few px if its content is ever
+    marginally taller than the viewport)."""
+
+    def wheelEvent(self, event):
+        event.ignore()
+
+
+class _CarouselStrip(QWidget):
+    """A single-row horizontal strip with no scrollbar at all — just a pair
+    of arrow buttons overlaid on each side, revealed on hover and hidden
+    again both on mouse-leave and whenever there's nothing further to
+    scroll to in that direction."""
+
+    ARROW_SIZE = 32
+    STEP = 380  # px per click — a little over one album card + its gap
+
+    def __init__(self, height: int, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(height)
+        self._hovering = False
+        self._scroll_anim: QPropertyAnimation | None = None
+
+        self._scroll = _NoWheelScrollArea(self)
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+        row_container = QWidget()
+        self.row = QHBoxLayout(row_container)
+        self.row.setContentsMargins(0, 0, 0, 0)
+        self.row.setSpacing(16)
+        self._scroll.setWidget(row_container)
+
+        self._left_btn = self._make_arrow_btn("‹", self._scroll_left)
+        self._right_btn = self._make_arrow_btn("›", self._scroll_right)
+
+        hbar = self._scroll.horizontalScrollBar()
+        hbar.rangeChanged.connect(lambda *_a: self._update_arrows())
+        hbar.valueChanged.connect(lambda *_a: self._update_arrows())
+        self._update_arrows()
+
+    def _make_arrow_btn(self, text: str, handler) -> QPushButton:
+        btn = QPushButton(text, self)
+        btn.setFixedSize(self.ARROW_SIZE, self.ARROW_SIZE)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        btn.setStyleSheet(
+            f"QPushButton {{ background: {COLORS['SURFACE']}; border: 1px solid {COLORS['BORDER']}; "
+            f"border-radius: {self.ARROW_SIZE // 2}px; color: {COLORS['TEXT_PRIMARY']}; font: 13pt 'Segoe UI'; }}"
+            f"QPushButton:hover {{ background: {COLORS['SURFACE_HOVER']}; border-color: {COLORS['TEXT_PRIMARY']}; }}"
+        )
+        btn.clicked.connect(handler)
+        btn.hide()
+        return btn
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._scroll.setGeometry(0, 0, self.width(), self.height())
+        y = (self.height() - self.ARROW_SIZE) // 2
+        self._left_btn.move(6, y)
+        self._right_btn.move(self.width() - self.ARROW_SIZE - 6, y)
+        self._left_btn.raise_()
+        self._right_btn.raise_()
+
+    def _scroll_left(self):
+        self._animate_scroll(-self.STEP)
+
+    def _scroll_right(self):
+        self._animate_scroll(self.STEP)
+
+    def _animate_scroll(self, delta: int):
+        bar = self._scroll.horizontalScrollBar()
+        target = max(bar.minimum(), min(bar.maximum(), bar.value() + delta))
+        if self._scroll_anim is not None:
+            self._scroll_anim.stop()
+        self._scroll_anim = QPropertyAnimation(bar, b"value", self)
+        self._scroll_anim.setDuration(220)
+        self._scroll_anim.setStartValue(bar.value())
+        self._scroll_anim.setEndValue(target)
+        self._scroll_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._scroll_anim.start()
+
+    def _update_arrows(self):
+        bar = self._scroll.horizontalScrollBar()
+        can_left = bar.value() > bar.minimum()
+        can_right = bar.value() < bar.maximum()
+        self._left_btn.setVisible(self._hovering and can_left)
+        self._right_btn.setVisible(self._hovering and can_right)
+
+    def enterEvent(self, event):
+        self._hovering = True
+        self._update_arrows()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hovering = False
+        self._left_btn.hide()
+        self._right_btn.hide()
+        super().leaveEvent(event)
+
+
+class HomePage(QWidget):
+    album_clicked = pyqtSignal(dict, dict)  # (album, artist)
+    artist_selected = pyqtSignal(dict)
+
+    ALBUM_COUNT = 12
+    ARTIST_COUNT = 10
+    _ALBUM_CARD_W = 170
+    _ARTIST_TILE_W = 120
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._runners: list = []
+        self._library: list[dict] = []
+        self._continue_cards: list[AlbumWidget] = []
+        self._album_cards: list[AlbumWidget] = []
+        self._artist_tiles: list[QWidget] = []
+        self._build_ui()
+
+    def _build_ui(self):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setStyleSheet(get_scrollbar_style())
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(20, 16, 20, 24)
+        layout.setSpacing(20)
+
+        header_row = QHBoxLayout()
+        header_row.setSpacing(10)
+        title = QLabel("Главное меню")
+        title.setFont(QFont("Segoe UI", 18, QFont.Weight.Bold))
+        title.setStyleSheet(f"color: {COLORS['TEXT_PRIMARY']};")
+        header_row.addWidget(title)
+        header_row.addStretch(1)
+
+        refresh_btn = QPushButton("⟳  Обновить")
+        refresh_btn.setFixedHeight(32)
+        refresh_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        refresh_btn.setToolTip("Показать другую подборку")
+        refresh_btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; border: 1px solid {COLORS['BORDER']}; border-radius: 16px; "
+            f"color: {COLORS['TEXT_SECONDARY']}; font: 9.5pt 'Segoe UI'; padding: 0 14px; }}"
+            f"QPushButton:hover {{ border-color: {COLORS['TEXT_PRIMARY']}; color: {COLORS['TEXT_PRIMARY']}; }}"
+        )
+        refresh_btn.clicked.connect(self.reshuffle)
+        header_row.addWidget(refresh_btn)
+        layout.addLayout(header_row)
+
+        self._continue_label = QLabel("Продолжить слушать")
+        self._continue_label.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
+        self._continue_label.setStyleSheet(f"color: {COLORS['TEXT_PRIMARY']};")
+        self._continue_label.setVisible(False)
+        layout.addWidget(self._continue_label)
+
+        self._continue_scroll, self._continue_row = self._make_row_strip(240)
+        self._continue_scroll.setVisible(False)
+        layout.addWidget(self._continue_scroll)
+
+        albums_label = QLabel("Случайные альбомы")
+        albums_label.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
+        albums_label.setStyleSheet(f"color: {COLORS['TEXT_PRIMARY']};")
+        layout.addWidget(albums_label)
+
+        self._album_scroll, self._album_row = self._make_row_strip(240)
+        layout.addWidget(self._album_scroll)
+
+        artists_label = QLabel("Случайные исполнители")
+        artists_label.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
+        artists_label.setStyleSheet(f"color: {COLORS['TEXT_PRIMARY']};")
+        layout.addWidget(artists_label)
+
+        self._artist_scroll, self._artist_row = self._make_row_strip(160)
+        layout.addWidget(self._artist_scroll)
+
+        self._build_changelog_section(layout)
+
+        layout.addStretch(1)
+        self._scroll.setWidget(container)
+        outer.addWidget(self._scroll)
+
+    PAST_CHANGELOG_COUNT = 4
+
+    def _build_changelog_section(self, layout: QVBoxLayout):
+        """Changelog for the version this build was downloaded with, plus
+        the previous few updates below it — always the very last thing on
+        the page."""
+        divider = QFrame()
+        divider.setFrameShape(QFrame.Shape.HLine)
+        divider.setStyleSheet(f"color: {COLORS['BORDER']};")
+        layout.addWidget(divider)
+
+        self._add_changelog_entry(layout, APP_VERSION, current=True)
+
+        versions = sorted(
+            CHANGELOG.keys(),
+            key=lambda v: tuple(int(p) for p in v.split(".")),
+            reverse=True,
+        )
+        start = versions.index(APP_VERSION) + 1 if APP_VERSION in versions else 0
+        for version in versions[start:start + self.PAST_CHANGELOG_COUNT]:
+            self._add_changelog_entry(layout, version, current=False)
+
+    def _add_changelog_entry(self, layout: QVBoxLayout, version: str, current: bool):
+        block = QWidget()
+        block_layout = QVBoxLayout(block)
+        block_layout.setContentsMargins(0, 0, 0, 0)
+        block_layout.setSpacing(6)
+
+        title = QLabel(f"Что нового в версии {version}" if current else f"Версия {version}")
+        title.setFont(QFont("Segoe UI", 14 if current else 11, QFont.Weight.Bold))
+        title.setStyleSheet(
+            f"color: {COLORS['TEXT_PRIMARY'] if current else COLORS['TEXT_SECONDARY']};"
+        )
+        block_layout.addWidget(title)
+
+        entries = CHANGELOG.get(version) or (
+            ["Список изменений для этой версии пока не добавлен."] if current else []
+        )
+        for entry in entries:
+            item_lbl = QLabel(f"•  {entry}")
+            item_lbl.setWordWrap(True)
+            item_lbl.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']}; font: 9.5pt 'Segoe UI';")
+            block_layout.addWidget(item_lbl)
+
+        layout.addWidget(block)
+
+    def _make_row_strip(self, height: int) -> tuple:
+        """A single-row strip (cards never wrap): no scrollbar, no
+        wheel-scroll, just hover-revealed arrow buttons — see _CarouselStrip."""
+        strip = _CarouselStrip(height, self)
+        return strip, strip.row
+
+    # ── Data ─────────────────────────────────────────────────────────────────
+
+    def load_library(self, library: list[dict], history: list | None = None):
+        """Full reload — call whenever the page is (re)opened so the pool of
+        candidates reflects the current library before rerolling. `history`
+        is the account's recent-albums-played list (most recent first); the
+        "Продолжить слушать" row is rebuilt after reshuffle() so its cover
+        loads don't get cancelled by _fill_albums' _stop_runners()."""
+        self._library = library or []
+        self.reshuffle()
+        self._fill_continue_listening(history or [])
+
+    def reshuffle(self):
+        albums_pool = []
+        for artist in self._library:
+            if not isinstance(artist, dict):
+                continue
+            for album in artist.get("albums", []) or []:
+                if isinstance(album, dict):
+                    albums_pool.append((album, artist))
+
+        picked_albums = (
+            random.sample(albums_pool, min(self.ALBUM_COUNT, len(albums_pool)))
+            if albums_pool else []
+        )
+        artist_pool = [a for a in self._library if isinstance(a, dict)]
+        picked_artists = (
+            random.sample(artist_pool, min(self.ARTIST_COUNT, len(artist_pool)))
+            if artist_pool else []
+        )
+
+        self._fill_albums(picked_albums)
+        self._fill_artists(picked_artists)
+
+    # ── Layout helpers ───────────────────────────────────────────────────────
+
+    def _clear_row(self, row: QHBoxLayout, tracked: list):
+        for w in tracked:
+            row.removeWidget(w)
+            w.deleteLater()
+        tracked.clear()
+        while row.count():
+            item = row.takeAt(0)
+            if item and item.widget():
+                item.widget().deleteLater()
+
+    # ── Albums section ───────────────────────────────────────────────────────
+
+    def _fill_albums(self, picked: list):
+        _stop_runners(self._runners)
+        self._clear_row(self._album_row, self._album_cards)
+
+        if not picked:
+            placeholder = QLabel("Библиотека пуста")
+            placeholder.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']};")
+            self._album_row.addWidget(placeholder, 0, Qt.AlignmentFlag.AlignTop)
+            self._album_row.addStretch(1)
+            return
+
+        cover_urls = []
+        for album, artist in picked:
+            cover_url = resolve_media_url(album["cover"]) if album.get("cover") else ""
+            card = AlbumWidget(album, cover_url, widget_size=self._ALBUM_CARD_W, cover_size=150)
+            card.clicked.connect(partial(self._on_album_clicked, artist=artist))
+            self._album_row.addWidget(card, 0, Qt.AlignmentFlag.AlignTop)
+            self._album_cards.append(card)
+            cover_urls.append(cover_url)
+        self._album_row.addStretch(1)
+
+        self._load_covers_into(cover_urls, self._album_cards)
+
+    def _on_album_clicked(self, album: dict, artist: dict):
+        self.album_clicked.emit(album, artist)
+
+    def _load_covers_into(self, urls: list, cards: list):
+        valid = [(i, u) for i, u in enumerate(urls) if u]
+        if not valid:
+            return
+        to_load = []
+        for i, url in valid:
+            key = cache_key(url, 150, 14)
+            cached = cover_cache.get(key)
+            if cached and not cached.isNull() and i < len(cards):
+                cards[i].set_cover(cached)
+            else:
+                to_load.append((i, url))
+        if not to_load:
+            return
+        indices = [i for i, _ in to_load]
+        load_urls = [u for _, u in to_load]
+
+        def on_loaded(url, img, size, radius):
+            if img is None:
+                return
+            try:
+                pm = QPixmap.fromImage(img)
+                if pm.isNull():
+                    return
+                cover_cache.set(cache_key(url, size, radius), pm)
+                card_idx = indices[load_urls.index(url)]
+                if card_idx < len(cards):
+                    cards[card_idx].set_cover(pm)
+            except Exception:
+                pass
+
+        _start_image_loader(load_urls, 150, 14, on_loaded, self._runners)
+
+    # ── Continue listening section ──────────────────────────────────────────
+
+    def _fill_continue_listening(self, history: list):
+        self._clear_row(self._continue_row, self._continue_cards)
+
+        pairs = self._resolve_history_albums(history)
+        has_history = bool(pairs)
+        self._continue_label.setVisible(has_history)
+        self._continue_scroll.setVisible(has_history)
+        if not has_history:
+            return
+
+        cover_urls = []
+        for album, artist in pairs:
+            cover_url = resolve_media_url(album["cover"]) if album.get("cover") else ""
+            card = AlbumWidget(album, cover_url, widget_size=self._ALBUM_CARD_W, cover_size=150)
+            card.clicked.connect(partial(self._on_album_clicked, artist=artist))
+            self._continue_row.addWidget(card, 0, Qt.AlignmentFlag.AlignTop)
+            self._continue_cards.append(card)
+            cover_urls.append(cover_url)
+        self._continue_row.addStretch(1)
+
+        self._load_covers_into(cover_urls, self._continue_cards)
+
+    def _resolve_history_albums(self, history: list) -> list:
+        """Match stored (artist_name, album_title/album_id) history entries
+        against the current library — server-side album removals/renames
+        just drop that entry instead of showing something broken."""
+        resolved = []
+        seen_keys = set()
+        for entry in history:
+            if not isinstance(entry, dict):
+                continue
+            pair = self._find_album(
+                entry.get("artist_name", ""),
+                entry.get("album_title", ""),
+                str(entry.get("album_id") or "").strip(),
+            )
+            if not pair:
+                continue
+            album, artist = pair
+            key = (artist.get("artist", ""), album.get("title", ""))
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            resolved.append(pair)
+        return resolved
+
+    def _find_album(self, artist_name: str, album_title: str, album_id: str):
+        target_artist = clean_artist_name(artist_name)
+        target_title = clean_title(album_title)
+        for artist in self._library:
+            if not isinstance(artist, dict):
+                continue
+            if target_artist and clean_artist_name(artist.get("artist", "")) != target_artist:
+                continue
+            for album in artist.get("albums", []) or []:
+                if not isinstance(album, dict):
+                    continue
+                if album_id and str(album.get("album_id") or "").strip() == album_id:
+                    return album, artist
+                if target_title and clean_title(album.get("title", "")) == target_title:
+                    return album, artist
+        return None
+
+    # ── Artists section ──────────────────────────────────────────────────────
+
+    def _fill_artists(self, picked: list):
+        self._clear_row(self._artist_row, self._artist_tiles)
+
+        if not picked:
+            placeholder = QLabel("Нет исполнителей")
+            placeholder.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']};")
+            self._artist_row.addWidget(placeholder, 0, Qt.AlignmentFlag.AlignTop)
+            self._artist_row.addStretch(1)
+            return
+
+        for artist in picked:
+            tile = self._make_artist_tile(artist)
+            self._artist_row.addWidget(tile, 0, Qt.AlignmentFlag.AlignTop)
+            self._artist_tiles.append(tile)
+        self._artist_row.addStretch(1)
+
+    def _make_artist_tile(self, artist: dict) -> QWidget:
+        tile = QWidget()
+        tile.setFixedWidth(self._ARTIST_TILE_W)
+        tile.setCursor(Qt.CursorShape.PointingHandCursor)
+        lay = QVBoxLayout(tile)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(8)
+
+        avatar = QLabel()
+        avatar.setFixedSize(90, 90)
+        avatar.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        avatar.setStyleSheet(f"background: {COLORS['COVER_BG']}; border-radius: 45px;")
+        lay.addWidget(avatar, 0, Qt.AlignmentFlag.AlignHCenter)
+
+        name_lbl = QLabel(clean_artist_name(artist.get("artist", "")))
+        name_lbl.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        name_lbl.setWordWrap(True)
+        name_lbl.setStyleSheet(f"color: {COLORS['TEXT_PRIMARY']}; font: 9pt 'Segoe UI';")
+        lay.addWidget(name_lbl)
+
+        cover_rel = artist.get("cover", "")
+        if cover_rel:
+            full = resolve_media_url(cover_rel)
+            key = cache_key(full, 90, 45)
+            cached = cover_cache.get(key)
+            if cached and not cached.isNull():
+                avatar.setPixmap(cached)
+            else:
+                def _cb(loaded_url, img, sz, rad, lbl=avatar):
+                    try:
+                        pm = QPixmap.fromImage(img) if img else QPixmap()
+                        if not pm.isNull():
+                            cover_cache.set(cache_key(loaded_url, sz, rad), pm)
+                            lbl.setPixmap(pm)
+                    except Exception:
+                        pass
+                _start_image_loader([full], 90, 45, _cb, self._runners)
+
+        def on_click(event, a=artist):
+            if event.button() == Qt.MouseButton.LeftButton:
+                self.artist_selected.emit(a)
+        tile.mousePressEvent = on_click
+        return tile
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -2587,7 +3213,7 @@ class Sidebar(QWidget):
             if not pm.isNull():
                 item.set_cover(pm)
                 return item
-        item.set_cover_text("♥", COLORS["PRIMARY"])
+        item.set_cover_text("♥", COLORS["PRIMARY_GRADIENT"])
         return item
 
     def _make_artist_row(self, artist: dict) -> QListWidgetItem:
@@ -2747,7 +3373,14 @@ class _ToggleSwitch(QWidget):
         rect = QRectF(self.rect().adjusted(1, 1, -1, -1))
         radius = rect.height() / 2.0
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QBrush(track))
+        # Mid-flip the track is a plain off->on color blend (the animation is
+        # short enough that a gradient interpolation wouldn't read anyway);
+        # once fully on, switch to the real accent brush so a gradient
+        # accent actually shows on a resting toggle.
+        if t >= 0.999:
+            p.setBrush(styles_module.accent_brush(rect.left(), 0, rect.right(), 0))
+        else:
+            p.setBrush(QBrush(track))
         p.drawRoundedRect(rect, radius, radius)
 
         knob_d = rect.height() - 4
@@ -2866,7 +3499,6 @@ class _EqCurveWidget(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         rect = self._plot_rect()
-        accent = QColor(COLORS["PRIMARY"])
         border = QColor(COLORS["BORDER"])
         text_secondary = QColor(COLORS["TEXT_SECONDARY"])
 
@@ -2909,15 +3541,8 @@ class _EqCurveWidget(QWidget):
         fill_path.lineTo(points[-1].x(), rect.bottom())
         fill_path.lineTo(points[0].x(), rect.bottom())
         fill_path.closeSubpath()
-        gradient = QLinearGradient(0, rect.top(), 0, rect.bottom())
-        fill_color = QColor(accent)
-        fill_color.setAlpha(110)
-        gradient.setColorAt(0.0, fill_color)
-        transparent = QColor(accent)
-        transparent.setAlpha(0)
-        gradient.setColorAt(1.0, transparent)
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QBrush(gradient))
+        p.setBrush(styles_module.accent_fade_brush(0, rect.top(), 0, rect.bottom(), alpha_start=110, alpha_end=0))
         p.drawPath(fill_path)
 
         # The curve line itself.
@@ -2934,7 +3559,10 @@ class _EqCurveWidget(QWidget):
             active = i == self._drag_index
             radius = self._DOT_RADIUS + (1.5 if active else 0)
             p.setPen(QPen(QColor(COLORS["TEXT_PRIMARY"]), 1.5))
-            p.setBrush(QBrush(accent if active else QColor(COLORS["TEXT_PRIMARY"])))
+            if active:
+                p.setBrush(styles_module.accent_brush(pt.x() - radius, 0, pt.x() + radius, 0))
+            else:
+                p.setBrush(QBrush(QColor(COLORS["TEXT_PRIMARY"])))
             p.drawEllipse(pt, radius, radius)
 
         p.end()
@@ -2987,7 +3615,7 @@ class _EqCurveWidget(QWidget):
 
 class SettingsPage(QWidget):
     logout_clicked = pyqtSignal()
-    accent_changed = pyqtSignal(str)
+    accent_changed = pyqtSignal(str, str)  # (color1, color2-or-"")
     theme_changed = pyqtSignal(str)
     scale_changed = pyqtSignal(float)
     discord_rpc_toggled = pyqtSignal(bool)
@@ -3009,6 +3637,10 @@ class SettingsPage(QWidget):
         self._local_lib_toggle: _ToggleSwitch | None = None
         self._accent_btns: list[QPushButton] = []
         self._current_accent = ""
+        self._current_accent2: str | None = None
+        self._gradient_toggle: _ToggleSwitch | None = None
+        self._gradient_swatch1: QPushButton | None = None
+        self._gradient_swatch2: QPushButton | None = None
         self._theme_btns: dict[str, QPushButton] = {}
         self._current_theme = "dark"
         self._scale_btns: dict[float, QPushButton] = {}
@@ -3112,9 +3744,49 @@ class SettingsPage(QWidget):
             palette_row.addWidget(btn)
             self._accent_btns.append(btn)
 
+        custom_btn = QPushButton("+")
+        custom_btn.setFixedSize(32, 32)
+        custom_btn.setToolTip("Свой цвет")
+        custom_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        custom_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        custom_btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; border: 2px dashed {COLORS['BORDER']}; "
+            f"border-radius: 16px; color: {COLORS['TEXT_SECONDARY']}; font-size: 15px; }}"
+            f"QPushButton:hover {{ border-color: {COLORS['TEXT_PRIMARY']}; color: {COLORS['TEXT_PRIMARY']}; }}"
+        )
+        custom_btn.clicked.connect(self._on_custom_accent_clicked)
+        palette_row.addWidget(custom_btn)
+
         palette_row.addStretch(1)
         accent_card.addLayout(palette_row)
         self._restyle_accent_buttons()
+
+        # ── Gradient accent row ──────────────────────────────────────────────
+        gradient_row = QHBoxLayout()
+        gradient_row.setSpacing(10)
+        gradient_row.setContentsMargins(0, 4, 0, 0)
+
+        gradient_lbl = QLabel("Градиент из двух цветов")
+        gradient_lbl.setStyleSheet(f"color: {COLORS['TEXT_PRIMARY']}; font: 10pt 'Segoe UI';")
+        gradient_row.addWidget(gradient_lbl)
+        gradient_row.addStretch(1)
+
+        self._gradient_swatch1 = self._make_gradient_swatch_btn()
+        self._gradient_swatch1.setToolTip("Первый цвет градиента")
+        self._gradient_swatch1.clicked.connect(partial(self._on_gradient_swatch_clicked, 0))
+        gradient_row.addWidget(self._gradient_swatch1)
+
+        self._gradient_swatch2 = self._make_gradient_swatch_btn()
+        self._gradient_swatch2.setToolTip("Второй цвет градиента")
+        self._gradient_swatch2.clicked.connect(partial(self._on_gradient_swatch_clicked, 1))
+        gradient_row.addWidget(self._gradient_swatch2)
+
+        self._gradient_toggle = _ToggleSwitch()
+        self._gradient_toggle.toggled.connect(self._on_gradient_toggled)
+        gradient_row.addWidget(self._gradient_toggle)
+
+        accent_card.addLayout(gradient_row)
+        self._restyle_gradient_swatches()
 
         # ── Appearance card (theme + UI scale) ──────────────────────────────
         appearance_card = self._make_card(layout)
@@ -3332,9 +4004,9 @@ class SettingsPage(QWidget):
         self._eq_preamp_slider.setCursor(Qt.CursorShape.PointingHandCursor)
         self._eq_preamp_slider.setStyleSheet(
             f"QSlider::groove:horizontal {{ height: 4px; background: {COLORS['BORDER']}; border-radius: 2px; }}"
-            f"QSlider::handle:horizontal {{ background: {COLORS['PRIMARY']}; width: 14px; height: 14px; "
+            f"QSlider::handle:horizontal {{ background: {COLORS['PRIMARY_GRADIENT']}; width: 14px; height: 14px; "
             f"margin: -5px 0; border-radius: 7px; }}"
-            f"QSlider::sub-page:horizontal {{ background: {COLORS['PRIMARY']}; border-radius: 2px; }}"
+            f"QSlider::sub-page:horizontal {{ background: {COLORS['PRIMARY_GRADIENT']}; border-radius: 2px; }}"
             f"QSlider::add-page:horizontal {{ background: {COLORS['BORDER']}; border-radius: 2px; }}"
         )
         self._eq_preamp_slider.valueChanged.connect(self._on_eq_preamp_slider_changed)
@@ -3404,16 +4076,84 @@ class SettingsPage(QWidget):
                 f"QPushButton:hover {{ border-color: {COLORS['TEXT_PRIMARY']}; }}"
             )
 
-    def set_selected_accent(self, color: str):
-        """Reflect the currently active accent in the swatch row (call on load and after changes)."""
+    def set_selected_accent(self, color: str, color2: str | None = None):
+        """Reflect the currently active accent in the swatch row + gradient
+        controls (call on load and after changes)."""
         self._current_accent = color or ""
+        self._current_accent2 = color2 or None
         self._restyle_accent_buttons()
+        self._restyle_gradient_swatches()
+        if self._gradient_toggle is not None:
+            self._gradient_toggle.blockSignals(True)
+            self._gradient_toggle.setChecked(bool(self._current_accent2))
+            self._gradient_toggle.blockSignals(False)
+
+    def _make_gradient_swatch_btn(self) -> QPushButton:
+        btn = QPushButton()
+        btn.setFixedSize(28, 28)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        return btn
+
+    def _restyle_gradient_swatches(self):
+        if self._gradient_swatch1 is None or self._gradient_swatch2 is None:
+            return
+        c1 = self._current_accent or COLORS["PRIMARY"]
+        c2 = self._current_accent2 or c1
+        for btn, color in ((self._gradient_swatch1, c1), (self._gradient_swatch2, c2)):
+            btn.setStyleSheet(
+                f"QPushButton {{ background: {color}; border: 2px solid {COLORS['BORDER']}; "
+                f"border-radius: 14px; }}"
+                f"QPushButton:hover {{ border-color: {COLORS['TEXT_PRIMARY']}; }}"
+            )
+
+    def _on_custom_accent_clicked(self):
+        initial = QColor(self._current_accent or COLORS["PRIMARY"])
+        picked = QColorDialog.getColor(initial, self, "Свой цвет акцента")
+        if picked.isValid():
+            self._on_accent_clicked(picked.name())
+
+    def _on_gradient_swatch_clicked(self, index: int):
+        current = QColor((self._current_accent2 if index else self._current_accent) or COLORS["PRIMARY"])
+        picked = QColorDialog.getColor(current, self, "Цвет градиента")
+        if not picked.isValid():
+            return
+        if index == 0:
+            self._current_accent = picked.name()
+        else:
+            self._current_accent2 = picked.name()
+        if self._gradient_toggle is not None and self._gradient_toggle.isChecked():
+            self._apply_accent(self._current_accent, self._current_accent2)
+        else:
+            self._restyle_gradient_swatches()
+
+    def _on_gradient_toggled(self, checked: bool):
+        if checked:
+            color2 = self._current_accent2 or self._auto_second_color(self._current_accent)
+            self._apply_accent(self._current_accent, color2)
+        else:
+            self._apply_accent(self._current_accent, None)
+
+    @staticmethod
+    def _auto_second_color(color: str) -> str:
+        """A reasonable default 2nd stop when gradient mode is turned on
+        without one picked yet — same hue, shifted lighter/darker so the
+        gradient reads clearly instead of looking almost solid."""
+        c = QColor(color or COLORS["PRIMARY"])
+        h, s, v, a = c.getHsvF()
+        shifted = QColor.fromHsvF(h, s, max(0.0, v - 0.35) if v > 0.5 else min(1.0, v + 0.45), a)
+        return shifted.name()
+
+    def _apply_accent(self, color1: str, color2: str | None):
+        set_accent_color(color1, color2)
+        self.set_selected_accent(color1, color2)
+        self.accent_changed.emit(color1, color2 or "")
 
     def _style_choice_button(self, btn: QPushButton, selected: bool):
         c = COLORS
         if selected:
             btn.setStyleSheet(
-                f"QPushButton {{ background: {c['PRIMARY']}; border: none; border-radius: 16px; "
+                f"QPushButton {{ background: {c['PRIMARY_GRADIENT']}; border: none; border-radius: 16px; "
                 f"color: #000; font: 600 9.5pt 'Segoe UI'; padding: 0 14px; }}"
             )
         else:
@@ -3465,9 +4205,9 @@ class SettingsPage(QWidget):
         self._local_lib_toggle.blockSignals(False)
 
     def _on_accent_clicked(self, color: str):
-        set_accent_color(color)
-        self.set_selected_accent(color)
-        self.accent_changed.emit(color)
+        """A preset/custom single-color pick always switches to solid —
+        gradient stays an opt-in via its own toggle."""
+        self._apply_accent(color, None)
 
     def _on_theme_clicked(self, mode: str):
         self.set_selected_theme(mode)
@@ -3623,7 +4363,8 @@ class MusicApp(QWidget):
         except Exception:
             pass
         accent = self._settings.get("accent_color", COLORS["PRIMARY"])
-        set_accent_color(accent)
+        accent2 = self._settings.get("accent_color2") or None
+        set_accent_color(accent, accent2)
         set_theme(self._settings.get("theme", "dark"))
         app = QApplication.instance()
         if app:
@@ -3632,7 +4373,10 @@ class MusicApp(QWidget):
 
     def _apply_loaded_settings(self):
         """Apply settings that require UI to already be built (called after _setup_ui)."""
-        self._settings_page.set_selected_accent(self._settings.get("accent_color", COLORS["PRIMARY"]))
+        self._settings_page.set_selected_accent(
+            self._settings.get("accent_color", COLORS["PRIMARY"]),
+            self._settings.get("accent_color2") or None,
+        )
         self._settings_page.set_selected_theme(self._settings.get("theme", "dark"))
         self._settings_page.set_selected_scale(self._settings.get("ui_scale", 1.0))
 
@@ -3751,13 +4495,14 @@ class MusicApp(QWidget):
         # Page stack — pre-built, never recreated
         self._page_stack = QStackedWidget()
         self._welcome_page = WelcomePage()
+        self._home_page = HomePage()
         self._artist_page = ArtistPage()
         self._album_page = AlbumPage()
         self._search_page = SearchPage()
         self._all_artists_page = AllArtistsPage()
         self._settings_page = SettingsPage(eq_band_freqs=get_eq_band_frequencies())
 
-        for page in [self._welcome_page, self._artist_page, self._album_page,
+        for page in [self._welcome_page, self._home_page, self._artist_page, self._album_page,
                      self._search_page, self._all_artists_page, self._settings_page]:
             self._page_stack.addWidget(page)
 
@@ -3805,6 +4550,8 @@ class MusicApp(QWidget):
         self._album_page.cover_clicked.connect(self._cover_viewer.show_for)
         self._search_page.result_selected.connect(self._on_search_result_selected)
         self._all_artists_page.artist_selected.connect(self._navigate_to_artist)
+        self._home_page.album_clicked.connect(self._on_album_selected)
+        self._home_page.artist_selected.connect(self._navigate_to_artist)
         self._settings_page.logout_clicked.connect(self._on_logout)
         self._settings_page.accent_changed.connect(self._on_accent_changed)
         self._settings_page.theme_changed.connect(self._on_theme_changed)
@@ -3858,12 +4605,12 @@ class MusicApp(QWidget):
             self._logo_icon_lbl.setStyleSheet(f"color: {COLORS['PRIMARY']}; background: transparent;")
         logo_layout.addWidget(self._logo_icon_lbl)
 
-        self._logo_text_lbl = QLabel("Memify")
+        self._logo_text_lbl = _AccentGradientLabel("Memify")
         self._logo_text_lbl.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
         self._logo_text_lbl.setStyleSheet(f"color: {COLORS['PRIMARY']}; background: transparent;")
         logo_layout.addWidget(self._logo_text_lbl)
 
-        logo_widget.mousePressEvent = lambda _e: self._go_home()
+        logo_widget.mousePressEvent = lambda _e: self._open_home_menu()
         lp_layout.addWidget(logo_widget)
         lp_layout.addStretch(1)
 
@@ -4084,7 +4831,11 @@ class MusicApp(QWidget):
             for key in _RESTART_REQUIRED_SETTINGS_KEYS
         )
         new_accent = app_settings.get("accent_color")
-        accent_changed = bool(new_accent) and new_accent != self._settings.get("accent_color")
+        new_accent2 = app_settings.get("accent_color2") if "accent_color2" in app_settings else self._settings.get("accent_color2")
+        accent_changed = (
+            (bool(new_accent) and new_accent != self._settings.get("accent_color"))
+            or new_accent2 != self._settings.get("accent_color2")
+        )
 
         self._settings.update(
             {k: v for k, v in app_settings.items() if k not in _LOCAL_ONLY_SETTINGS_KEYS}
@@ -4096,7 +4847,8 @@ class MusicApp(QWidget):
             pass
 
         if accent_changed:
-            set_accent_color(new_accent)
+            set_accent_color(new_accent or COLORS["PRIMARY"], new_accent2 or None)
+            self._settings_page.set_selected_accent(new_accent or COLORS["PRIMARY"], new_accent2 or None)
             self._refresh_accent_widgets()
 
         if "volume" in app_settings:
@@ -4509,6 +5261,17 @@ class MusicApp(QWidget):
         else:
             self._page_stack.setCurrentWidget(self._welcome_page)
 
+    def _open_home_menu(self):
+        """Memify logo click — a main-menu page with a fresh random spread
+        of albums/artists, reshuffled every time it's opened."""
+        self._search_bar.clear()
+        self._search_page.set_loading(False)
+        self._home_page.load_library(
+            self.library_manager.get_library(),
+            history=self._settings.get("album_history"),
+        )
+        self._page_stack.setCurrentWidget(self._home_page)
+
     def _open_settings(self):
         self._page_stack.setCurrentWidget(self._settings_page)
 
@@ -4535,7 +5298,7 @@ class MusicApp(QWidget):
         display_artist_names = self._display_artist_names(album.get("album_id"), artist.get("artist", ""))
         self._album_page.load_album(
             album, artist, playing_url=self._playing_url, display_artist_names=display_artist_names,
-            playing_track=self._playing_track,
+            playing_track=self._playing_track, is_paused=not self.player.is_playing(),
         )
         self._album_page._album_like_btn.setVisible(True)
         album_key = self._album_key(artist.get("artist", ""), album.get("title", ""))
@@ -4691,7 +5454,8 @@ class MusicApp(QWidget):
         self._current_album = virtual_album
         self._current_artist = virtual_artist
         self._album_page.load_album(
-            virtual_album, virtual_artist, playing_url=self._playing_url, playing_track=self._playing_track
+            virtual_album, virtual_artist, playing_url=self._playing_url, playing_track=self._playing_track,
+            is_paused=not self.player.is_playing(),
         )
         self._album_page._album_like_btn.setVisible(False)
         self._album_page.refresh_track_likes(self._liked_urls_set())
@@ -4945,11 +5709,11 @@ class MusicApp(QWidget):
         })
         self._update_sidebar_from_account()
 
-    def _on_accent_changed(self, color: str):
+    def _on_accent_changed(self, color: str, color2: str):
         # Single source of truth for persistence — avoid a second writer
         # (SettingsPage used to write the file itself, which got clobbered
         # by the next _save_ui_state()/_save_settings() call elsewhere).
-        self._save_ui_state(accent_color=color)
+        self._save_ui_state(accent_color=color, accent_color2=color2 or None)
         self._refresh_accent_widgets()
 
     def _refresh_accent_widgets(self):
@@ -5219,19 +5983,43 @@ class MusicApp(QWidget):
         self._playing_url = track.get("url", "") or ""
         self._playing_track = track
         self._album_page.mark_playing_url(self._playing_url, track)
+        self._album_page.set_paused(False)  # a freshly-started track is always playing, never paused
         self._search_page.refresh_playing(self._playing_url, track)
         # Save track info for next-launch restore
         artist_name = track.get("artist_name") or (artist or {}).get("artist", "") or ""
         album_title = track.get("_real_album_title") or (album or {}).get("title", "") or ""
         album_id = str(track.get("album_id") or (album or {}).get("album_id") or "").strip()
         cover = (album or {}).get("cover", "") if not (album or {}).get("_is_liked_album") else track.get("_real_album_cover", "")
-        self._save_ui_state(last_played_track={
-            "title": track.get("title", ""),
+        self._save_ui_state(
+            last_played_track={
+                "title": track.get("title", ""),
+                "artist_name": artist_name,
+                "album_title": album_title,
+                "album_cover": cover,
+                "album_id": album_id,
+            },
+            album_history=self._record_album_history(artist_name, album_title, album_id, cover),
+        )
+
+    def _record_album_history(self, artist_name: str, album_title: str, album_id: str, cover: str) -> list:
+        """Push (artist, album) onto the "recently listened" list the home
+        page's "Продолжить слушать" row reads from — most-recent-first,
+        re-listening moves an album back to the front instead of duplicating
+        it, capped so it doesn't grow forever."""
+        if not album_title:
+            return list(self._settings.get("album_history") or [])
+        key = self._album_key(artist_name, album_title)
+        history = [
+            h for h in (self._settings.get("album_history") or [])
+            if isinstance(h, dict) and self._album_key(h.get("artist_name", ""), h.get("album_title", "")) != key
+        ]
+        history.insert(0, {
             "artist_name": artist_name,
             "album_title": album_title,
-            "album_cover": cover,
             "album_id": album_id,
+            "album_cover": cover,
         })
+        return history[:20]
 
     def _resolve_playing_cover_rel(self, album: dict) -> str:
         """Cover path for the currently playing album — prefers the real
@@ -5282,6 +6070,7 @@ class MusicApp(QWidget):
     def _on_playback_state_changed(self, is_playing: bool):
         self._controls.set_playing(is_playing)
         self._disc_overlay.set_playing(is_playing)
+        self._album_page.set_paused(not is_playing)
         self._schedule_discord_presence_refresh(90)
         self._schedule_discord_presence_refresh(650)
         if self._mpris_service:

@@ -4,7 +4,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QSize, QTimer, QPoint, QRectF
 from PyQt6.QtCore import QPropertyAnimation, QSequentialAnimationGroup, QPauseAnimation
-from PyQt6.QtGui import QFont, QCursor, QPixmap, QPainter, QPainterPath, QColor, QBrush, QFontMetrics
+from PyQt6.QtGui import QFont, QCursor, QPixmap, QPainter, QPainterPath, QColor, QBrush, QPen, QFontMetrics
 
 import ui.styles as styles_module
 from utils.format_utils import format_duration, clean_artist_name, clean_title
@@ -413,8 +413,11 @@ class _GlyphButton(QPushButton):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         c = styles_module.COLORS
         active = self._active or (self.isCheckable() and self.isChecked())
-        color = QColor(c["PRIMARY"] if (active or self._hovered) else c["TEXT_PRIMARY"])
-        p.setPen(color)
+        if active or self._hovered:
+            fm_bounds = self.rect()
+            p.setPen(QPen(styles_module.accent_brush(fm_bounds.left(), 0, fm_bounds.right(), 0), 0))
+        else:
+            p.setPen(QColor(c["TEXT_PRIMARY"]))
         f = self.font()
         p.setFont(f)
         text = self.text()
@@ -657,7 +660,7 @@ class PlaybackControls(QWidget):
             f"  border-radius: 6px; margin: -4px 0;"
             f"}}"
             f"QSlider::sub-page:horizontal {{"
-            f"  background: {c['PRIMARY']}; border-radius: 2px;"
+            f"  background: {c['PRIMARY_GRADIENT']}; border-radius: 2px;"
             f"}}"
         )
         self.progress_slider.setStyleSheet(slider_style)
