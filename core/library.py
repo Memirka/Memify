@@ -12,7 +12,8 @@ _library_cache = None
 class SearchResult:
     def __init__(self, result_type, artist_name, album_title=None, track_title=None,
                  cover_url=None, artist_obj=None, album_obj=None, track_obj=None,
-                 artist_names=None):
+                 artist_names=None, playlist_obj=None, playlist_owner_login=None,
+                 playlist_editable=False, playlist_cover_pixmap=None):
         self.type = result_type
         self.artist_name = artist_name
         self.album_title = album_title
@@ -24,6 +25,16 @@ class SearchResult:
         # All artist names when this album/track is shared (same album_id)
         # across several artists — otherwise just [artist_name].
         self.artist_names = list(artist_names) if artist_names else ([artist_name] if artist_name else [])
+        # Playlists aren't part of the shared library LibraryManager searches
+        # (they're per-account) — MusicApp constructs these directly instead
+        # of going through fast_search. playlist_obj is either one of the
+        # account's own playlist dicts (playlist_editable=True) or a
+        # playlist_subscriptions entry {owner_login, playlist_id, name,
+        # cover_data} for a "+"-ed one (playlist_editable=False).
+        self.playlist_obj = playlist_obj
+        self.playlist_owner_login = playlist_owner_login
+        self.playlist_editable = playlist_editable
+        self.playlist_cover_pixmap = playlist_cover_pixmap
 
     def artists_display(self) -> str:
         return ", ".join(clean_artist_name(n) for n in self.artist_names) if self.artist_names else clean_artist_name(self.artist_name)

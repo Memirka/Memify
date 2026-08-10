@@ -12,6 +12,8 @@ DEFAULT_PLAYER_DATA = {
     "last_played": {},
     "subscriptions": [],
     "liked_tracks": [],
+    "playlists": [],
+    "playlist_subscriptions": [],
     "app_settings": {},
     "avatar_data": None,
     "avatar_filename": None,
@@ -241,6 +243,37 @@ class AccountManager:
             print(f"Verify request failed: {e}")
             self.last_error = "network_error"
             return False
+
+    # === public users ===
+    def search_users(self, query: str, limit: int = 8) -> list:
+        query = (query or "").strip()
+        if not query:
+            return []
+        try:
+            resp = self._post("/users/search", {"query": query, "limit": limit}, timeout=5)
+            if resp.status_code != 200:
+                return []
+            data = resp.json() if resp.content else {}
+            items = data.get("items")
+            return items if isinstance(items, list) else []
+        except Exception as e:
+            print(f"User search failed: {e}")
+            return []
+
+    def get_public_profile(self, login: str = "", account_id: str = "") -> dict:
+        login = (login or "").strip()
+        account_id = (account_id or "").strip()
+        if not login and not account_id:
+            return {}
+        try:
+            resp = self._post("/users/profile", {"login": login, "account_id": account_id}, timeout=5)
+            if resp.status_code != 200:
+                return {}
+            data = resp.json() if resp.content else {}
+            return data if data.get("ok") else {}
+        except Exception as e:
+            print(f"Public profile fetch failed: {e}")
+            return {}
 
     def is_server_reachable(self, timeout: float = 3.0) -> bool:
         """Lightweight connectivity probe — used at startup when there's no

@@ -10,7 +10,10 @@ import re
 import sys
 import json
 import time
+import uuid
+import queue
 import random
+import base64
 import threading
 from functools import partial
 
@@ -21,11 +24,11 @@ from PyQt6.QtWidgets import (
     QMenu, QFileDialog, QProgressDialog, QSpacerItem,
     QAbstractItemView, QFrame, QMessageBox, QGraphicsDropShadowEffect,
     QGraphicsScene, QGraphicsPixmapItem, QGraphicsBlurEffect,
-    QStyledItemDelegate, QStyle, QSlider, QColorDialog,
+    QStyledItemDelegate, QStyle, QSlider, QColorDialog, QInputDialog,
 )
 from PyQt6.QtCore import (
     Qt, QTimer, QThread, QUrl, QSize, QRectF, pyqtSignal, pyqtSlot, QObject, QPoint, QPointF,
-    QPropertyAnimation, pyqtProperty, QEasingCurve,
+    QPropertyAnimation, pyqtProperty, QEasingCurve, QBuffer,
 )
 from PyQt6.QtGui import QFont, QColor, QPalette, QIcon, QPixmap, QFontMetrics, QCursor, QPainter, QPainterPath, QPen, QBrush, QLinearGradient, QDesktopServices
 
@@ -223,6 +226,77 @@ def _liked_entry_matches(entry, keys: set) -> bool:
     if isinstance(entry, str):
         return bool(_track_like_keys({}, entry) & keys)
     return False
+
+
+def _decode_base64_pixmap(data: str) -> QPixmap | None:
+    """Decode a base64-encoded image (e.g. a playlist's custom cover) into a
+    QPixmap, or None if it's missing/corrupt."""
+    if not data:
+        return None
+    try:
+        pm = QPixmap()
+        if pm.loadFromData(base64.b64decode(data)) and not pm.isNull():
+            return pm
+    except Exception:
+        pass
+    return None
+
+
+def _make_placeholder_cover(size: int, radius: int, glyph: str = "♪") -> QPixmap:
+    """Generated "no cover" tile for playlists — a plain rounded surface
+    with a music-note glyph, instead of reusing the liked-tracks heart icon."""
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pm)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    path = QPainterPath()
+    path.addRoundedRect(0, 0, size, size, radius, radius)
+    painter.setClipPath(path)
+    painter.fillRect(0, 0, size, size, QColor(COLORS["SURFACE_LIGHT"]))
+    painter.setPen(QColor(COLORS["TEXT_SECONDARY"]))
+    font = QFont("Segoe UI", max(10, int(size * 0.34)), QFont.Weight.Bold)
+    painter.setFont(font)
+    painter.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, glyph)
+    painter.end()
+    return pm
+
+
+def _make_play_pause_icon(playing: bool, size: int, color: str) -> QPixmap:
+    """Same triangle/bars shapes and proportions as _TrackPlayGlyph (so this
+    matches the rest of the app's play/pause iconography pixel-for-pixel),
+    rendered as a flat solid-color pixmap instead — for use as a QPushButton
+    icon, e.g. "Слушать"/"Играет", where the button's own accent-gradient
+    background makes an accent-colored glyph invisible. A plain text glyph
+    ("▮▮") looked like a smudged blob rather than two distinct bars; this
+    draws the actual shape instead of leaning on a font's rendering of it."""
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor(color))
+    cx, cy = size / 2, size / 2
+    glyph = size * 0.72
+
+    if playing:
+        bar_w = glyph * 0.26
+        gap = glyph * 0.28
+        bar_h = glyph * 0.95
+        for dx in (-(gap / 2 + bar_w / 2), gap / 2 + bar_w / 2):
+            p.drawRoundedRect(QRectF(cx + dx - bar_w / 2, cy - bar_h / 2, bar_w, bar_h), 1.0, 1.0)
+    else:
+        h = glyph * 0.95
+        w = h * 0.87
+        path = QPainterPath()
+        path.moveTo(0, 0)
+        path.lineTo(0, h)
+        path.lineTo(w, h / 2)
+        path.closeSubpath()
+        optical_nudge = w * 0.12  # same optical-centering nudge as _CircleButton/_TrackPlayGlyph
+        path.translate(cx - w / 2 + optical_nudge, cy - h / 2)
+        p.drawPath(path)
+    p.end()
+    return pm
 
 
 # _settings keys that describe *this machine*, not the user's account —
@@ -474,23 +548,25 @@ class ArtistPage(QWidget):
         self._name_label.setFont(name_font)
         self._name_label.setStyleSheet(f"color: {COLORS['TEXT_PRIMARY']};")
         name_row.addWidget(self._name_label, 1)
-
-        self._artist_like_btn = QPushButton("♡")
-        self._artist_like_btn.setFixedSize(34, 34)
-        self._artist_like_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._artist_like_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._artist_like_btn.setToolTip("Подписаться на исполнителя")
-        self._artist_like_btn.setStyleSheet(
-            f"QPushButton {{ background: transparent; border: none; color: {COLORS['TEXT_SECONDARY']}; font-size: 20px; }}"
-            f"QPushButton:hover {{ color: {COLORS['TEXT_PRIMARY']}; }}"
-        )
-        self._artist_like_btn.clicked.connect(self.artist_like_clicked.emit)
-        name_row.addWidget(self._artist_like_btn)
         info_col.addLayout(name_row)
 
         self._album_count_label = QLabel()
         self._album_count_label.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']}; font: 9pt 'Segoe UI';")
         info_col.addWidget(self._album_count_label)
+
+        # Pill button styled like AlbumPage's "Слушать" — solid/accent when not
+        # subscribed ("Подписаться"), outlined once subscribed ("Вы подписаны").
+        # Sits below the album count, left-aligned, rather than crowding the name.
+        self._artist_like_btn = QPushButton("Подписаться")
+        self._artist_like_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._artist_like_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._artist_like_btn.setFixedHeight(34)
+        self._artist_like_btn.clicked.connect(self.artist_like_clicked.emit)
+        like_btn_row = QHBoxLayout()
+        like_btn_row.setContentsMargins(0, 4, 0, 0)
+        like_btn_row.addWidget(self._artist_like_btn)
+        like_btn_row.addStretch(1)
+        info_col.addLayout(like_btn_row)
 
         info_col.addStretch(1)
         header_row.addLayout(info_col, 1)
@@ -564,18 +640,20 @@ class ArtistPage(QWidget):
         self._is_liked = liked
         c = COLORS
         if liked:
-            self._artist_like_btn.setText("♥")
+            self._artist_like_btn.setText("Вы подписаны")
             self._artist_like_btn.setToolTip("Отписаться от исполнителя")
             self._artist_like_btn.setStyleSheet(
-                f"QPushButton {{ background: transparent; border: none; color: {c['PRIMARY']}; font-size: 20px; }}"
-                f"QPushButton:hover {{ color: {c['PRIMARY_HOVER']}; }}"
+                f"QPushButton {{ background: transparent; border: 1.5px solid {c['PRIMARY']}; border-radius: 17px; "
+                f"color: {c['PRIMARY']}; font: 10pt 'Segoe UI'; font-weight: 600; padding: 0 18px; }}"
+                f"QPushButton:hover {{ color: {c['PRIMARY_HOVER']}; border-color: {c['PRIMARY_HOVER']}; }}"
             )
         else:
-            self._artist_like_btn.setText("♡")
+            self._artist_like_btn.setText("Подписаться")
             self._artist_like_btn.setToolTip("Подписаться на исполнителя")
             self._artist_like_btn.setStyleSheet(
-                f"QPushButton {{ background: transparent; border: none; color: {c['TEXT_SECONDARY']}; font-size: 20px; }}"
-                f"QPushButton:hover {{ color: {c['TEXT_PRIMARY']}; }}"
+                f"QPushButton {{ background: {c['PRIMARY_GRADIENT']}; border: none; border-radius: 17px; "
+                f"color: #000; font: 10pt 'Segoe UI'; font-weight: 600; padding: 0 18px; }}"
+                f"QPushButton:hover {{ background: {c['PRIMARY_HOVER']}; }}"
             )
 
     def apply_accent(self):
@@ -650,6 +728,7 @@ class TrackRow(QWidget):
         self._track = track
         self._display_number = display_number if display_number is not None else index + 1
         self._liked = False
+        self._hovered = False
         self._is_playing_state = False  # this row is the current track (playing or paused)
         self._is_paused_state = False   # only meaningful while _is_playing_state is True
         self.setObjectName("trackRow")
@@ -689,31 +768,39 @@ class TrackRow(QWidget):
         self._cover_label.setVisible(False)
         row.addWidget(self._cover_label)
 
+        title_col = QVBoxLayout()
+        title_col.setContentsMargins(0, 0, 0, 0)
+        title_col.setSpacing(0)
+
         title = clean_title(self._track.get("title", "")) or "Неизвестно"
         self._title_label = _AccentGradientLabel(title)
         self._title_label.set_accent_active(False)  # plain TEXT_PRIMARY until this row is the playing track
         self._title_label.setStyleSheet(f"color: {COLORS['TEXT_PRIMARY']}; font: 10pt 'Segoe UI';")
         self._title_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        row.addWidget(self._title_label, 1)
+        title_col.addWidget(self._title_label)
 
+        # Below the title (not inline) — mainly relevant for playlist tracks,
+        # which can each come from a different artist/album.
         artist_name = self._track.get("artist_name", "")
         if artist_name:
             self._artist_label = QLabel(clean_artist_name(artist_name))
-            self._artist_label.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']}; font: 9pt 'Segoe UI';")
+            self._artist_label.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']}; font: 8.5pt 'Segoe UI';")
             self._artist_label.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
-            row.addWidget(self._artist_label)
+            title_col.addWidget(self._artist_label)
 
-        self._like_btn = QPushButton("♡")
-        self._like_btn.setFixedSize(28, 28)
+        row.addLayout(title_col, 1)
+
+        self._like_btn = QPushButton("+")
+        self._like_btn.setFixedSize(26, 26)
         self._like_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._like_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._like_btn.setToolTip("Нравится")
-        self._like_btn.setStyleSheet(
-            f"QPushButton {{ background: transparent; border: none; color: {COLORS['TEXT_SECONDARY']}; font-size: 14px; }}"
-            f"QPushButton:hover {{ color: {COLORS['TEXT_PRIMARY']}; }}"
-        )
+        self._like_btn.setToolTip("Добавить в плейлист")
         self._like_btn.clicked.connect(lambda: self.like_clicked.emit(self._index))
         row.addWidget(self._like_btn)
+        # Always occupies its 26x26 slot (never setVisible(False)) — hiding/showing
+        # a layout-managed widget on hover made the row briefly reflow/widen every
+        # time; painted fully transparent instead, so the reserved space never changes.
+        self._apply_add_button_style()
 
         duration_ms = self._track.get("duration", 0) or 0
         self._dur_label = QLabel(format_duration(duration_ms) if duration_ms else "")
@@ -735,21 +822,38 @@ class TrackRow(QWidget):
         else:
             self._cover_label.setPixmap(QPixmap())
 
-    def set_liked(self, liked: bool):
-        self._liked = liked
+    def _apply_add_button_style(self):
         c = COLORS
-        if liked:
-            self._like_btn.setText("♥")
-            self._like_btn.setStyleSheet(
-                f"QPushButton {{ background: transparent; border: none; color: {c['PRIMARY']}; font-size: 14px; }}"
-                f"QPushButton:hover {{ color: {c['PRIMARY_HOVER']}; }}"
-            )
+        if self._liked:
+            color, hover = c['PRIMARY'], c['PRIMARY_HOVER']
+        elif self._hovered:
+            color, hover = c['TEXT_SECONDARY'], c['TEXT_PRIMARY']
         else:
-            self._like_btn.setText("♡")
-            self._like_btn.setStyleSheet(
-                f"QPushButton {{ background: transparent; border: none; color: {c['TEXT_SECONDARY']}; font-size: 14px; }}"
-                f"QPushButton:hover {{ color: {c['TEXT_PRIMARY']}; }}"
-            )
+            # Painted fully transparent (not hidden) so it keeps reserving
+            # its 26x26 slot — see the comment where the button is built.
+            color = hover = "transparent"
+        self._like_btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; border: 1.5px solid {color}; border-radius: 13px; "
+            f"color: {color}; font-size: 13px; font-weight: 600; }}"
+            f"QPushButton:hover {{ color: {hover}; border-color: {hover}; }}"
+        )
+
+    def set_liked(self, liked: bool):
+        """Despite the name, this now means "belongs to at least one
+        collection (liked tracks or a playlist)" — accent-colored and always
+        shown when true, invisible-until-hovered otherwise."""
+        self._liked = liked
+        self._apply_add_button_style()
+
+    def enterEvent(self, event):
+        self._hovered = True
+        self._apply_add_button_style()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hovered = False
+        self._apply_add_button_style()
+        super().leaveEvent(event)
 
     def track_url(self) -> str:
         url = self._track.get("url", "") or ""
@@ -815,6 +919,7 @@ class TrackRow(QWidget):
             # Already a local file — nothing to download.
             return
         menu = QMenu(self)
+        menu.setStyleSheet(_menu_style())
         dl_track = menu.addAction("↓  Скачать трек")
         dl_album = menu.addAction("↓  Скачать альбом")
         action = menu.exec(event.globalPos())
@@ -833,6 +938,14 @@ class AlbumPage(QWidget):
     track_like_clicked = pyqtSignal(dict)   # track dict
     album_like_clicked = pyqtSignal()
     cover_clicked = pyqtSignal(dict, dict)  # (album, artist)
+    playlist_cover_edit_requested = pyqtSignal()
+    playlist_creator_clicked = pyqtSignal(str)  # creator's login
+    play_pause_toggle_requested = pyqtSignal()  # "Играет" clicked while this is the playing album/playlist
+
+    _PLAY_ALL_TEXT_IDLE = "Слушать"
+    _PLAY_ALL_TEXT_PLAYING = "Играет"
+    _PLAY_ALL_ICON_SIZE = 18
+    _PLAY_ALL_ICON_LEFT_INSET = 14
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -841,6 +954,7 @@ class AlbumPage(QWidget):
         self._track_rows: list[TrackRow] = []
         self._disc_headers: list[QWidget] = []
         self._album_liked: bool = False
+        self._is_current_playing_target: bool = False  # this album/playlist is what's loaded in the player
         self._duration_worker: TrackDurationWorker | None = None
         self._runners: list = []
         self._build_ui()
@@ -864,13 +978,7 @@ class AlbumPage(QWidget):
         self._cover_label.setStyleSheet(
             f"background: {COLORS['SURFACE_LIGHT']}; border-radius: 14px;"
         )
-        self._cover_label.mousePressEvent = lambda e: (
-            self.cover_clicked.emit(self._current_album, self._current_artist)
-            if e.button() == Qt.MouseButton.LeftButton
-            and self._current_album.get("cover")
-            and not self._current_album.get("_is_liked_album")
-            else None
-        )
+        self._cover_label.mousePressEvent = self._on_cover_pressed
         header_row.addWidget(self._cover_label, 0, Qt.AlignmentFlag.AlignVCenter)
 
         info_col = QVBoxLayout()
@@ -896,14 +1004,32 @@ class AlbumPage(QWidget):
         self._artist_names_layout.setSpacing(0)
         artist_row.addWidget(self._artist_names_widget)
 
-        self._album_like_btn = QPushButton("♡")
+        # Shown instead of _artist_names_widget for playlists — the creator's
+        # display name, clickable like an artist chip, opens their profile.
+        self._playlist_creator_label = QPushButton("")
+        self._playlist_creator_label.setFlat(True)
+        self._playlist_creator_label.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._playlist_creator_label.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._playlist_creator_label.setStyleSheet(
+            f"QPushButton {{ background: transparent; border: none; color: {COLORS['TEXT_SECONDARY']}; "
+            f"font: 10pt 'Segoe UI'; text-align: left; padding: 0; }}"
+            f"QPushButton:hover {{ color: {COLORS['TEXT_PRIMARY']}; text-decoration: underline; }}"
+        )
+        self._playlist_creator_label.clicked.connect(
+            lambda: self.playlist_creator_clicked.emit(self._current_album.get("_playlist_owner_login", ""))
+        )
+        self._playlist_creator_label.setVisible(False)
+        artist_row.addWidget(self._playlist_creator_label)
+
+        self._album_like_btn = QPushButton("+")
         self._album_like_btn.setFixedSize(30, 30)
         self._album_like_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._album_like_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._album_like_btn.setToolTip("Сохранить альбом")
+        self._album_like_btn.setToolTip("Сохранить альбом в библиотеку")
         self._album_like_btn.setStyleSheet(
-            f"QPushButton {{ background: transparent; border: none; color: {COLORS['TEXT_SECONDARY']}; font-size: 18px; }}"
-            f"QPushButton:hover {{ color: {COLORS['TEXT_PRIMARY']}; }}"
+            f"QPushButton {{ background: transparent; border: 1.5px solid {COLORS['TEXT_SECONDARY']}; "
+            f"border-radius: 15px; color: {COLORS['TEXT_SECONDARY']}; font-size: 15px; font-weight: 600; }}"
+            f"QPushButton:hover {{ color: {COLORS['TEXT_PRIMARY']}; border-color: {COLORS['TEXT_PRIMARY']}; }}"
         )
         self._album_like_btn.clicked.connect(self.album_like_clicked.emit)
         artist_row.addWidget(self._album_like_btn)
@@ -914,18 +1040,44 @@ class AlbumPage(QWidget):
         self._track_count_label.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']}; font: 9pt 'Segoe UI';")
         info_col.addWidget(self._track_count_label)
 
-        # Play all button
-        self._play_all_btn = QPushButton("▶  Слушать")
+        # Play all button — fixed width (fits the longer of the two labels)
+        # so it doesn't resize when the text swaps between idle/playing.
+        # The icon sits flush at the button's left edge while the text stays
+        # centered across the whole button — QPushButton's own icon+text
+        # can't be split like that (they move as one group), so the icon is
+        # a separate transparent-to-clicks QLabel overlaid on top instead.
+        # Icon is hand-drawn (see _make_play_pause_icon), not a font glyph —
+        # a plain "▮▮" text character rendered as a blurry blob rather than
+        # two distinct bars.
+        self._play_all_btn = QPushButton(self._PLAY_ALL_TEXT_IDLE)
         self._play_all_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._play_all_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._play_all_btn.setFixedHeight(36)
-        self._play_all_btn.clicked.connect(lambda: self.track_play_requested.emit(0, self._current_album, self._current_artist))
+        btn_font = QFont("Segoe UI", 10, QFont.Weight.DemiBold)
+        self._play_all_btn.setFont(btn_font)
+        fm = QFontMetrics(btn_font)
+        label_w = max(
+            fm.horizontalAdvance(self._PLAY_ALL_TEXT_IDLE),
+            fm.horizontalAdvance(self._PLAY_ALL_TEXT_PLAYING),
+        )
+        btn_w = label_w + 2 * self._PLAY_ALL_ICON_LEFT_INSET + self._PLAY_ALL_ICON_SIZE + 36
+        self._play_all_btn.setFixedWidth(btn_w)
+        self._play_all_btn.clicked.connect(self._on_play_all_clicked)
         c = COLORS
         self._play_all_btn.setStyleSheet(
             f"QPushButton {{ background: {c['PRIMARY_GRADIENT']}; border: none; border-radius: 18px; "
-            f"color: #000; font: 10pt 'Segoe UI'; font-weight: 600; padding: 0 24px; }}"
+            f"color: #000; font: 10pt 'Segoe UI'; font-weight: 600; padding-left: 14px; }}"
             f"QPushButton:hover {{ background: {c['PRIMARY_HOVER']}; }}"
         )
+
+        self._play_all_icon = QLabel(self._play_all_btn)
+        self._play_all_icon.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._play_all_icon.setPixmap(_make_play_pause_icon(False, self._PLAY_ALL_ICON_SIZE, "#000"))
+        icon_y = (36 - self._PLAY_ALL_ICON_SIZE) // 2
+        self._play_all_icon.setGeometry(
+            self._PLAY_ALL_ICON_LEFT_INSET, icon_y, self._PLAY_ALL_ICON_SIZE, self._PLAY_ALL_ICON_SIZE
+        )
+
         btn_row = QHBoxLayout()
         btn_row.setContentsMargins(0, 8, 0, 0)
         btn_row.setSpacing(8)
@@ -1022,6 +1174,33 @@ class AlbumPage(QWidget):
                 layout.addWidget(sep)
         self._artist_names_widget.setVisible(bool(names))
 
+    def _on_cover_pressed(self, event):
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        if self._current_album.get("_is_playlist"):
+            if self._current_album.get("_playlist_editable"):
+                self.playlist_cover_edit_requested.emit()
+            return
+        if self._current_album.get("cover") and not self._current_album.get("_is_liked_album"):
+            self.cover_clicked.emit(self._current_album, self._current_artist)
+
+    def _on_play_all_clicked(self):
+        if self._is_current_playing_target:
+            # Already playing (or paused) this exact album/playlist — toggle
+            # pause/resume in place instead of restarting from track 0.
+            self.play_pause_toggle_requested.emit()
+        else:
+            self.track_play_requested.emit(0, self._current_album, self._current_artist)
+
+    def set_playback_state(self, is_current_target: bool, is_playing: bool):
+        """is_current_target: this exact album/playlist is what's loaded in
+        the player right now (playing or paused). is_playing: playback is
+        actively running — only meaningful together with is_current_target."""
+        self._is_current_playing_target = is_current_target
+        playing_now = is_current_target and is_playing
+        self._play_all_icon.setPixmap(_make_play_pause_icon(playing_now, self._PLAY_ALL_ICON_SIZE, "#000"))
+        self._play_all_btn.setText(self._PLAY_ALL_TEXT_PLAYING if playing_now else self._PLAY_ALL_TEXT_IDLE)
+
     def load_album(self, album: dict, artist: dict, playing_url: str = "", display_artist_names: list | None = None,
                     playing_track: dict | None = None, is_paused: bool = False):
         """Update this page for a different album."""
@@ -1030,6 +1209,8 @@ class AlbumPage(QWidget):
         self._stop_duration_loader()
 
         is_liked_album = bool(album.get("_is_liked_album"))
+        is_playlist = bool(album.get("_is_playlist"))
+        is_virtual = is_liked_album or is_playlist
 
         album_name = clean_title(album.get("title", "")) or "Неизвестно"
         artist_name = clean_artist_name(artist.get("artist", "")) or ""
@@ -1038,20 +1219,37 @@ class AlbumPage(QWidget):
         self._dl_btn.setVisible(not album.get("local"))
 
         self._album_name_label.setText(album_name)
-        # The "liked tracks" virtual album isn't a real album and has no
-        # real artist — showing the "Альбом" type label and an artist chip
-        # that just reads "Неизвестно" (clean_artist_name's fallback for an
-        # empty name) is pure noise here, so both are hidden for it.
-        self._type_label.setVisible(not is_liked_album)
-        names = [] if is_liked_album else (
-            display_artist_names if display_artist_names else ([artist_name] if artist_name else [])
-        )
-        self._set_artist_names(names)
 
-        self._cover_label.setCursor(
-            Qt.CursorShape.ArrowCursor if is_liked_album else Qt.CursorShape.PointingHandCursor
-        )
-        self._cover_label.setToolTip("" if is_liked_album else "Открыть обложку")
+        if is_playlist:
+            self._type_label.setText("Плейлист")
+            self._type_label.setVisible(True)
+            self._set_artist_names([])
+            self._playlist_creator_label.setText(album.get("_playlist_creator_name") or "")
+            self._playlist_creator_label.setVisible(bool(album.get("_playlist_creator_name")))
+        else:
+            self._type_label.setText("Альбом")
+            # The "liked tracks" virtual album isn't a real album and has no
+            # real artist — showing the "Альбом" type label and an artist chip
+            # that just reads "Неизвестно" (clean_artist_name's fallback for an
+            # empty name) is pure noise here, so both are hidden for it.
+            self._type_label.setVisible(not is_liked_album)
+            self._playlist_creator_label.setVisible(False)
+            names = [] if is_liked_album else (
+                display_artist_names if display_artist_names else ([artist_name] if artist_name else [])
+            )
+            self._set_artist_names(names)
+
+        editable_playlist = is_playlist and bool(album.get("_playlist_editable"))
+        if is_playlist:
+            self._cover_label.setCursor(
+                Qt.CursorShape.PointingHandCursor if editable_playlist else Qt.CursorShape.ArrowCursor
+            )
+            self._cover_label.setToolTip("Изменить обложку плейлиста" if editable_playlist else "")
+        else:
+            self._cover_label.setCursor(
+                Qt.CursorShape.ArrowCursor if is_liked_album else Qt.CursorShape.PointingHandCursor
+            )
+            self._cover_label.setToolTip("" if is_liked_album else "Открыть обложку")
 
         count = len(tracks)
         self._track_count_label.setText(
@@ -1062,7 +1260,10 @@ class AlbumPage(QWidget):
 
         # Album cover
         cover_rel = album.get("cover", "")
-        if cover_rel:
+        cover_pm = _decode_base64_pixmap(album.get("_cover_data", "")) if is_playlist else None
+        if cover_pm is not None:
+            self._cover_label.setPixmap(make_rounded_pixmap(cover_pm, 180, 14))
+        elif cover_rel:
             if os.path.isabs(cover_rel) and os.path.exists(cover_rel):
                 pm = QPixmap(cover_rel)
                 if not pm.isNull():
@@ -1072,6 +1273,8 @@ class AlbumPage(QWidget):
             else:
                 cover_url = resolve_media_url(cover_rel)
                 self._load_album_cover(cover_url)
+        elif is_playlist:
+            self._cover_label.setPixmap(_make_placeholder_cover(180, 14))
         else:
             self._cover_label.setPixmap(QPixmap())
 
@@ -1107,7 +1310,7 @@ class AlbumPage(QWidget):
                 self._tracks_layout.insertWidget(self._tracks_layout.count() - 1, row)
                 self._track_rows.append(row)
 
-                if is_liked_album:
+                if is_virtual:
                     row.show_cover(True)
                     cover_rel = track.get("_real_album_cover", "")
                     if cover_rel:
@@ -1276,25 +1479,21 @@ class AlbumPage(QWidget):
     def set_album_liked(self, liked: bool):
         self._album_liked = liked
         c = COLORS
+        noun = "плейлист" if self._current_album.get("_is_playlist") else "альбом"
         if liked:
-            self._album_like_btn.setText("♥")
+            self._album_like_btn.setToolTip(f"Убрать {noun} из библиотеки")
             self._album_like_btn.setStyleSheet(
-                f"QPushButton {{ background: transparent; border: none; color: {c['PRIMARY']}; font-size: 18px; }}"
-                f"QPushButton:hover {{ color: {c['PRIMARY_HOVER']}; }}"
+                f"QPushButton {{ background: transparent; border: 1.5px solid {c['PRIMARY']}; "
+                f"border-radius: 15px; color: {c['PRIMARY']}; font-size: 15px; font-weight: 600; }}"
+                f"QPushButton:hover {{ color: {c['PRIMARY_HOVER']}; border-color: {c['PRIMARY_HOVER']}; }}"
             )
         else:
-            self._album_like_btn.setText("♡")
+            self._album_like_btn.setToolTip(f"Сохранить {noun} в библиотеку")
             self._album_like_btn.setStyleSheet(
-                f"QPushButton {{ background: transparent; border: none; color: {c['TEXT_SECONDARY']}; font-size: 18px; }}"
-                f"QPushButton:hover {{ color: {c['TEXT_PRIMARY']}; }}"
+                f"QPushButton {{ background: transparent; border: 1.5px solid {c['TEXT_SECONDARY']}; "
+                f"border-radius: 15px; color: {c['TEXT_SECONDARY']}; font-size: 15px; font-weight: 600; }}"
+                f"QPushButton:hover {{ color: {c['TEXT_PRIMARY']}; border-color: {c['TEXT_PRIMARY']}; }}"
             )
-
-    def set_track_liked(self, track: dict, liked: bool):
-        keys = _track_like_keys(track)
-        for row in self._track_rows:
-            if row.track_identity_keys() & keys:
-                row.set_liked(liked)
-                break
 
     def refresh_track_likes(self, liked_keys: set):
         for row in self._track_rows:
@@ -1304,7 +1503,7 @@ class AlbumPage(QWidget):
         c = COLORS
         self._play_all_btn.setStyleSheet(
             f"QPushButton {{ background: {c['PRIMARY_GRADIENT']}; border: none; border-radius: 18px; "
-            f"color: #000; font: 10pt 'Segoe UI'; font-weight: 600; padding: 0 24px; }}"
+            f"color: #000; font: 10pt 'Segoe UI'; font-weight: 600; padding-left: 14px; }}"
             f"QPushButton:hover {{ background: {c['PRIMARY_HOVER']}; }}"
         )
         self.set_album_liked(self._album_liked)
@@ -1834,10 +2033,11 @@ class SearchPage(QWidget):
             self._count_label.setText("Ничего не найдено")
             return
 
-        artists = [r for r in self._results if r.type == "artist"][:3]
-        albums  = [r for r in self._results if r.type == "album"][:5]
-        tracks  = [r for r in self._results if r.type == "track"][:10]
-        total = len(artists) + len(albums) + len(tracks)
+        artists   = [r for r in self._results if r.type == "artist"][:4]
+        albums    = [r for r in self._results if r.type == "album"][:6]
+        playlists = [r for r in self._results if r.type == "playlist"][:10]
+        tracks    = [r for r in self._results if r.type == "track"][:10]
+        total = len(artists) + len(albums) + len(playlists) + len(tracks)
         self._count_label.setText(f"Найдено: {total}")
 
         insert_pos = 0
@@ -1848,19 +2048,36 @@ class SearchPage(QWidget):
             insert_pos += 1
 
         if artists:
-            _insert(self._make_section_header("Исполнители"))
-            for r in artists:
-                _insert(self._make_artist_row(r))
+            _insert(self._make_grid_section("Исполнители", [self._make_artist_row(r) for r in artists]))
 
         if albums:
-            _insert(self._make_section_header("Альбомы"))
-            for r in albums:
-                _insert(self._make_album_row(r))
+            _insert(self._make_grid_section("Альбомы", [self._make_album_row(r) for r in albums]))
+
+        if playlists:
+            _insert(self._make_grid_section("Плейлисты", [self._make_search_playlist_row(r) for r in playlists]))
 
         if tracks:
-            _insert(self._make_section_header("Треки"))
-            for r in tracks:
-                _insert(self._make_track_row(r))
+            _insert(self._make_grid_section("Треки", [self._make_track_row(r) for r in tracks]))
+
+    def _make_grid_section(self, title: str, row_widgets: list) -> QWidget:
+        """Section header + rows laid out two-per-row (row-major), so N
+        results end up as N/2 on the left column and N/2 on the right."""
+        container = QWidget()
+        v = QVBoxLayout(container)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
+        v.addWidget(self._make_section_header(title))
+
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(4)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        for i, w in enumerate(row_widgets):
+            grid.addWidget(w, i // 2, i % 2)
+        v.addLayout(grid)
+        return container
 
     def _make_section_header(self, text: str) -> QWidget:
         lbl = QLabel(text)
@@ -2000,11 +2217,52 @@ class SearchPage(QWidget):
         row.mousePressEvent = on_click
         return row
 
+    def _make_search_playlist_row(self, result: SearchResult) -> QWidget:
+        row = QWidget()
+        row.setCursor(Qt.CursorShape.PointingHandCursor)
+        row.setObjectName("srRow")
+        row.setStyleSheet(
+            "QWidget#srRow { background: transparent; border-radius: 8px; }"
+            f"QWidget#srRow:hover {{ background-color: {COLORS['SURFACE_LIGHT']}; }}"
+        )
+        lay = QHBoxLayout(row)
+        lay.setContentsMargins(8, 6, 8, 6)
+        lay.setSpacing(14)
+
+        cover = QLabel()
+        cover.setFixedSize(48, 48)
+        cover.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        cover.setStyleSheet(f"background: {COLORS['COVER_BG']}; border-radius: 6px;")
+        pm = result.playlist_cover_pixmap
+        cover.setPixmap(make_rounded_pixmap(pm, 48, 6) if pm and not pm.isNull() else _make_placeholder_cover(48, 6))
+        lay.addWidget(cover)
+
+        pl = result.playlist_obj or {}
+        txt = QVBoxLayout()
+        txt.setSpacing(2)
+        txt.setContentsMargins(0, 0, 0, 0)
+        title_lbl = QLabel(clean_title(pl.get("name") or "Без названия"))
+        title_lbl.setStyleSheet(f"color: {COLORS['TEXT_PRIMARY']}; font: 10pt 'Segoe UI';")
+        txt.addWidget(title_lbl)
+        subtitle = "Ваш плейлист" if result.playlist_editable else f"@{result.playlist_owner_login or ''}"
+        sub_lbl = QLabel(subtitle)
+        sub_lbl.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']}; font: 9pt 'Segoe UI';")
+        txt.addWidget(sub_lbl)
+        lay.addLayout(txt, 1)
+
+        def on_click(event, r=result):
+            if event.button() == Qt.MouseButton.LeftButton:
+                self.result_selected.emit(r)
+        row.mousePressEvent = on_click
+        return row
+
     def _make_result_row(self, result: SearchResult) -> QWidget:
         if result.type == "artist":
             return self._make_artist_row(result)
         if result.type == "album":
             return self._make_album_row(result)
+        if result.type == "playlist":
+            return self._make_search_playlist_row(result)
         return self._make_track_row(result)
 
     def refresh_playing(self, url: str, track: dict | None = None):
@@ -2742,6 +3000,7 @@ _SR_RADIUS = Qt.ItemDataRole.UserRole + 12
 _SR_FALLBACK = Qt.ItemDataRole.UserRole + 13
 _SR_CLICK_DATA = Qt.ItemDataRole.UserRole + 14
 _SR_KIND = Qt.ItemDataRole.UserRole + 15
+_SR_FALLBACK_BG = Qt.ItemDataRole.UserRole + 16  # fallback cover background color override
 
 
 class _SidebarItemDelegate(QStyledItemDelegate):
@@ -2790,7 +3049,8 @@ class _SidebarItemDelegate(QStyledItemDelegate):
             painter.drawPixmap(cover_rect.toRect(), pm)
             painter.restore()
         else:
-            painter.fillPath(cover_path, QColor(c["SURFACE_LIGHT"]))
+            fallback_bg = index.data(_SR_FALLBACK_BG) or c["SURFACE_LIGHT"]
+            painter.fillPath(cover_path, QColor(fallback_bg))
             fallback = index.data(_SR_FALLBACK) or ""
             if fallback:
                 painter.setPen(QColor(c["TEXT_PRIMARY"]))
@@ -2916,6 +3176,60 @@ class _SidebarItem(QWidget):
         super().mousePressEvent(event)
 
 
+class _AvatarButton(QWidget):
+    """Circular account avatar. Shows the uploaded picture, or — with none
+    set — a solid accent-colored circle with the first letter of the
+    account's name, so there's always something to click."""
+    clicked = pyqtSignal()
+
+    def __init__(self, size: int = 34, parent=None):
+        super().__init__(parent)
+        self._size = size
+        self._has_avatar = False
+        self._letter = "?"
+        self.setFixedSize(size, size)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._label = QLabel(self)
+        self._label.setGeometry(0, 0, size, size)
+        self._label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._apply_fallback_style()
+
+    def _apply_fallback_style(self):
+        radius = self._size // 2
+        font_size = max(10, int(self._size * 0.42))
+        self._label.setPixmap(QPixmap())
+        self._label.setText(self._letter)
+        self._label.setStyleSheet(
+            f"background: {COLORS['PRIMARY']}; color: white; border-radius: {radius}px; "
+            f"font: 600 {font_size}px 'Segoe UI';"
+        )
+
+    def set_fallback_letter(self, text: str):
+        self._letter = (text or "?").strip()[:1].upper() or "?"
+        if not self._has_avatar:
+            self._label.setText(self._letter)
+
+    def set_avatar_pixmap(self, pixmap: QPixmap | None):
+        if pixmap is None or pixmap.isNull():
+            self._has_avatar = False
+            self._apply_fallback_style()
+            return
+        self._has_avatar = True
+        pm = make_rounded_pixmap(pixmap, self._size, self._size // 2)
+        self._label.setStyleSheet("background: transparent;")
+        self._label.setText("")
+        self._label.setPixmap(pm)
+
+    def apply_accent(self):
+        if not self._has_avatar:
+            self._apply_fallback_style()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+
 class _ChevronButton(QPushButton):
     """Small hand-drawn disclosure triangle for collapsing a sidebar
     section — points right when collapsed, down when expanded. Checkable
@@ -2958,10 +3272,28 @@ class _ChevronButton(QPushButton):
         p.end()
 
 
+class _NoWheelListWidget(QListWidget):
+    """Same reasoning as _NoWheelScrollArea: this list is always sized to
+    its full content height (see _resize_list_to_content) precisely so it
+    never needs to scroll internally — the sidebar's own outer QScrollArea
+    is meant to be the only thing that scrolls. But QListWidget still
+    handles wheel events on its own regardless of scrollbar visibility, so
+    without this override, scrolling over it nudges its *internal* viewport
+    instead of the page — invisibly, since the scrollbar is hidden — which
+    clips rows like "Понравившиеся" out of view without any visual cue that
+    anything scrolled at all. Ignoring the event here lets Qt bubble it up
+    to the outer QScrollArea instead."""
+
+    def wheelEvent(self, event):
+        event.ignore()
+
+
 class Sidebar(QWidget):
     artist_selected = pyqtSignal(dict)
     album_selected = pyqtSignal(dict, dict)   # (album, artist)
     liked_tracks_selected = pyqtSignal()
+    playlist_selected = pyqtSignal(str)  # own playlist id
+    playlist_subscription_selected = pyqtSignal(dict)  # {owner_login, playlist_id, name, cover_data}
     # Emitted after the user drags an artist/album row to a new position —
     # carries the section ("server"/"local") plus the full new order as
     # stable "artist::Name" / "album::Artist||Title" keys, ready to hand
@@ -2980,7 +3312,10 @@ class Sidebar(QWidget):
             f"QWidget#sidebar {{ background-color: {COLORS['SURFACE']}; "
             f"border-right: 1px solid {COLORS['SURFACE_LIGHT']}; }}"
         )
-        self._liked_item: _SidebarItem | None = None
+        # Own account state — cached so _rebuild_server_list() can redraw
+        # the combined server list on demand.
+        self._server_liked: bool = False
+        self._server_entries: list = []
         self._runners: list = []
         # True while set_server_collapsed()/set_local_collapsed() is
         # applying a saved setting programmatically — suppresses
@@ -2994,10 +3329,9 @@ class Sidebar(QWidget):
         self._rebuilding = False
         self._build_ui()
 
-    def _build_section(self, title: str, section: str, with_liked_slot: bool = False):
-        """Builds one collapsible section (header + chevron [+ liked slot]
-        + reorderable list) and returns (container_widget, list_widget,
-        chevron_button)."""
+    def _build_section(self, title: str, section: str):
+        """Builds one collapsible section (header + chevron + list) and
+        returns (container_widget, list_widget, chevron_button)."""
         container = QWidget()
         section_layout = QVBoxLayout(container)
         section_layout.setContentsMargins(0, 0, 0, 0)
@@ -3014,20 +3348,13 @@ class Sidebar(QWidget):
         header_row.addWidget(chevron)
         section_layout.addLayout(header_row)
 
-        if with_liked_slot:
-            # "Понравившиеся треки" is pinned above the reorderable list,
-            # not part of it — it isn't an artist or album, so dragging it
-            # around relative to them wouldn't mean anything.
-            self._liked_slot = QVBoxLayout()
-            self._liked_slot.setContentsMargins(0, 0, 0, 0)
-            section_layout.addLayout(self._liked_slot)
 
         # Reorderable artist/album list. Rows are owner-drawn (see
         # _SidebarItemDelegate) rather than embedded widgets — a widget set
         # via setItemWidget() would intercept every mouse press itself,
         # leaving the view's built-in InternalMove drag-and-drop with
         # nothing to react to.
-        list_widget = QListWidget()
+        list_widget = _NoWheelListWidget()
         list_widget.setObjectName("sidebarList")
         list_widget.setItemDelegate(_SidebarItemDelegate(list_widget))
         list_widget.setFrameShape(QFrame.Shape.NoFrame)
@@ -3058,11 +3385,6 @@ class Sidebar(QWidget):
 
         def _on_chevron_toggled(expanded, lw=list_widget):
             lw.setVisible(expanded)
-            if with_liked_slot:
-                for i in range(self._liked_slot.count()):
-                    w = self._liked_slot.itemAt(i).widget()
-                    if w:
-                        w.setVisible(expanded)
             if not self._applying_saved_collapse:
                 self.section_collapsed_changed.emit(section, not expanded)
         chevron.toggled.connect(_on_chevron_toggled)
@@ -3104,7 +3426,7 @@ class Sidebar(QWidget):
         layout.addLayout(self._user_row)
 
         self._server_container, self._list_server, self._chevron_server = self._build_section(
-            "Библиотека", "server", with_liked_slot=True
+            "Библиотека", "server"
         )
         layout.addWidget(self._server_container)
         self._list_server.model().rowsMoved.connect(lambda *_: self._on_rows_moved("server"))
@@ -3154,24 +3476,45 @@ class Sidebar(QWidget):
 
     def load_account_content(self, liked: bool, entries: list | None = None):
         """entries: ordered list of ("artist", artist_dict) /
-        ("album", (album_dict, artist_dict)) tuples, already in the desired
-        display order (caller resolves follow_order into this)."""
+        ("album", (album_dict, artist_dict)) / ("playlist", playlist_dict)
+        tuples, already in the desired display order (caller resolves
+        follow_order into this — playlists are freely draggable among
+        artists/albums, same as either of those; only "liked" is pinned)."""
+        self._server_liked = liked
+        self._server_entries = entries or []
+        self._rebuild_server_list()
+
+    def _rebuild_server_list(self):
+        """Rebuilds the "Библиотека" list from cached state: "Понравившиеся
+        треки" always first (pinned — see _make_liked_item), then
+        artists/albums/playlists in whatever order the caller supplied
+        (their own relative drag order)."""
         _stop_runners(self._runners)
-
-        if self._liked_item is not None:
-            self._liked_slot.removeWidget(self._liked_item)
-            self._liked_item.deleteLater()
-            self._liked_item = None
-        if liked:
-            self._liked_item = self._make_liked_item()
-            self._liked_slot.addWidget(self._liked_item)
-            self._liked_item.setVisible(self._chevron_server.isChecked())
-
-        self._fill_list(self._list_server, entries)
+        self._rebuilding = True
+        try:
+            self._list_server.clear()
+            if self._server_liked:
+                self._list_server.addItem(self._make_liked_item())
+            for kind, payload in self._server_entries:
+                if kind == "artist":
+                    list_item = self._make_artist_row(payload)
+                elif kind == "album":
+                    album, artist = payload
+                    list_item = self._make_album_row(album, artist)
+                elif kind == "playlist":
+                    list_item = self._make_playlist_row(payload)
+                elif kind == "playlist_sub":
+                    list_item = self._make_playlist_sub_row(payload)
+                else:
+                    continue
+                self._list_server.addItem(list_item)
+        finally:
+            self._rebuilding = False
+        self._resize_list_to_content(self._list_server)
 
     def load_local_content(self, entries: list | None = None):
         """Same shape as load_account_content's entries, for the local
-        library section — no "liked" concept there."""
+        library section — no "liked"/playlists concept there."""
         self._fill_list(self._list_local, entries)
 
     def _fill_list(self, list_widget: QListWidget, entries: list | None):
@@ -3195,25 +3538,73 @@ class Sidebar(QWidget):
     def _resize_list_to_content(list_widget: QListWidget):
         """No internal scrollbar (see _build_section) — the list's height
         must track its own row count exactly, so the whole sidebar's single
-        outer scroll area sees the real total content height."""
+        outer scroll area sees the real total content height.
+
+        Each item carries `spacing()` on every side of its own layout box —
+        so besides the first item's top and the last item's bottom (one
+        `spacing` each), every *pair* of consecutive items contributes two
+        (its bottom + the next one's top). The previous formula counted a
+        single `spacing` per gap instead of double, undercounting the total
+        by one `spacing` per item — invisible for a short list, but on a
+        longer one (e.g. once playlists made "Библиотека" grow) it added up
+        to clipping the last row's subtitle against the section below it.
+        Verified empirically against sizeHintForRow via visualItemRect for
+        1/2/3/11-item lists — exact match, no leftover slack either way."""
         count = list_widget.count()
         if count == 0:
             list_widget.setFixedHeight(0)
             return
         row_h = list_widget.sizeHintForRow(0)
-        total = row_h * count + list_widget.spacing() * (count + 1) + list_widget.frameWidth() * 2
+        spacing = list_widget.spacing()
+        total = row_h * count + spacing * (2 * count - 1) + list_widget.frameWidth() * 2
         list_widget.setFixedHeight(max(total, 0))
 
-    def _make_liked_item(self) -> _SidebarItem:
-        item = _SidebarItem("Понравившиеся треки", "_liked_tracks_", radius=6)
-        item.clicked.connect(lambda _: self.liked_tracks_selected.emit())
+    def _make_liked_item(self) -> QListWidgetItem:
+        item = QListWidgetItem("Понравившиеся треки")
+        item.setData(_SR_KEY, "_liked_tracks_")
+        item.setData(_SR_KIND, "liked")
+        item.setData(_SR_RADIUS, 6)
+        item.setData(_SR_FALLBACK, "♥")
+        item.setData(_SR_FALLBACK_BG, COLORS["PRIMARY_GRADIENT"])
+        # Pinned — the user can't pick this row up and drag it elsewhere.
+        item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsDragEnabled)
         icon_path = os.path.join(ICONS_DIR, "liked_icon.png")
         if os.path.exists(icon_path):
             pm = QPixmap(icon_path)
             if not pm.isNull():
-                item.set_cover(pm)
-                return item
-        item.set_cover_text("♥", COLORS["PRIMARY_GRADIENT"])
+                item.setData(_SR_COVER, pm)
+        return item
+
+    def _make_playlist_row(self, playlist: dict) -> QListWidgetItem:
+        item = QListWidgetItem(playlist.get("name") or "Без названия")
+        item.setData(_SR_KEY, f"playlist::{playlist.get('id', '')}")
+        item.setData(_SR_KIND, "playlist")
+        # The full dict (not just the id) — needed to rebuild this same row
+        # after a drag (see _on_rows_moved); _on_item_clicked pulls the id
+        # back out of it before emitting playlist_selected.
+        item.setData(_SR_CLICK_DATA, playlist)
+        item.setData(_SR_SUBTITLE, "Плейлист")
+        item.setData(_SR_RADIUS, 6)
+        item.setData(_SR_FALLBACK, "♪")
+        # Draggable, same as artists/albums — only "liked" is pinned.
+        cover_pm = _decode_base64_pixmap(playlist.get("cover_data") or "")
+        if cover_pm is not None:
+            item.setData(_SR_COVER, cover_pm)
+        return item
+
+    def _make_playlist_sub_row(self, sub: dict) -> QListWidgetItem:
+        """A "+"-ed playlist belonging to another account — same row style
+        as an owned playlist, draggable the same way."""
+        item = QListWidgetItem(sub.get("name") or "Без названия")
+        item.setData(_SR_KEY, f"playlistsub::{sub.get('owner_login', '')}::{sub.get('playlist_id', '')}")
+        item.setData(_SR_KIND, "playlist_sub")
+        item.setData(_SR_CLICK_DATA, sub)
+        item.setData(_SR_SUBTITLE, "Плейлист")
+        item.setData(_SR_RADIUS, 6)
+        item.setData(_SR_FALLBACK, "♪")
+        cover_pm = _decode_base64_pixmap(sub.get("cover_data") or "")
+        if cover_pm is not None:
+            item.setData(_SR_COVER, cover_pm)
         return item
 
     def _make_artist_row(self, artist: dict) -> QListWidgetItem:
@@ -3292,6 +3683,12 @@ class Sidebar(QWidget):
         elif kind == "album":
             album, artist = data
             self.album_selected.emit(album, artist)
+        elif kind == "liked":
+            self.liked_tracks_selected.emit()
+        elif kind == "playlist":
+            self.playlist_selected.emit((data or {}).get("id", ""))
+        elif kind == "playlist_sub":
+            self.playlist_subscription_selected.emit(data)
 
     def _on_rows_moved(self, section: str, *_args):
         if self._rebuilding:
@@ -3299,9 +3696,32 @@ class Sidebar(QWidget):
         list_widget = self._list_server if section == "server" else self._list_local
         keys = []
         for row in range(list_widget.count()):
-            key = list_widget.item(row).data(_SR_KEY)
+            item = list_widget.item(row)
+            if item.data(_SR_KIND) == "liked":
+                continue
+            key = item.data(_SR_KEY)
             if key:
                 keys.append(key)
+        if section == "server":
+            # Re-derive self._server_entries from what's now actually on
+            # screen post-drag (each row already carries its resolved
+            # artist/album/playlist payload via _SR_CLICK_DATA — no need to
+            # look anything back up), then do a full, deterministic rebuild
+            # next tick. That's more robust than patching the existing
+            # QListWidgetItems in place: a drag that grazed "liked" used to
+            # occasionally leave it (or another row) missing, because that
+            # patch-up ran while Qt's own drag-and-drop bookkeeping for this
+            # same drop was still finishing up on the *existing* items —
+            # rebuilding from scratch with fresh items sidesteps whatever
+            # state Qt's internals left those in.
+            new_entries = []
+            for row in range(list_widget.count()):
+                item = list_widget.item(row)
+                kind = item.data(_SR_KIND)
+                if kind in ("artist", "album", "playlist", "playlist_sub"):
+                    new_entries.append((kind, item.data(_SR_CLICK_DATA)))
+            self._server_entries = new_entries
+            QTimer.singleShot(0, self._rebuild_server_list)
         self.order_changed.emit(section, keys)
 
 
@@ -4239,8 +4659,14 @@ class _PlayerDataLoadSignal(QObject):
     finished = pyqtSignal(dict)
 
 
-class _PlayerDataSaveSignal(QObject):
-    finished = pyqtSignal()
+class _UserSearchSignal(QObject):
+    # (generation, results) — generation lets the receiver drop stale
+    # responses that finish out of order relative to a newer query.
+    finished = pyqtSignal(int, list)
+
+
+class _UserProfileSignal(QObject):
+    finished = pyqtSignal(dict)
 
 
 class _DiscordConnectSignal(QObject):
@@ -4274,6 +4700,453 @@ class _SearchIcon(QWidget):
         p.drawEllipse(1, 1, 9, 9)
         p.drawLine(9, 9, 14, 14)
         p.end()
+
+
+def _card_widget(parent_layout: QVBoxLayout) -> QVBoxLayout:
+    """Same rounded-surface card SettingsPage uses, as a free function so
+    ProfilePage/UserProfilePage can share it without inheriting SettingsPage."""
+    card = QWidget()
+    card.setStyleSheet(f"QWidget {{ background: {COLORS['SURFACE']}; border-radius: 12px; }}")
+    inner = QVBoxLayout(card)
+    inner.setContentsMargins(18, 16, 18, 16)
+    inner.setSpacing(12)
+    parent_layout.addWidget(card)
+    return inner
+
+
+def _card_section_label(text: str) -> QLabel:
+    lbl = QLabel(text.upper())
+    lbl.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']}; font: 600 8.5pt 'Segoe UI'; letter-spacing: 1px;")
+    return lbl
+
+
+def _line_edit_style() -> str:
+    return (
+        f"QLineEdit {{ background: {COLORS['SURFACE_LIGHT']}; color: {COLORS['TEXT_PRIMARY']}; "
+        f"border: 1px solid {COLORS['BORDER']}; border-radius: 8px; padding: 0 10px; font: 10.5pt 'Segoe UI'; }}"
+        f"QLineEdit:focus {{ border-color: {COLORS['PRIMARY']}; }}"
+    )
+
+
+def _menu_style() -> str:
+    """Shared QMenu look for every popup/context menu in the app, in place
+    of the native OS menu style. QMenu::indicator is left untouched so
+    Fusion still draws its own checkmark glyph for checkable actions."""
+    c = COLORS
+    return (
+        f"QMenu {{ background: {c['SURFACE']}; border: 1px solid {c['BORDER']}; "
+        f"border-radius: 8px; padding: 4px; }}"
+        f"QMenu::item {{ background: transparent; color: {c['TEXT_PRIMARY']}; "
+        f"padding: 7px 24px 7px 10px; border-radius: 6px; font: 10pt 'Segoe UI'; }}"
+        f"QMenu::item:selected {{ background: {c['SURFACE_HOVER']}; color: {c['TEXT_PRIMARY']}; }}"
+        f"QMenu::item:disabled {{ color: {c['TEXT_SECONDARY']}; }}"
+        f"QMenu::separator {{ height: 1px; background: {c['BORDER']}; margin: 4px 8px; }}"
+        f"QMenu::icon {{ padding-left: 4px; }}"
+    )
+
+
+class ProfilePage(QWidget):
+    """Own-account page: avatar + display name editing, plus a search box
+    to find other users by login/display name."""
+    display_name_save_requested = pyqtSignal(str)
+    avatar_file_selected = pyqtSignal(str)   # local path chosen via file dialog
+    user_search_changed = pyqtSignal(str)
+    user_result_clicked = pyqtSignal(dict)
+    playlist_clicked = pyqtSignal(str)               # playlist id
+    playlist_create_requested = pyqtSignal()
+    playlist_rename_requested = pyqtSignal(str, str)  # (id, new name)
+    playlist_delete_requested = pyqtSignal(str)       # id
+    playlist_visibility_toggled = pyqtSignal(str, bool)  # (id, public)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._runners: list = []
+        self._result_rows: list = []
+        self._playlist_rows: list = []
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(280)
+        self._search_timer.timeout.connect(self._emit_search)
+        self._build_ui()
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet(get_scrollbar_style())
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        root.addWidget(scroll)
+
+        container = QWidget()
+        scroll.setWidget(container)
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(30, 20, 30, 20)
+        layout.setSpacing(20)
+
+        hdr = QLabel("Профиль")
+        hdr.setFont(QFont("Segoe UI", 20, QFont.Weight.Bold))
+        hdr.setStyleSheet(f"color: {COLORS['TEXT_PRIMARY']};")
+        layout.addWidget(hdr)
+
+        # ── Identity card ────────────────────────────────────────────────
+        card = _card_widget(layout)
+        card.addWidget(_card_section_label("Аккаунт"))
+
+        id_row = QHBoxLayout()
+        id_row.setSpacing(16)
+
+        self._avatar_btn = _AvatarButton(size=88)
+        self._avatar_btn.setToolTip("Изменить аватар")
+        self._avatar_btn.clicked.connect(self._pick_avatar_file)
+        id_row.addWidget(self._avatar_btn)
+
+        fields_col = QVBoxLayout()
+        fields_col.setSpacing(8)
+
+        name_row = QHBoxLayout()
+        name_row.setSpacing(8)
+        self._name_edit = QLineEdit()
+        self._name_edit.setPlaceholderText("Отображаемое имя")
+        self._name_edit.setFixedHeight(34)
+        self._name_edit.setStyleSheet(_line_edit_style())
+        name_row.addWidget(self._name_edit, 1)
+
+        save_btn = QPushButton("Сохранить")
+        save_btn.setFixedHeight(34)
+        save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        save_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        save_btn.setStyleSheet(
+            f"QPushButton {{ background: {COLORS['PRIMARY']}; color: white; border: none; "
+            f"border-radius: 8px; padding: 0 16px; font: 600 9.5pt 'Segoe UI'; }}"
+            f"QPushButton:hover {{ background: {COLORS['PRIMARY_HOVER']}; }}"
+        )
+        save_btn.clicked.connect(self._on_save_name_clicked)
+        name_row.addWidget(save_btn)
+        fields_col.addLayout(name_row)
+
+        self._identity_lbl = QLabel("")
+        self._identity_lbl.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']}; font: 9.5pt 'Segoe UI';")
+        self._identity_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        fields_col.addWidget(self._identity_lbl)
+
+        id_row.addLayout(fields_col, 1)
+        card.addLayout(id_row)
+
+        # ── Playlists card ──────────────────────────────────────────────
+        playlists_card = _card_widget(layout)
+        playlists_hdr_row = QHBoxLayout()
+        playlists_hdr_row.setContentsMargins(0, 0, 0, 0)
+        playlists_hdr_row.addWidget(_card_section_label("Мои плейлисты"))
+        playlists_hdr_row.addStretch(1)
+
+        create_playlist_btn = QPushButton("+ Новый плейлист")
+        create_playlist_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        create_playlist_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        create_playlist_btn.setFixedHeight(28)
+        create_playlist_btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; border: 1px solid {COLORS['BORDER']}; "
+            f"border-radius: 6px; color: {COLORS['TEXT_SECONDARY']}; font: 9pt 'Segoe UI'; padding: 0 12px; }}"
+            f"QPushButton:hover {{ border-color: {COLORS['TEXT_PRIMARY']}; color: {COLORS['TEXT_PRIMARY']}; }}"
+        )
+        create_playlist_btn.clicked.connect(self.playlist_create_requested.emit)
+        playlists_hdr_row.addWidget(create_playlist_btn)
+        playlists_card.addLayout(playlists_hdr_row)
+
+        self._playlists_col = QVBoxLayout()
+        self._playlists_col.setSpacing(2)
+        playlists_card.addLayout(self._playlists_col)
+
+        self._playlists_empty_lbl = QLabel("У вас пока нет плейлистов")
+        self._playlists_empty_lbl.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']}; font: 9.5pt 'Segoe UI';")
+        playlists_card.addWidget(self._playlists_empty_lbl)
+
+        # ── User search card ────────────────────────────────────────────
+        search_card = _card_widget(layout)
+        search_card.addWidget(_card_section_label("Найти пользователей"))
+
+        self._search_edit = QLineEdit()
+        self._search_edit.setPlaceholderText("Логин или отображаемое имя...")
+        self._search_edit.setFixedHeight(34)
+        self._search_edit.setStyleSheet(_line_edit_style())
+        self._search_edit.textChanged.connect(lambda _: self._search_timer.start())
+        search_card.addWidget(self._search_edit)
+
+        self._results_col = QVBoxLayout()
+        self._results_col.setSpacing(2)
+        search_card.addLayout(self._results_col)
+
+        self._results_empty_lbl = QLabel("")
+        self._results_empty_lbl.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']}; font: 9.5pt 'Segoe UI';")
+        self._results_empty_lbl.setVisible(False)
+        search_card.addWidget(self._results_empty_lbl)
+
+        layout.addStretch(1)
+
+    def _emit_search(self):
+        self.user_search_changed.emit(self._search_edit.text().strip())
+
+    def _pick_avatar_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Выберите аватар", "", "Изображения (*.png *.jpg *.jpeg *.webp)"
+        )
+        if path:
+            self.avatar_file_selected.emit(path)
+
+    def _on_save_name_clicked(self):
+        self.display_name_save_requested.emit(self._name_edit.text().strip())
+
+    def set_identity(self, login: str, account_id: str, display_name: str):
+        self._name_edit.setText(display_name or "")
+        self._avatar_btn.set_fallback_letter(display_name or login)
+        parts = [f"@{login}"] if login else []
+        if account_id:
+            parts.append(f"ID: {account_id}")
+        self._identity_lbl.setText("  •  ".join(parts))
+
+    def set_avatar_pixmap(self, pixmap: QPixmap | None):
+        self._avatar_btn.set_avatar_pixmap(pixmap)
+
+    def apply_accent(self):
+        self._avatar_btn.apply_accent()
+
+    def set_playlists(self, playlists: list):
+        for row in self._playlist_rows:
+            self._playlists_col.removeWidget(row)
+            row.deleteLater()
+        self._playlist_rows.clear()
+
+        playlists = playlists or []
+        self._playlists_empty_lbl.setVisible(not playlists)
+
+        for pl in playlists:
+            if not isinstance(pl, dict):
+                continue
+            pid = pl.get("id", "")
+            name = pl.get("name") or "Без названия"
+            count = len(pl.get("tracks") or [])
+            count_txt = (
+                f"{count} трек" if count == 1 else
+                f"{count} трека" if 2 <= count <= 4 else
+                f"{count} треков"
+            )
+            visibility_txt = "Публичный" if pl.get("public") else "Приватный"
+            subtitle = f"{count_txt} • {visibility_txt}"
+            row = _SidebarItem(name, pid, radius=8, subtitle=subtitle)
+            cover_pm = _decode_base64_pixmap(pl.get("cover_data") or "")
+            if cover_pm is not None:
+                row.set_cover(cover_pm)
+            else:
+                row.set_cover_text("♪", COLORS["SURFACE_LIGHT"])
+            row.clicked.connect(lambda data: self.playlist_clicked.emit(data))
+            row.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            row.customContextMenuRequested.connect(lambda _pos, r=row, p=pl: self._show_playlist_menu(r, p))
+            self._playlists_col.addWidget(row)
+            self._playlist_rows.append(row)
+
+    def _show_playlist_menu(self, row: '_SidebarItem', playlist: dict):
+        menu = QMenu(self)
+        menu.setStyleSheet(_menu_style())
+        rename_act = menu.addAction("Переименовать")
+        public_act = menu.addAction("Публичный плейлист")
+        public_act.setCheckable(True)
+        public_act.setChecked(bool(playlist.get("public")))
+        menu.addSeparator()
+        delete_act = menu.addAction("Удалить")
+        action = menu.exec(QCursor.pos())
+        if action == rename_act:
+            name, ok = QInputDialog.getText(
+                self, "Переименовать плейлист", "Новое название:", text=playlist.get("name", "")
+            )
+            name = (name or "").strip()
+            if ok and name:
+                self.playlist_rename_requested.emit(playlist.get("id", ""), name)
+        elif action == public_act:
+            self.playlist_visibility_toggled.emit(playlist.get("id", ""), not bool(playlist.get("public")))
+        elif action == delete_act:
+            self.playlist_delete_requested.emit(playlist.get("id", ""))
+
+    def set_search_results(self, items: list):
+        _stop_runners(self._runners)
+        for row in self._result_rows:
+            self._results_col.removeWidget(row)
+            row.deleteLater()
+        self._result_rows.clear()
+
+        if not items:
+            has_query = bool(self._search_edit.text().strip())
+            self._results_empty_lbl.setText("Ничего не найдено" if has_query else "")
+            self._results_empty_lbl.setVisible(has_query)
+            return
+        self._results_empty_lbl.setVisible(False)
+
+        for item in items:
+            login = item.get("login", "")
+            display_name = item.get("display_name") or login
+            row = _SidebarItem(display_name, item, radius=20, subtitle=f"@{login}")
+            row.set_cover_text((display_name or "?")[:1].upper(), COLORS["PRIMARY"])
+            row.clicked.connect(lambda data: self.user_result_clicked.emit(data))
+            self._results_col.addWidget(row)
+            self._result_rows.append(row)
+            avatar_url = item.get("avatar_url")
+            if avatar_url:
+                self._load_result_avatar(row, avatar_url)
+
+    def _load_result_avatar(self, row: '_SidebarItem', avatar_rel_url: str):
+        url = resolve_media_url(avatar_rel_url)
+        key = cache_key(url, 40, 20)
+        cached = cover_cache.get(key)
+        if cached and not cached.isNull():
+            row.set_cover(cached)
+            return
+
+        def on_loaded(loaded_url, img, size, radius):
+            try:
+                pm = QPixmap.fromImage(img) if img else QPixmap()
+                if not pm.isNull():
+                    cover_cache.set(cache_key(loaded_url, size, radius), pm)
+                    row.set_cover(pm)
+            except Exception:
+                pass
+        _start_image_loader([url], 40, 20, on_loaded, self._runners)
+
+
+class UserProfilePage(QWidget):
+    """Read-only view of another account's public profile."""
+    back_clicked = pyqtSignal()
+    playlist_clicked = pyqtSignal(dict)  # raw playlist dict from the profile payload
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._runners: list = []
+        self._playlist_rows: list = []
+        self._build_ui()
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(30, 20, 30, 20)
+        root.setSpacing(16)
+
+        back_btn = QPushButton("←  Назад")
+        back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        back_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        back_btn.setFixedHeight(30)
+        back_btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; border: 1px solid {COLORS['BORDER']}; "
+            f"border-radius: 6px; color: {COLORS['TEXT_SECONDARY']}; font: 9.5pt 'Segoe UI'; padding: 0 12px; }}"
+            f"QPushButton:hover {{ border-color: {COLORS['TEXT_PRIMARY']}; color: {COLORS['TEXT_PRIMARY']}; }}"
+        )
+        back_btn.clicked.connect(self.back_clicked.emit)
+        root.addWidget(back_btn, 0, Qt.AlignmentFlag.AlignLeft)
+
+        card = _card_widget(root)
+        head_row = QHBoxLayout()
+        head_row.setSpacing(16)
+
+        self._avatar = _AvatarButton(size=88)
+        self._avatar.setCursor(Qt.CursorShape.ArrowCursor)
+        head_row.addWidget(self._avatar)
+
+        text_col = QVBoxLayout()
+        text_col.setSpacing(4)
+        self._name_lbl = QLabel("")
+        self._name_lbl.setFont(QFont("Segoe UI", 15, QFont.Weight.Bold))
+        self._name_lbl.setStyleSheet(f"color: {COLORS['TEXT_PRIMARY']};")
+        text_col.addWidget(self._name_lbl)
+
+        self._sub_lbl = QLabel("")
+        self._sub_lbl.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']}; font: 10pt 'Segoe UI';")
+        self._sub_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        text_col.addWidget(self._sub_lbl)
+
+        head_row.addLayout(text_col, 1)
+        card.addLayout(head_row)
+
+        playlists_card = _card_widget(root)
+        playlists_card.addWidget(_card_section_label("Плейлисты"))
+        self._playlists_col = QVBoxLayout()
+        self._playlists_col.setSpacing(2)
+        playlists_card.addLayout(self._playlists_col)
+        self._playlists_empty_lbl = QLabel("Нет плейлистов")
+        self._playlists_empty_lbl.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']}; font: 9.5pt 'Segoe UI';")
+        playlists_card.addWidget(self._playlists_empty_lbl)
+
+        root.addStretch(1)
+
+    def set_profile(self, profile: dict):
+        if not isinstance(profile, dict):
+            return
+        login = profile.get("login", "")
+        display_name = profile.get("display_name") or login
+        account_id = profile.get("account_id") or ""
+
+        self._name_lbl.setText(display_name or f"@{login}")
+        parts = [f"@{login}"] if login else []
+        if account_id:
+            parts.append(f"ID: {account_id}")
+        if profile.get("is_artist"):
+            parts.append("Исполнитель")
+        self._sub_lbl.setText("  •  ".join(parts))
+        self._avatar.set_fallback_letter(display_name or login)
+
+        # The initial "partial" render (from a search result, before the full
+        # /users/profile fetch lands) has no "playlists" key at all — leave
+        # whatever's already shown alone rather than clearing it to empty.
+        if "playlists" in profile:
+            self._set_playlists(profile.get("playlists") or [], display_name or login)
+
+        avatar_url = profile.get("avatar_url")
+        if not avatar_url:
+            self._avatar.set_avatar_pixmap(None)
+            return
+
+        _stop_runners(self._runners)
+        url = resolve_media_url(avatar_url)
+        key = cache_key(url, 88, 44)
+        cached = cover_cache.get(key)
+        if cached and not cached.isNull():
+            self._avatar.set_avatar_pixmap(cached)
+            return
+
+        def on_loaded(loaded_url, img, size, radius):
+            try:
+                pm = QPixmap.fromImage(img) if img else QPixmap()
+                if not pm.isNull():
+                    cover_cache.set(cache_key(loaded_url, size, radius), pm)
+                    self._avatar.set_avatar_pixmap(pm)
+            except Exception:
+                pass
+        _start_image_loader([url], 88, 44, on_loaded, self._runners)
+
+    def _set_playlists(self, playlists: list, creator_name: str):
+        for row in self._playlist_rows:
+            self._playlists_col.removeWidget(row)
+            row.deleteLater()
+        self._playlist_rows.clear()
+
+        playlists = [p for p in playlists if isinstance(p, dict)]
+        self._playlists_empty_lbl.setVisible(not playlists)
+
+        for pl in playlists:
+            name = pl.get("name") or "Без названия"
+            count = len(pl.get("tracks") or [])
+            subtitle = (
+                f"{count} трек" if count == 1 else
+                f"{count} трека" if 2 <= count <= 4 else
+                f"{count} треков"
+            )
+            row = _SidebarItem(name, pl, radius=8, subtitle=subtitle)
+            cover_pm = _decode_base64_pixmap(pl.get("cover_data") or "")
+            if cover_pm is not None:
+                row.set_cover(cover_pm)
+            else:
+                row.set_cover_text("♪", COLORS["SURFACE_LIGHT"])
+            row.clicked.connect(lambda data: self.playlist_clicked.emit(data))
+            self._playlists_col.addWidget(row)
+            self._playlist_rows.append(row)
 
 
 class MusicApp(QWidget):
@@ -4318,18 +5191,38 @@ class MusicApp(QWidget):
 
         # Account state
         self._liked_tracks: list = []        # list of track dicts from server
+        self._playlists: list = []           # list of {id, name, created_at, public, tracks: [track-ref...]}
+        # Other accounts' public playlists this account has "+"-ed — a live
+        # reference (owner_login, playlist_id), not a snapshot; re-fetched from
+        # the owner's public profile whenever opened. name/cover_data cached
+        # here too so the sidebar row can render without a network round trip.
+        self._playlist_subscriptions: list = []
         self._subscriptions: list = []       # list of artist names
         self._album_subscriptions: list = [] # list of "artist||album" strings
         # User's custom sidebar order — "artist::Name" / "album::Artist||Title"
         # keys, letting artists and albums be freely interleaved instead of
         # always grouped as all-artists-then-all-albums.
         self._follow_order: list = []
-        # Keep-alive lists for in-flight background-load/-save signal
-        # bridges (see _LibraryLoadSignal) — daemon threads, so nothing to
-        # join/quit() on close; entries are removed as each one finishes.
+        self._display_name: str = ""
+        self._account_id: str = ""
+        self._user_search_generation: int = 0
+        self._viewed_profile: dict = {}  # last user profile shown on UserProfilePage
+        # Keep-alive lists for in-flight background-load signal bridges (see
+        # _LibraryLoadSignal) — daemon threads, so nothing to join/quit() on
+        # close; entries are removed as each one finishes.
         self._library_load_signals: list = []
         self._player_data_load_signals: list = []
-        self._player_data_save_signals: list = []
+        self._user_search_signals: list = []
+        self._user_profile_signals: list = []
+        # Player-data *saves* (likes, playlists, follow_order, settings...)
+        # all funnel through one queue processed by a single worker thread —
+        # serialized, so two saves fired close together can never complete
+        # out of order and have the older one's snapshot silently win over
+        # the newer one (that used to intermittently revert a like/playlist
+        # edit that raced another save in flight at the same time).
+        self._player_data_save_queue: "queue.Queue" = queue.Queue()
+        self._pending_player_data_saves = 0
+        threading.Thread(target=self._player_data_save_worker, daemon=True).start()
 
         self._discord_rpc = None
         self._discord_connecting = False
@@ -4484,12 +5377,14 @@ class MusicApp(QWidget):
         self._sidebar.artist_selected.connect(self._on_artist_selected)
         self._sidebar.album_selected.connect(self._on_sidebar_album_selected)
         self._sidebar.liked_tracks_selected.connect(self._on_liked_tracks_selected)
+        self._sidebar.playlist_selected.connect(self._open_playlist)
+        self._sidebar.playlist_subscription_selected.connect(self._on_playlist_subscription_clicked)
         self._sidebar.order_changed.connect(self._on_sidebar_order_changed)
         self._sidebar.section_collapsed_changed.connect(self._on_sidebar_section_collapsed_changed)
         if self._offline:
             self._sidebar.set_offline_mode()
         elif self._account_manager and self._account_manager.active_login:
-            self._sidebar.set_username(self._account_manager.active_login)
+            self._sidebar.set_username(self._display_name or self._account_manager.active_login)
         body_row.addWidget(self._sidebar)
 
         # Page stack — pre-built, never recreated
@@ -4501,9 +5396,12 @@ class MusicApp(QWidget):
         self._search_page = SearchPage()
         self._all_artists_page = AllArtistsPage()
         self._settings_page = SettingsPage(eq_band_freqs=get_eq_band_frequencies())
+        self._profile_page = ProfilePage()
+        self._user_profile_page = UserProfilePage()
 
         for page in [self._welcome_page, self._home_page, self._artist_page, self._album_page,
-                     self._search_page, self._all_artists_page, self._settings_page]:
+                     self._search_page, self._all_artists_page, self._settings_page,
+                     self._profile_page, self._user_profile_page]:
             self._page_stack.addWidget(page)
 
         self._page_stack.setCurrentWidget(self._welcome_page)
@@ -4545,8 +5443,11 @@ class MusicApp(QWidget):
         self._album_page.artist_name_clicked.connect(self._on_controls_artist_clicked)
         self._album_page.download_album_requested.connect(self._download_album)
         self._album_page.download_track_requested.connect(self._download_track)
-        self._album_page.track_like_clicked.connect(self._on_album_track_like_clicked)
+        self._album_page.track_like_clicked.connect(self._on_album_track_add_clicked)
         self._album_page.album_like_clicked.connect(self._on_album_like_clicked)
+        self._album_page.playlist_cover_edit_requested.connect(self._on_playlist_cover_edit_requested)
+        self._album_page.playlist_creator_clicked.connect(self._on_playlist_creator_clicked)
+        self._album_page.play_pause_toggle_requested.connect(self.player.toggle_playback)
         self._album_page.cover_clicked.connect(self._cover_viewer.show_for)
         self._search_page.result_selected.connect(self._on_search_result_selected)
         self._all_artists_page.artist_selected.connect(self._navigate_to_artist)
@@ -4566,6 +5467,18 @@ class MusicApp(QWidget):
         self._settings_page.eq_band_changed.connect(self._on_eq_band_changed)
         self._settings_page.eq_preamp_changed.connect(self._on_eq_preamp_changed)
         self._settings_page.eq_reset_clicked.connect(self._on_eq_reset)
+
+        self._profile_page.display_name_save_requested.connect(self._on_display_name_save_requested)
+        self._profile_page.avatar_file_selected.connect(self._on_avatar_file_selected)
+        self._profile_page.user_search_changed.connect(self._on_user_search_changed)
+        self._profile_page.user_result_clicked.connect(self._on_user_result_clicked)
+        self._user_profile_page.back_clicked.connect(lambda: self._page_stack.setCurrentWidget(self._profile_page))
+        self._user_profile_page.playlist_clicked.connect(self._on_remote_playlist_clicked)
+        self._profile_page.playlist_clicked.connect(self._open_playlist)
+        self._profile_page.playlist_create_requested.connect(self._on_playlist_create_requested)
+        self._profile_page.playlist_rename_requested.connect(self._on_playlist_rename_requested)
+        self._profile_page.playlist_delete_requested.connect(self._on_playlist_delete_requested)
+        self._profile_page.playlist_visibility_toggled.connect(self._on_playlist_visibility_toggled)
 
     def _build_top_bar(self, parent_layout):
         bar = QWidget()
@@ -4664,6 +5577,14 @@ class MusicApp(QWidget):
         )
         artists_btn.clicked.connect(self._show_all_artists)
         rp_layout.addWidget(artists_btn)
+        rp_layout.addSpacing(10)
+
+        self._avatar_btn = _AvatarButton(size=34)
+        self._avatar_btn.setToolTip("Профиль")
+        if self._account_manager and self._account_manager.active_login:
+            self._avatar_btn.set_fallback_letter(self._account_manager.active_login)
+        self._avatar_btn.clicked.connect(self._open_profile)
+        rp_layout.addWidget(self._avatar_btn)
         rp_layout.addSpacing(10)
 
         settings_btn = QPushButton("≡")
@@ -4806,13 +5727,176 @@ class MusicApp(QWidget):
 
     def _on_player_data_loaded(self, data: dict):
         self._liked_tracks = data.get("liked_tracks", []) or []
+        self._playlists = [p for p in (data.get("playlists", []) or []) if isinstance(p, dict)]
+        self._playlist_subscriptions = [
+            s for s in (data.get("playlist_subscriptions", []) or [])
+            if isinstance(s, dict) and s.get("owner_login") and s.get("playlist_id")
+        ]
         self._subscriptions = data.get("subscriptions", []) or []
         self._album_subscriptions = data.get("album_subscriptions", []) or []
         self._follow_order = data.get("follow_order", []) or []
         self._apply_synced_settings(data.get("app_settings") or {})
+        self._display_name = data.get("display_name") or ""
+        self._account_id = data.get("account_id") or ""
+        self._apply_own_identity()
+        self._apply_own_avatar(data.get("avatar_data"))
+        self._profile_page.set_playlists(self._playlists)
         self._update_sidebar_from_account()
+        self._after_track_collections_changed()
         if not self._state_restored:
             QTimer.singleShot(0, self._restore_ui_state)
+
+    def _apply_own_identity(self):
+        login = (self._account_manager.active_login if self._account_manager else "") or ""
+        self._avatar_btn.set_fallback_letter(self._display_name or login)
+        self._profile_page.set_identity(login, self._account_id, self._display_name)
+        if not self._offline and login:
+            self._sidebar.set_username(self._display_name or login)
+
+    def _apply_own_avatar(self, avatar_b64: str | None):
+        if not avatar_b64:
+            self._avatar_btn.set_avatar_pixmap(None)
+            self._profile_page.set_avatar_pixmap(None)
+            return
+        try:
+            raw = base64.b64decode(avatar_b64)
+            pm = QPixmap()
+            if pm.loadFromData(raw) and not pm.isNull():
+                self._avatar_btn.set_avatar_pixmap(pm)
+                self._profile_page.set_avatar_pixmap(pm)
+        except Exception:
+            pass
+
+    def _open_profile(self):
+        self._page_stack.setCurrentWidget(self._profile_page)
+
+    def _save_account_field_async(self, updates: dict):
+        """Queued partial player-data save for account-identity fields
+        (avatar/display name/playlists) — UI is already updated
+        optimistically, and /player/save only writes whatever keys are
+        present, so this never touches liked_tracks/subscriptions/etc."""
+        self._enqueue_player_data_save(updates)
+
+    def _enqueue_player_data_save(self, payload: dict):
+        if not self._account_manager:
+            return
+        self._pending_player_data_saves += 1
+        self._player_data_save_queue.put(payload)
+
+    def _player_data_save_worker(self):
+        """Single persistent worker — every player-data save (whatever
+        triggered it) is processed here, one at a time and strictly in the
+        order it was enqueued. See the comment where the queue is created."""
+        while True:
+            payload = self._player_data_save_queue.get()
+            try:
+                if self._account_manager:
+                    self._account_manager.save_player_data(payload)
+            except Exception:
+                pass
+            finally:
+                self._pending_player_data_saves = max(0, self._pending_player_data_saves - 1)
+
+    def _on_display_name_save_requested(self, name: str):
+        name = (name or "").strip()[:60]
+        self._display_name = name
+        self._apply_own_identity()
+        self._save_account_field_async({"display_name": name})
+
+    def _on_avatar_file_selected(self, path: str):
+        pm = QPixmap(path)
+        if pm.isNull():
+            QMessageBox.warning(self, "Аватар", "Не удалось загрузить это изображение.")
+            return
+        # Center-cropped square at a moderate resolution — circular clipping
+        # happens at display time (see _AvatarButton), so the stored image
+        # just needs to be square, not already round.
+        square = make_rounded_pixmap(pm, 256, 0)
+
+        buf = QBuffer()
+        buf.open(QBuffer.OpenModeFlag.WriteOnly)
+        square.save(buf, "PNG")
+        b64 = base64.b64encode(bytes(buf.data())).decode("ascii")
+        buf.close()
+
+        self._avatar_btn.set_avatar_pixmap(square)
+        self._profile_page.set_avatar_pixmap(square)
+        self._save_account_field_async({"avatar_data": b64, "avatar_filename": "avatar.png"})
+
+    def _on_user_search_changed(self, query: str):
+        query = (query or "").strip()
+        self._user_search_generation += 1
+        gen = self._user_search_generation
+        if not self._account_manager or not query:
+            self._profile_page.set_search_results([])
+            return
+
+        signal = _UserSearchSignal(self)
+        self._user_search_signals.append(signal)
+
+        def _cleanup(s=signal):
+            try:
+                self._user_search_signals.remove(s)
+            except ValueError:
+                pass
+
+        def _on_results(result_gen, items):
+            if result_gen == self._user_search_generation:
+                self._profile_page.set_search_results(items)
+
+        signal.finished.connect(_on_results)
+        signal.finished.connect(_cleanup)
+
+        account_manager = self._account_manager
+
+        def _worker():
+            try:
+                items = account_manager.search_users(query)
+            except Exception:
+                items = []
+            signal.finished.emit(gen, items)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_user_result_clicked(self, user: dict):
+        self._viewed_profile = dict(user)
+        self._user_profile_page.set_profile(user)
+        self._page_stack.setCurrentWidget(self._user_profile_page)
+        self._fetch_full_user_profile(user)
+
+    def _fetch_full_user_profile(self, user: dict):
+        if not self._account_manager:
+            return
+        login = user.get("login", "")
+        account_id = user.get("account_id", "")
+
+        signal = _UserProfileSignal(self)
+        self._user_profile_signals.append(signal)
+
+        def _cleanup(s=signal):
+            try:
+                self._user_profile_signals.remove(s)
+            except ValueError:
+                pass
+
+        def _on_result(profile):
+            if profile:
+                self._viewed_profile = dict(profile)
+                self._user_profile_page.set_profile(profile)
+
+        signal.finished.connect(_on_result)
+        signal.finished.connect(_cleanup)
+
+        account_manager = self._account_manager
+
+        def _worker():
+            try:
+                profile = account_manager.get_public_profile(login=login, account_id=account_id)
+            except Exception:
+                profile = {}
+            signal.finished.emit(profile)
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _apply_synced_settings(self, app_settings: dict):
         """Merge settings synced from the server (account-wide, via
@@ -5001,6 +6085,10 @@ class MusicApp(QWidget):
     def _update_sidebar_from_account(self):
         library = self.library_manager.get_library()
         artist_index = {(a.get("artist") or "").strip(): a for a in library}
+        playlist_index = {p.get("id"): p for p in self._playlists if isinstance(p, dict) and p.get("id")}
+        playlist_sub_index = {
+            f"{s.get('owner_login')}::{s.get('playlist_id')}": s for s in self._playlist_subscriptions
+        }
 
         def resolve_album(album_key: str):
             parts = album_key.split("||", 1)
@@ -5016,12 +6104,15 @@ class MusicApp(QWidget):
             return None
 
         # follow_order is the user's own custom drag-and-drop arrangement
-        # (mixing artists and albums freely), persisted via player data —
-        # filter it down to what's still actually subscribed, then append
-        # anything subscribed but missing from it (older data from before
-        # this existed, newest last) so nothing silently disappears.
+        # (mixing artists, albums and playlists freely), persisted via player
+        # data — filter it down to what's still actually subscribed/owned,
+        # then append anything missing from it (older data from before this
+        # existed, or a playlist created elsewhere, newest last) so nothing
+        # silently disappears.
         subscribed_keys = {f"artist::{n}" for n in self._subscriptions}
         subscribed_keys |= {f"album::{k}" for k in self._album_subscriptions}
+        subscribed_keys |= {f"playlist::{pid}" for pid in playlist_index}
+        subscribed_keys |= {f"playlistsub::{k}" for k in playlist_sub_index}
 
         ordered_keys = [k for k in self._follow_order if k in subscribed_keys]
         known = set(ordered_keys)
@@ -5032,6 +6123,16 @@ class MusicApp(QWidget):
                 known.add(k)
         for album_key in self._album_subscriptions:
             k = f"album::{album_key}"
+            if k not in known:
+                ordered_keys.append(k)
+                known.add(k)
+        for pid in playlist_index:
+            k = f"playlist::{pid}"
+            if k not in known:
+                ordered_keys.append(k)
+                known.add(k)
+        for sub_key in playlist_sub_index:
+            k = f"playlistsub::{sub_key}"
             if k not in known:
                 ordered_keys.append(k)
                 known.add(k)
@@ -5047,6 +6148,14 @@ class MusicApp(QWidget):
                 resolved = resolve_album(key[len("album::"):])
                 if resolved:
                     entries.append(("album", resolved))
+            elif key.startswith("playlistsub::"):
+                sub = playlist_sub_index.get(key[len("playlistsub::"):])
+                if sub:
+                    entries.append(("playlist_sub", sub))
+            elif key.startswith("playlist::"):
+                pl = playlist_index.get(key[len("playlist::"):])
+                if pl:
+                    entries.append(("playlist", pl))
 
         has_liked = bool(self._liked_tracks)
         self._sidebar.load_account_content(liked=has_liked, entries=entries)
@@ -5091,28 +6200,7 @@ class MusicApp(QWidget):
         full.update(updates)
         # Write to local cache immediately so next startup sees it right away
         self._write_local_player_data(full)
-
-        signal = _PlayerDataSaveSignal(self)
-        self._player_data_save_signals.append(signal)
-
-        def _cleanup(s=signal):
-            try:
-                self._player_data_save_signals.remove(s)
-            except ValueError:
-                pass
-
-        signal.finished.connect(_cleanup)
-
-        account_manager = self._account_manager
-
-        def _worker():
-            try:
-                account_manager.save_player_data(full)
-            except Exception:
-                pass
-            signal.finished.emit()
-
-        threading.Thread(target=_worker, daemon=True).start()
+        self._enqueue_player_data_save(full)
 
     # ── Player setup ──────────────────────────────────────────────────────────
 
@@ -5232,7 +6320,51 @@ class MusicApp(QWidget):
             # through the background SearchWorker (which owns its own,
             # separate LibraryManager instance for the server catalog).
             results = results + self.local_library_manager.fast_search(self._last_search_query)
+        if self._last_search_query:
+            results = results + self._search_playlists(self._last_search_query)
         self._search_page.update_results(results)
+
+    @staticmethod
+    def _playlist_matches_query(playlist: dict, q: str) -> bool:
+        if q in (playlist.get("name") or "").lower():
+            return True
+        # Also match by the name of any artist with a track in the playlist —
+        # only meaningful for own playlists, whose track list is held in full
+        # locally; a subscription entry is just {owner_login, playlist_id,
+        # name, cover_data}, no track data to search without a network fetch.
+        for track in playlist.get("tracks", []) or []:
+            if isinstance(track, dict) and q in (track.get("artist_name") or "").lower():
+                return True
+        return False
+
+    def _search_playlists(self, query: str) -> list:
+        """Own + "+"-ed playlists aren't part of the shared library, so
+        LibraryManager/SearchWorker never see them — matched here instead,
+        against the small in-memory lists MusicApp already holds."""
+        q = query.strip().lower()
+        if not q:
+            return []
+        my_login = (self._account_manager.active_login if self._account_manager else "") or ""
+        out = []
+        for pl in self._playlists:
+            if not isinstance(pl, dict):
+                continue
+            if self._playlist_matches_query(pl, q):
+                out.append(SearchResult(
+                    "playlist", "", playlist_obj=pl, playlist_editable=True,
+                    playlist_owner_login=my_login,
+                    playlist_cover_pixmap=_decode_base64_pixmap(pl.get("cover_data") or ""),
+                ))
+        for sub in self._playlist_subscriptions:
+            if not isinstance(sub, dict):
+                continue
+            if q in (sub.get("name") or "").lower():
+                out.append(SearchResult(
+                    "playlist", "", playlist_obj=sub, playlist_editable=False,
+                    playlist_owner_login=sub.get("owner_login", ""),
+                    playlist_cover_pixmap=_decode_base64_pixmap(sub.get("cover_data") or ""),
+                ))
+        return out
 
     def _on_search_result_selected(self, result: SearchResult):
         self._search_bar.clear()
@@ -5250,6 +6382,11 @@ class MusicApp(QWidget):
                 QTimer.singleShot(80, lambda: self._play_track(idx, result.album_obj, result.artist_obj))
             except Exception:
                 pass
+        elif result.type == "playlist" and result.playlist_obj:
+            if result.playlist_editable:
+                self._open_playlist(result.playlist_obj.get("id", ""))
+            else:
+                self._on_playlist_subscription_clicked(result.playlist_obj)
 
     # ── Navigation ────────────────────────────────────────────────────────────
 
@@ -5303,8 +6440,8 @@ class MusicApp(QWidget):
         self._album_page._album_like_btn.setVisible(True)
         album_key = self._album_key(artist.get("artist", ""), album.get("title", ""))
         self._album_page.set_album_liked(album_key in self._album_subscriptions)
-        liked_urls = self._liked_urls_set()
-        self._album_page.refresh_track_likes(liked_urls)
+        self._album_page.refresh_track_likes(self._all_collection_keys())
+        self._sync_play_all_button()
         self._page_stack.setCurrentWidget(self._album_page)
         self._save_ui_state(
             last_view_page="album",
@@ -5458,7 +6595,8 @@ class MusicApp(QWidget):
             is_paused=not self.player.is_playing(),
         )
         self._album_page._album_like_btn.setVisible(False)
-        self._album_page.refresh_track_likes(self._liked_urls_set())
+        self._album_page.refresh_track_likes(self._all_collection_keys())
+        self._sync_play_all_button()
         self._page_stack.setCurrentWidget(self._album_page)
         self._save_ui_state(last_view_page="liked", last_view_artist="", last_view_album="")
 
@@ -5555,6 +6693,8 @@ class MusicApp(QWidget):
         self.player.play_track(track_idx)
 
     def _on_like_clicked(self):
+        """Despite the name, this now opens the "add to collection" menu for
+        the currently playing track (the '+' button in the playback bar)."""
         if not self._account_manager:
             return
         track = self.player.current_track
@@ -5566,41 +6706,10 @@ class MusicApp(QWidget):
             track_obj = album["tracks"][self.player.current_track_idx]
         except (IndexError, KeyError, TypeError):
             return
-        rel_url = track_obj.get("url", "")
-        track_url = resolve_media_url(rel_url)
-        artist_name = track_obj.get("artist_name") or (artist or {}).get("artist", "") or ""
-        # Use real album title if playing from liked tracks virtual album
-        if album.get("_is_liked_album"):
-            album_title = track_obj.get("_real_album_title", "")
-        else:
-            album_title = album.get("title", "") or ""
-        track_title = track_obj.get("title", "") or ""
-        album_id = str(track_obj.get("album_id") or "").strip()
-
-        my_keys = _track_like_keys(track_obj, rel_url)
-        is_liked = bool(my_keys & self._liked_urls_set())
-
-        if is_liked:
-            self._liked_tracks = [
-                lt for lt in self._liked_tracks if not _liked_entry_matches(lt, my_keys)
-            ]
-        else:
-            self._liked_tracks.insert(0, {
-                "url": rel_url or track_url,
-                "artist_name": artist_name,
-                "album_title": album_title,
-                "track_title": track_title,
-                "album_id": album_id,
-            })
-
-        self._controls.set_like_state(not is_liked, enabled=True)
-        self._save_player_data_async({"liked_tracks": self._liked_tracks})
-        self._update_sidebar_from_account()
-        if self._current_album and self._current_album.get("_is_liked_album"):
-            self._on_liked_tracks_selected()
+        self._show_add_to_collections_menu(track_obj, album, artist, self._controls.like_btn)
 
     def _sync_like_button(self):
-        """Update the ♥ button state for the current track."""
+        """Update the '+' button state (accent = in some collection) for the current track."""
         if not self._account_manager:
             return
         album = self.player.current_playing_album
@@ -5612,10 +6721,10 @@ class MusicApp(QWidget):
         except (IndexError, KeyError, TypeError):
             self._controls.set_like_state(False, enabled=False)
             return
-        is_liked = bool(_track_like_keys(track_obj) & self._liked_urls_set())
-        self._controls.set_like_state(is_liked, enabled=True)
+        in_collection = bool(_track_like_keys(track_obj) & self._all_collection_keys())
+        self._controls.set_like_state(in_collection, enabled=True)
 
-    # ── Like helpers ──────────────────────────────────────────────────────────
+    # ── Like / playlist helpers ─────────────────────────────────────────────────
 
     def _liked_urls_set(self) -> set:
         """URL variants and album_id-based identity keys of all liked tracks
@@ -5629,46 +6738,435 @@ class MusicApp(QWidget):
                 keys |= _track_like_keys({}, lt)
         return keys
 
+    def _playlist_track_keys(self, playlist: dict) -> set:
+        keys = set()
+        for ref in (playlist or {}).get("tracks", []) or []:
+            if isinstance(ref, dict):
+                keys |= _track_like_keys(ref, ref.get("url", ""))
+        return keys
+
+    def _all_collection_keys(self) -> set:
+        """Union of liked-tracks keys and every playlist's track keys — used
+        to decide whether a track's '+' button should be accent-colored and
+        always visible (i.e. it belongs to *something*)."""
+        keys = self._liked_urls_set()
+        for pl in self._playlists:
+            keys |= self._playlist_track_keys(pl)
+        return keys
+
     @staticmethod
     def _album_key(artist_name: str, album_title: str) -> str:
         return f"{(artist_name or '').strip()}||{(album_title or '').strip()}"
 
-    def _on_album_track_like_clicked(self, track: dict):
+    def _is_same_playing_target(self, album: dict, artist: dict) -> bool:
+        """Is `album` (with `artist`) the exact same album/playlist/liked-
+        tracks view that's currently loaded in the player (playing or
+        paused) — used to decide whether the "Слушать" button should
+        toggle pause/resume instead of restarting from track 0."""
+        playing_album = self.player.current_playing_album
+        if not playing_album or not album:
+            return False
+        is_playlist = bool(album.get("_is_playlist"))
+        is_liked = bool(album.get("_is_liked_album"))
+        playing_is_playlist = bool(playing_album.get("_is_playlist"))
+        playing_is_liked = bool(playing_album.get("_is_liked_album"))
+        if is_playlist or playing_is_playlist:
+            return (
+                is_playlist and playing_is_playlist
+                and album.get("_playlist_id", "") == playing_album.get("_playlist_id", "")
+            )
+        if is_liked or playing_is_liked:
+            return is_liked and playing_is_liked
+        playing_artist = self.player.current_playing_artist or {}
+        this_key = self._album_key((artist or {}).get("artist", ""), album.get("title", ""))
+        playing_key = self._album_key(playing_artist.get("artist", ""), playing_album.get("title", ""))
+        return this_key == playing_key
+
+    def _sync_play_all_button(self, is_playing: bool | None = None):
+        """Keep AlbumPage's "Слушать"/"Играет" button in sync with the
+        player — called after loading a new album/playlist page and on every
+        playback state change while one might be open.
+
+        `is_playing`, when given, is trusted as-is instead of re-querying
+        self.player.is_playing() — libVLC's own is_playing() can briefly
+        still say False right after play()/on_track_changed fires (playback
+        hasn't actually started yet internally), which used to leave the
+        button reading "Слушать" for a track started by clicking it directly
+        in the tracklist, even though it really was playing (and clicking
+        "Слушать" right then correctly paused it — proof the *target* match
+        was right all along, just not this *is-it-playing* read)."""
+        album = self._current_album
+        is_same = bool(album) and self._is_same_playing_target(album, self._current_artist)
+        if is_playing is None:
+            is_playing = self.player.is_playing()
+        self._album_page.set_playback_state(is_same, is_same and is_playing)
+
+    def _build_track_ref(self, track: dict, album: dict, artist: dict | None = None) -> dict:
+        """Same track-reference shape used by liked_tracks and playlists —
+        {url, artist_name, album_title, track_title, album_id} — resolved
+        against the real library later (see _resolve_liked_track)."""
+        album = album or {}
+        rel_url = track.get("url", "")
+        if album.get("_is_liked_album"):
+            album_title = track.get("_real_album_title", "")
+        else:
+            album_title = album.get("title", "") or ""
+        artist_name = track.get("artist_name") or ((artist or {}).get("artist", "") if artist else "") or ""
+        return {
+            "url": rel_url or resolve_media_url(rel_url),
+            "artist_name": artist_name,
+            "album_title": album_title,
+            "track_title": track.get("title", "") or "",
+            "album_id": str(track.get("album_id") or "").strip(),
+        }
+
+    def _show_add_to_collections_menu(self, track: dict, album: dict, artist: dict | None, anchor: QWidget):
         if not self._account_manager:
             return
-        rel_url = track.get("url", "")
-        track_url = resolve_media_url(rel_url)
-        my_keys = _track_like_keys(track, rel_url)
-        is_liked = bool(my_keys & self._liked_urls_set())
-        if is_liked:
-            self._liked_tracks = [
-                lt for lt in self._liked_tracks if not _liked_entry_matches(lt, my_keys)
-            ]
+        my_keys = _track_like_keys(track, track.get("url", ""))
+
+        menu = QMenu(anchor)
+        menu.setStyleSheet(_menu_style())
+        liked_action = menu.addAction("Понравившиеся треки")
+        liked_action.setCheckable(True)
+        liked_action.setChecked(bool(my_keys & self._liked_urls_set()))
+        liked_action.toggled.connect(lambda checked, t=track, a=album, ar=artist: self._toggle_track_liked(t, a, ar, checked))
+
+        if self._playlists:
+            menu.addSeparator()
+            for pl in self._playlists:
+                act = menu.addAction(pl.get("name") or "Без названия")
+                act.setCheckable(True)
+                act.setChecked(bool(my_keys & self._playlist_track_keys(pl)))
+                act.toggled.connect(
+                    lambda checked, t=track, a=album, ar=artist, pid=pl.get("id"):
+                        self._toggle_track_in_playlist(t, a, ar, pid, checked)
+                )
+
+        menu.addSeparator()
+        create_action = menu.addAction("Создать плейлист...")
+        create_action.triggered.connect(lambda: self._create_playlist_with_track(track, album, artist))
+
+        menu.exec(QCursor.pos())
+
+    def _toggle_track_liked(self, track: dict, album: dict, artist: dict | None, liked: bool):
+        my_keys = _track_like_keys(track, track.get("url", ""))
+        already = bool(my_keys & self._liked_urls_set())
+        if liked == already:
+            return
+        if liked:
+            self._liked_tracks.insert(0, self._build_track_ref(track, album, artist))
         else:
-            current_album = self._current_album or {}
-            if current_album.get("_is_liked_album"):
-                album_title = track.get("_real_album_title", "")
-            else:
-                album_title = current_album.get("title", "")
-            self._liked_tracks.insert(0, {
-                "url": rel_url or track_url,
-                "artist_name": track.get("artist_name", ""),
-                "album_title": album_title,
-                "track_title": track.get("title", ""),
-                "album_id": str(track.get("album_id") or "").strip(),
-            })
+            self._liked_tracks = [lt for lt in self._liked_tracks if not _liked_entry_matches(lt, my_keys)]
         self._save_player_data_async({"liked_tracks": self._liked_tracks})
         self._update_sidebar_from_account()
-        # Sync playback controls if this is the current track
+        self._after_track_collections_changed()
+
+    def _toggle_track_in_playlist(self, track: dict, album: dict, artist: dict | None, playlist_id: str, add: bool):
+        pl = next((p for p in self._playlists if p.get("id") == playlist_id), None)
+        if pl is None:
+            return
+        my_keys = _track_like_keys(track, track.get("url", ""))
+        tracks = pl.setdefault("tracks", [])
+        already = any(_liked_entry_matches(t, my_keys) for t in tracks)
+        if add == already:
+            return
+        if add:
+            tracks.insert(0, self._build_track_ref(track, album, artist))
+        else:
+            pl["tracks"] = [t for t in tracks if not _liked_entry_matches(t, my_keys)]
+        self._save_playlists_async()
+        self._after_track_collections_changed()
+        self._refresh_playlists_ui()
+
+    def _create_playlist_with_track(self, track: dict, album: dict, artist: dict | None):
+        if not self._account_manager:
+            return
+        name, ok = QInputDialog.getText(self, "Новый плейлист", "Название плейлиста:")
+        name = (name or "").strip()
+        if not ok or not name:
+            return
+        playlist = {
+            "id": uuid.uuid4().hex,
+            "name": name[:80],
+            "created_at": int(time.time()),
+            "public": False,
+            "tracks": [self._build_track_ref(track, album, artist)],
+        }
+        self._playlists.insert(0, playlist)
+        self._follow_order.insert(0, f"playlist::{playlist['id']}")
+        self._save_playlists_async()
+        self._save_follow_order_async()
+        self._after_track_collections_changed()
+        self._refresh_playlists_ui()
+
+    def _save_playlists_async(self):
+        self._save_account_field_async({"playlists": self._playlists})
+
+    def _save_follow_order_async(self):
+        # follow_order lives in _save_player_data_async's "full" bundle (see
+        # its definition) — any call persists whatever's currently in
+        # self._follow_order, so this just makes the intent explicit at call sites.
+        self._save_player_data_async({"follow_order": self._follow_order})
+
+    def _refresh_playlists_ui(self):
+        self._profile_page.set_playlists(self._playlists)
+        self._update_sidebar_from_account()
+
+    def _after_track_collections_changed(self):
+        """Re-sync every visible '+' button after liked_tracks/playlists change."""
         self._sync_like_button()
-        # Refresh liked tracks page to show updated order
+        collection_keys = self._all_collection_keys()
+        self._album_page.refresh_track_likes(collection_keys)
         if self._current_album and self._current_album.get("_is_liked_album"):
             self._on_liked_tracks_selected()
+
+    def _build_playlist_virtual_album(self, playlist: dict, creator_name: str, editable: bool, owner_login: str = "") -> dict:
+        """Same "virtual album" shape liked-tracks uses (see _resolve_liked_track),
+        plus playlist-specific fields AlbumPage/TrackRow key off of: a
+        creator name shown where the artist would be, an editable custom
+        cover, and (unlike liked tracks) each track's own artist name kept
+        so it can show a per-track subtitle."""
+        library = self.library_manager.get_library()
+        tracks = [
+            self._resolve_liked_track(ref, library)
+            for ref in (playlist.get("tracks", []) or [])
+            if isinstance(ref, dict)
+        ]
+        return {
+            "title": playlist.get("name") or "Плейлист",
+            "tracks": tracks,
+            "cover": "",
+            "_cover_data": playlist.get("cover_data", ""),
+            "_is_playlist": True,
+            "_playlist_id": playlist.get("id", ""),
+            "_playlist_editable": editable,
+            "_playlist_creator_name": creator_name,
+            "_playlist_owner_login": owner_login,
+        }
+
+    def _is_playlist_subscribed(self, owner_login: str, playlist_id: str) -> bool:
+        return any(
+            s.get("owner_login") == owner_login and s.get("playlist_id") == playlist_id
+            for s in self._playlist_subscriptions
+        )
+
+    def _show_playlist_album(self, playlist: dict, creator_name: str, editable: bool, owner_login: str = ""):
+        virtual_album = self._build_playlist_virtual_album(playlist, creator_name, editable, owner_login)
+        virtual_artist = {"artist": ""}
+        self._current_album = virtual_album
+        self._current_artist = virtual_artist
+        self._album_page.load_album(
+            virtual_album, virtual_artist, playing_url=self._playing_url, playing_track=self._playing_track,
+            is_paused=not self.player.is_playing(),
+        )
+        if editable:
+            # Your own playlist — nothing to "+"/subscribe to, you already have it.
+            self._album_page._album_like_btn.setVisible(False)
         else:
-            self._album_page.set_track_liked(track, not is_liked)
+            self._album_page._album_like_btn.setVisible(True)
+            self._album_page.set_album_liked(self._is_playlist_subscribed(owner_login, playlist.get("id", "")))
+        self._album_page.refresh_track_likes(self._all_collection_keys())
+        self._sync_play_all_button()
+        self._page_stack.setCurrentWidget(self._album_page)
+
+    def _open_playlist(self, playlist_id: str):
+        """Show one of the current account's own (editable) playlists."""
+        pl = next((p for p in self._playlists if p.get("id") == playlist_id), None)
+        if pl is None:
+            return
+        login = (self._account_manager.active_login if self._account_manager else "") or ""
+        creator_name = self._display_name or login
+        self._show_playlist_album(pl, creator_name, editable=True, owner_login=login)
+
+    def _on_remote_playlist_clicked(self, playlist: dict):
+        """A playlist clicked on someone else's UserProfilePage — always
+        read-only, even in the edge case of viewing your own profile via search."""
+        my_login = (self._account_manager.active_login if self._account_manager else "") or ""
+        viewed_login = self._viewed_profile.get("login", "")
+        creator_name = self._viewed_profile.get("display_name") or viewed_login
+        editable = bool(my_login) and my_login == viewed_login
+        self._show_playlist_album(playlist, creator_name, editable=editable, owner_login=viewed_login)
+
+    def _on_playlist_subscription_clicked(self, sub: dict):
+        """A "+"-ed playlist clicked in the sidebar — show the cached snapshot
+        immediately, then refresh with the owner's current public data (the
+        owner may have renamed/re-covered/edited it, or made it private since)."""
+        owner_login = sub.get("owner_login", "")
+        playlist_id = sub.get("playlist_id", "")
+        if not owner_login or not playlist_id or not self._account_manager:
+            return
+        snapshot = {
+            "id": playlist_id, "name": sub.get("name") or "Плейлист",
+            "cover_data": sub.get("cover_data", ""), "tracks": [],
+        }
+        self._show_playlist_album(snapshot, sub.get("name") or owner_login, editable=False, owner_login=owner_login)
+
+        signal = _UserProfileSignal(self)
+        self._user_profile_signals.append(signal)
+
+        def _cleanup(s=signal):
+            try:
+                self._user_profile_signals.remove(s)
+            except ValueError:
+                pass
+
+        def _on_result(payload):
+            profile = payload.get("profile") or {}
+            pl = payload.get("playlist")
+            if not pl:
+                return  # deleted or made private since subscribing — keep showing the snapshot
+            # Still viewing the same subscribed playlist? (user may have navigated away already)
+            if not (self._current_album or {}).get("_is_playlist"):
+                return
+            if (self._current_album or {}).get("_playlist_owner_login") != owner_login:
+                return
+            creator_name = profile.get("display_name") or profile.get("login") or owner_login
+            self._show_playlist_album(pl, creator_name, editable=False, owner_login=owner_login)
+
+        signal.finished.connect(_on_result)
+        signal.finished.connect(_cleanup)
+
+        account_manager = self._account_manager
+
+        def _worker():
+            try:
+                profile = account_manager.get_public_profile(login=owner_login)
+                pl = None
+                if profile:
+                    pl = next((p for p in (profile.get("playlists") or []) if p.get("id") == playlist_id), None)
+                signal.finished.emit({"profile": profile or {}, "playlist": pl})
+            except Exception:
+                signal.finished.emit({"profile": {}, "playlist": None})
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_playlist_subscribe_clicked(self):
+        """The '+' library button on someone else's playlist page."""
+        album = self._current_album or {}
+        owner_login = album.get("_playlist_owner_login", "")
+        playlist_id = album.get("_playlist_id", "")
+        if not self._account_manager or not owner_login or not playlist_id:
+            return
+        sub_key = f"{owner_login}::{playlist_id}"
+        order_key = f"playlistsub::{sub_key}"
+        already = self._is_playlist_subscribed(owner_login, playlist_id)
+        if already:
+            self._playlist_subscriptions = [
+                s for s in self._playlist_subscriptions
+                if not (s.get("owner_login") == owner_login and s.get("playlist_id") == playlist_id)
+            ]
+            if order_key in self._follow_order:
+                self._follow_order.remove(order_key)
+            self._album_page.set_album_liked(False)
+        else:
+            self._playlist_subscriptions.insert(0, {
+                "owner_login": owner_login,
+                "playlist_id": playlist_id,
+                "name": album.get("title", ""),
+                "cover_data": album.get("_cover_data", ""),
+            })
+            self._follow_order.insert(0, order_key)
+            self._album_page.set_album_liked(True)
+        self._save_player_data_async({
+            "playlist_subscriptions": self._playlist_subscriptions, "follow_order": self._follow_order,
+        })
+        self._update_sidebar_from_account()
+
+    def _on_playlist_creator_clicked(self, owner_login: str):
+        if not owner_login or not self._account_manager:
+            return
+        my_login = (self._account_manager.active_login or "") if self._account_manager else ""
+        if owner_login == my_login:
+            self._open_profile()
+            return
+        self._on_user_result_clicked({"login": owner_login})
+
+    def _on_playlist_cover_edit_requested(self):
+        album = self._current_album or {}
+        if not self._account_manager or not album.get("_is_playlist") or not album.get("_playlist_editable"):
+            return
+        playlist_id = album.get("_playlist_id", "")
+        pl = next((p for p in self._playlists if p.get("id") == playlist_id), None)
+        if pl is None:
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Выберите обложку плейлиста", "", "Изображения (*.png *.jpg *.jpeg *.webp)"
+        )
+        if not path:
+            return
+        pm = QPixmap(path)
+        if pm.isNull():
+            QMessageBox.warning(self, "Обложка", "Не удалось загрузить это изображение.")
+            return
+        square = make_rounded_pixmap(pm, 512, 0)
+        buf = QBuffer()
+        buf.open(QBuffer.OpenModeFlag.WriteOnly)
+        square.save(buf, "PNG")
+        b64 = base64.b64encode(bytes(buf.data())).decode("ascii")
+        buf.close()
+
+        pl["cover_data"] = b64
+        self._save_playlists_async()
+        self._refresh_playlists_ui()
+        self._open_playlist(playlist_id)
+
+    def _on_playlist_create_requested(self):
+        if not self._account_manager:
+            return
+        name, ok = QInputDialog.getText(self, "Новый плейлист", "Название плейлиста:")
+        name = (name or "").strip()
+        if not ok or not name:
+            return
+        playlist = {"id": uuid.uuid4().hex, "name": name[:80], "created_at": int(time.time()), "public": False, "tracks": []}
+        self._playlists.insert(0, playlist)
+        self._follow_order.insert(0, f"playlist::{playlist['id']}")
+        self._save_playlists_async()
+        self._save_follow_order_async()
+        self._refresh_playlists_ui()
+
+    def _on_playlist_rename_requested(self, playlist_id: str, new_name: str):
+        pl = next((p for p in self._playlists if p.get("id") == playlist_id), None)
+        if pl is None:
+            return
+        pl["name"] = new_name[:80]
+        self._save_playlists_async()
+        self._refresh_playlists_ui()
+
+    def _on_playlist_visibility_toggled(self, playlist_id: str, public: bool):
+        pl = next((p for p in self._playlists if p.get("id") == playlist_id), None)
+        if pl is None:
+            return
+        pl["public"] = bool(public)
+        self._save_playlists_async()
+        self._refresh_playlists_ui()
+
+    def _on_playlist_delete_requested(self, playlist_id: str):
+        reply = QMessageBox.question(
+            self, "Удалить плейлист", "Удалить этот плейлист без возможности восстановления?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self._playlists = [p for p in self._playlists if p.get("id") != playlist_id]
+        key = f"playlist::{playlist_id}"
+        if key in self._follow_order:
+            self._follow_order.remove(key)
+        self._save_playlists_async()
+        self._save_follow_order_async()
+        self._refresh_playlists_ui()
+        self._after_track_collections_changed()
+
+    def _on_album_track_add_clicked(self, track: dict):
+        if not self._account_manager:
+            return
+        self._show_add_to_collections_menu(track, self._current_album or {}, self._current_artist, self._album_page)
 
     def _on_album_like_clicked(self):
         if not self._account_manager or not self._current_album:
+            return
+        if self._current_album.get("_is_playlist"):
+            self._on_playlist_subscribe_clicked()
             return
         artist_name = (self._current_artist or {}).get("artist", "")
         album_title = self._current_album.get("title", "")
@@ -5726,6 +7224,8 @@ class MusicApp(QWidget):
         self._artist_page.apply_accent()
         self._cover_viewer.apply_accent()
         self._settings_page.apply_accent()
+        self._avatar_btn.apply_accent()
+        self._profile_page.apply_accent()
         c = COLORS
         # The search field's pill border lives on _search_wrapper, not on the
         # QLineEdit itself (which stays borderless) — just refresh it for the
@@ -5984,12 +7484,21 @@ class MusicApp(QWidget):
         self._playing_track = track
         self._album_page.mark_playing_url(self._playing_url, track)
         self._album_page.set_paused(False)  # a freshly-started track is always playing, never paused
+        self._sync_play_all_button(True)
         self._search_page.refresh_playing(self._playing_url, track)
         # Save track info for next-launch restore
         artist_name = track.get("artist_name") or (artist or {}).get("artist", "") or ""
         album_title = track.get("_real_album_title") or (album or {}).get("title", "") or ""
         album_id = str(track.get("album_id") or (album or {}).get("album_id") or "").strip()
-        cover = (album or {}).get("cover", "") if not (album or {}).get("_is_liked_album") else track.get("_real_album_cover", "")
+        # Same "real per-track cover for a virtual album" resolution used to
+        # show the bottom bar's cover live (see _resolve_playing_cover_rel)
+        # — reused here so the *saved* last_played_track.album_cover (read
+        # back on next launch, before anything is actually playing) is
+        # correct too. This used to only check _is_liked_album, not
+        # _is_playlist, so a track last played from a playlist always saved
+        # an empty cover — showing no artwork at startup until playback was
+        # started again (which re-resolved it correctly via this same logic).
+        cover = self._resolve_playing_cover_rel(album)
         self._save_ui_state(
             last_played_track={
                 "title": track.get("title", ""),
@@ -6023,9 +7532,11 @@ class MusicApp(QWidget):
 
     def _resolve_playing_cover_rel(self, album: dict) -> str:
         """Cover path for the currently playing album — prefers the real
-        album cover from the track when playing the liked-tracks virtual album."""
+        album cover from the track when playing a virtual album (liked
+        tracks or a playlist), since those don't have one cover of their own."""
         cover_rel = (album or {}).get("cover", "")
-        if album and album.get("_is_liked_album") and self.player.current_track_idx is not None:
+        is_virtual = bool(album) and (album.get("_is_liked_album") or album.get("_is_playlist"))
+        if is_virtual and self.player.current_track_idx is not None:
             try:
                 track = album["tracks"][self.player.current_track_idx]
                 real = track.get("_real_album_cover", "")
@@ -6071,6 +7582,7 @@ class MusicApp(QWidget):
         self._controls.set_playing(is_playing)
         self._disc_overlay.set_playing(is_playing)
         self._album_page.set_paused(not is_playing)
+        self._sync_play_all_button(is_playing)
         self._schedule_discord_presence_refresh(90)
         self._schedule_discord_presence_refresh(650)
         if self._mpris_service:
@@ -6214,16 +7726,17 @@ class MusicApp(QWidget):
         # _LibraryLoadSignal) — safe to just let those go, _closing (set
         # above) stops their callbacks from touching the tearing-down UI.
         #
-        # Player-data *saves* (likes, follow_order, settings — anything via
-        # _save_player_data_async) are also daemon threads, but unlike loads
-        # they're not disposable: a daemon thread is killed outright the
-        # instant the process exits, mid-HTTP-request if that's where it is.
-        # Closing the app right after unliking something used to lose that
-        # unlike silently — it never reached the server, even though the
-        # local cache and this session's own UI already showed it gone. Give
-        # any in-flight save a brief grace period to actually finish first.
+        # Player-data *saves* (likes, playlists, follow_order, settings —
+        # anything that goes through the save queue) run on a daemon worker
+        # thread, but unlike loads they're not disposable: a daemon thread is
+        # killed outright the instant the process exits, mid-HTTP-request if
+        # that's where it is. Closing the app right after unliking something
+        # used to lose that unlike silently — it never reached the server,
+        # even though the local cache and this session's own UI already
+        # showed it gone. Give any in-flight/queued save a brief grace period
+        # to actually finish first.
         deadline = time.monotonic() + 2.0
-        while self._player_data_save_signals and time.monotonic() < deadline:
+        while self._pending_player_data_saves and time.monotonic() < deadline:
             QApplication.processEvents()
             time.sleep(0.02)
 

@@ -528,15 +528,16 @@ class PlaybackControls(QWidget):
 
         layout.addLayout(text_layout, 1)
 
-        self.like_btn = QPushButton("♡")
+        self.like_btn = QPushButton("+")
         self.like_btn.setFixedSize(28, 28)
         self.like_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.like_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.like_btn.setToolTip("Нравится")
+        self.like_btn.setToolTip("Добавить в плейлист")
         self.like_btn.setEnabled(False)
         self.like_btn.setStyleSheet(
-            f"QPushButton {{ background: transparent; border: none; color: {styles_module.COLORS['TEXT_SECONDARY']}; font-size: 16px; }}"
-            f"QPushButton:hover {{ color: {styles_module.COLORS['TEXT_PRIMARY']}; }}"
+            f"QPushButton {{ background: transparent; border: 1.5px solid {styles_module.COLORS['TEXT_SECONDARY']}; "
+            f"border-radius: 14px; color: {styles_module.COLORS['TEXT_SECONDARY']}; font-size: 14px; font-weight: 600; }}"
+            f"QPushButton:hover {{ color: {styles_module.COLORS['TEXT_PRIMARY']}; border-color: {styles_module.COLORS['TEXT_PRIMARY']}; }}"
         )
         self.like_btn.clicked.connect(self.like_clicked.emit)
         layout.addWidget(self.like_btn)
@@ -771,16 +772,16 @@ class PlaybackControls(QWidget):
         self.like_btn.setEnabled(enabled)
         c = styles_module.COLORS
         if liked:
-            self.like_btn.setText("♥")
             self.like_btn.setStyleSheet(
-                f"QPushButton {{ background: transparent; border: none; color: {c['PRIMARY']}; font-size: 16px; }}"
-                f"QPushButton:hover {{ color: {c['PRIMARY_HOVER']}; }}"
+                f"QPushButton {{ background: transparent; border: 1.5px solid {c['PRIMARY']}; border-radius: 14px; "
+                f"color: {c['PRIMARY']}; font-size: 14px; font-weight: 600; }}"
+                f"QPushButton:hover {{ color: {c['PRIMARY_HOVER']}; border-color: {c['PRIMARY_HOVER']}; }}"
             )
         else:
-            self.like_btn.setText("♡")
             self.like_btn.setStyleSheet(
-                f"QPushButton {{ background: transparent; border: none; color: {c['TEXT_SECONDARY']}; font-size: 16px; }}"
-                f"QPushButton:hover {{ color: {c['TEXT_PRIMARY']}; }}"
+                f"QPushButton {{ background: transparent; border: 1.5px solid {c['TEXT_SECONDARY']}; border-radius: 14px; "
+                f"color: {c['TEXT_SECONDARY']}; font-size: 14px; font-weight: 600; }}"
+                f"QPushButton:hover {{ color: {c['TEXT_PRIMARY']}; border-color: {c['TEXT_PRIMARY']}; }}"
             )
 
     def set_volume(self, value: int):
