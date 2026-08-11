@@ -902,7 +902,16 @@ class TrackRow(QWidget):
         return url
 
     def track_identity_keys(self) -> set:
-        return _track_like_keys(self._track)
+        # Playlists (unlike the liked-tracks page) hand this row the *live*
+        # track dict, not a display-only copy — once played, a YouTube
+        # track's url field gets overwritten in place with a resolved
+        # stream (see MusicApp._resolve_track_url_for_player), which
+        # differs every time. _track_identity_url prefers _permanent_url
+        # when present so this keeps matching _playing_url either way,
+        # whether this row's dict got mutated (playlists) or never does
+        # (the liked-tracks page's own copy, which is why this bug didn't
+        # show up there — its url simply never changes).
+        return _track_like_keys(self._track, _track_identity_url(self._track))
 
     def set_playing(self, is_playing: bool):
         """Marks this row as the current track (playing OR paused) — call
@@ -6233,6 +6242,20 @@ class MusicApp(QWidget):
                 self._on_player_data_loaded(local)
             else:
                 self._sidebar.load_account_content(liked=False, entries=[])
+            # Fetch the real, current player data right away — don't wait for
+            # the library refresh below (_on_library_loaded used to be the
+            # only place this ran). That refresh can easily take longer than
+            # the 800ms settings-sync debounce that boot's own navigation-
+            # restore triggers (_restore_ui_state -> _save_ui_state ->
+            # _schedule_settings_sync) — confirmed: that debounce fired
+            # first, using whatever was in the *local cache* (self._playlists
+            # etc. straight from _on_player_data_loaded(local) above, not
+            # yet corrected by the server), and _save_player_data_async
+            # resending that stale snapshot silently overwrote newer
+            # server-side state — e.g. a playlist cover.png that had been
+            # set after this local cache was last written just disappeared,
+            # every time, well before the "real" fetch could ever correct it.
+            self._fetch_player_data()
 
         # Step 3: Refresh library from server in background (won't block UI)
         signal = _LibraryLoadSignal(self)
@@ -6267,7 +6290,6 @@ class MusicApp(QWidget):
         # Refresh sidebar now that library is available (artists/albums can be resolved)
         if self._account_manager:
             self._update_sidebar_from_account()
-            self._fetch_player_data()
             # Retry navigation if it failed earlier because library was empty
             if self._state_restored and not self._nav_restored:
                 self._retry_nav_restore()
