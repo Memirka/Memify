@@ -6818,12 +6818,26 @@ class MusicApp(QWidget):
     def _save_player_data_async(self, updates: dict):
         if not self._account_manager:
             return
-        # Always send full current state to avoid partial overwrites on server
+        # Always send full current state to avoid partial overwrites on server.
+        # "playlists" belongs here too, not just in explicit playlist-mutation
+        # calls — _write_local_player_data below *replaces* the whole local
+        # cache file with this dict, so any save missing "playlists" (a plain
+        # settings/volume change, the listen-stats flush, ...) silently wiped
+        # it from the cache. On next launch that empty-playlists snapshot is
+        # what _on_player_data_loaded sees first (before the network re-fetch
+        # corrects it), and _update_sidebar_from_account — reading an
+        # apparently-playlist-less account at that exact moment — strips
+        # every "playlist::<id>" entry out of follow_order right then, which
+        # is what actually got persisted going forward: every reorder/drag a
+        # user ever did to a playlist's sidebar position was thrown away,
+        # and it reappeared at the bottom (freshly re-appended, newest-last)
+        # from then on.
         full = {
             "liked_tracks": self._liked_tracks,
             "subscriptions": self._subscriptions,
             "album_subscriptions": self._album_subscriptions,
             "follow_order": self._follow_order,
+            "playlists": self._playlists,
             "app_settings": {
                 k: v for k, v in self._settings.items() if k not in _LOCAL_ONLY_SETTINGS_KEYS
             },
@@ -8348,8 +8362,16 @@ class MusicApp(QWidget):
         self._sync_like_button()
         self._schedule_discord_presence_refresh(90)
         self._schedule_discord_presence_refresh(650)
-        # Highlight playing track everywhere
-        self._playing_url = track.get("url", "") or ""
+        # Highlight playing track everywhere. For a YouTube track this must
+        # be the permanent link (_track_identity_url), not track["url"] —
+        # AlbumPage.load_album takes a *copy* of each track for the liked-
+        # tracks virtual album specifically (to strip artist_name), so the
+        # in-place url/_permanent_url/_resolved_stream mutation this track
+        # dict just got (see _resolve_track_url_for_player) never reaches
+        # that row's copy; matching on the permanent link instead works
+        # regardless, since _resolve_liked_track never had anything but the
+        # permanent link to give that copy in the first place.
+        self._playing_url = _track_identity_url(track) or ""
         self._playing_track = track
         self._album_page.mark_playing_url(self._playing_url, track)
         self._album_page.set_paused(False)  # a freshly-started track is always playing, never paused
@@ -8504,7 +8526,16 @@ class MusicApp(QWidget):
         if not self._listen_stats_dirty:
             return
         self._listen_stats_dirty = False
-        self._save_player_data_async({})
+        # Deliberately NOT _save_player_data_async({}) — that resends this
+        # window's whole in-memory snapshot (liked_tracks, subscriptions,
+        # follow_order, app_settings), and since this timer fires every 20s
+        # purely from *playback continuing* (not from the user touching any
+        # of those), a snapshot that's gone stale relative to the server
+        # (e.g. a track liked from another device/session meanwhile) gets
+        # silently overwritten back out — confirmed: a like made elsewhere
+        # while this window sits open and playing gets wiped within one
+        # flush cycle. A plain per-key save only ever touches listen_stats.
+        self._enqueue_player_data_save({"listen_stats": self._listen_stats})
         self._profile_page.set_listen_stats(self._listen_stats)
 
     def _on_duration_changed(self):
@@ -8626,7 +8657,7 @@ class MusicApp(QWidget):
         # a no-op that would otherwise silently drop this save.
         if self._listen_stats_dirty:
             self._listen_stats_dirty = False
-            self._save_player_data_async({})
+            self._enqueue_player_data_save({"listen_stats": self._listen_stats})
         # Set before anything else so any QTimer/async callback still in
         # flight (library refresh, player-data fetch) bails out instead of
         # spawning a fresh background thread after teardown has started.
