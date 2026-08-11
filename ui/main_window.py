@@ -24,12 +24,13 @@ from PyQt6.QtWidgets import (
     QMenu, QFileDialog, QProgressDialog, QSpacerItem,
     QAbstractItemView, QFrame, QMessageBox, QGraphicsDropShadowEffect,
     QGraphicsScene, QGraphicsPixmapItem, QGraphicsBlurEffect,
-    QStyledItemDelegate, QStyle, QSlider, QColorDialog, QInputDialog,
+    QStyledItemDelegate, QStyle, QSlider, QColorDialog, QInputDialog, QToolTip,
 )
 from PyQt6.QtCore import (
     Qt, QTimer, QThread, QUrl, QSize, QRectF, pyqtSignal, pyqtSlot, QObject, QPoint, QPointF,
     QPropertyAnimation, pyqtProperty, QEasingCurve, QBuffer,
 )
+from datetime import date, timedelta
 from PyQt6.QtGui import QFont, QColor, QPalette, QIcon, QPixmap, QFontMetrics, QCursor, QPainter, QPainterPath, QPen, QBrush, QLinearGradient, QDesktopServices
 
 from config import SERVER_URL, APP_ICON, ICONS_DIR, APP_SETTINGS_FILE, PLAYER_DATA_CACHE_DIR, LIBRARY_CACHE_FILE, WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT, DATA_DIR, APP_VERSION, LOCAL_MUSIC_DIR
@@ -40,6 +41,11 @@ try:
     from core.account import AccountManager as _AccountManager
 except ImportError:
     _AccountManager = None
+try:
+    from core.youtube import search_youtube as _search_youtube, resolve_stream_url as _resolve_youtube_stream
+except ImportError:
+    _search_youtube = None
+    _resolve_youtube_stream = None
 from ui.playback_controls import PlaybackControls, ClickableLabel
 from ui.album_widget import AlbumWidget
 from ui.changelog_data import CHANGELOG
@@ -184,6 +190,42 @@ def _blurred_backdrop(pixmap: QPixmap, radius: float = 28.0, tint_alpha: int = 1
         return result
     except Exception:
         return pixmap
+
+
+def _make_youtube_icon_pixmap(size: int) -> QPixmap:
+    """Drawn in code (no bundled asset needed) so the search-source toggle
+    button (see MusicApp._toggle_search_source) can flip to a recognizable
+    YouTube glyph without shipping/licensing an actual logo image."""
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pm)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor("#FF0000"))
+    r = size * 0.24
+    painter.drawRoundedRect(QRectF(0, 0, size, size), r, r)
+    painter.setBrush(QColor("#FFFFFF"))
+    cx, cy = size / 2.0, size / 2.0
+    tw, th = size * 0.34, size * 0.40
+    triangle = QPainterPath()
+    triangle.moveTo(cx - tw * 0.35, cy - th / 2.0)
+    triangle.lineTo(cx - tw * 0.35, cy + th / 2.0)
+    triangle.lineTo(cx + tw * 0.65, cy)
+    triangle.closeSubpath()
+    painter.drawPath(triangle)
+    painter.end()
+    return pm
+
+
+def _track_identity_url(track: dict) -> str:
+    """The URL that identifies a track for like/collection matching. For a
+    YouTube track this must be the permanent youtube.com/watch link, not
+    track["url"] — once played, that's overwritten in-memory with a
+    resolved googlevideo.com stream (see MusicApp._resolve_track_url_for_player),
+    which is different on every play and would never match what's actually
+    stored in liked_tracks/playlists (see MusicApp._build_track_ref)."""
+    track = track or {}
+    return track.get("_permanent_url") or track.get("url", "")
 
 
 def _track_like_keys(track: dict, url: str = "") -> set:
@@ -1904,6 +1946,281 @@ class NowPlayingDiscOverlay(QWidget):
             self._disc.stop_spin()
 
 
+class _AvatarCropCanvas(QWidget):
+    """Discord-style pan & zoom picker: drag the image to reposition it,
+    slider/wheel to zoom, fixed circular frame in the center marking what
+    ends up as the avatar (it's always displayed circular — see
+    _AvatarButton). Offset/scale are clamped so the frame is always fully
+    covered by the image, never showing empty canvas."""
+
+    FRAME_SIZE = 260
+    CANVAS_SIZE = 300
+    zoom_changed = pyqtSignal(int)  # 0-100, mirrors the external zoom slider
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(self.CANVAS_SIZE, self.CANVAS_SIZE)
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self._source: QPixmap | None = None
+        self._min_scale = 1.0
+        self._scale = 1.0
+        self._offset = QPointF(0.0, 0.0)
+        self._dragging = False
+        self._drag_start = QPointF()
+        self._offset_start = QPointF()
+
+    def set_image(self, pixmap: QPixmap):
+        self._source = pixmap if pixmap and not pixmap.isNull() else None
+        if self._source:
+            w, h = self._source.width(), self._source.height()
+            self._min_scale = self.FRAME_SIZE / max(1, min(w, h))
+            self._scale = self._min_scale
+            self._offset = QPointF(0.0, 0.0)
+        self.update()
+
+    def set_zoom(self, percent: int):
+        """Driven by the external slider (0-100 -> min_scale..min_scale*4x)."""
+        if not self._source:
+            return
+        t = max(0.0, min(1.0, percent / 100.0))
+        self._scale = self._min_scale * (1.0 + 3.0 * t)
+        self._clamp_offset()
+        self.update()
+
+    def _zoom_percent(self) -> int:
+        max_scale = self._min_scale * 4.0
+        if max_scale <= self._min_scale:
+            return 0
+        t = (self._scale - self._min_scale) / (max_scale - self._min_scale)
+        return int(round(max(0.0, min(1.0, t)) * 100))
+
+    def _clamp_offset(self):
+        if not self._source:
+            return
+        img_w = self._source.width() * self._scale
+        img_h = self._source.height() * self._scale
+        max_x = max(0.0, (img_w - self.FRAME_SIZE) / 2.0)
+        max_y = max(0.0, (img_h - self.FRAME_SIZE) / 2.0)
+        self._offset = QPointF(
+            min(max_x, max(-max_x, self._offset.x())),
+            min(max_y, max(-max_y, self._offset.y())),
+        )
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), QColor(24, 24, 24))
+
+        if self._source:
+            c = self.CANVAS_SIZE / 2.0
+            img_w = self._source.width() * self._scale
+            img_h = self._source.height() * self._scale
+            x = c - img_w / 2.0 + self._offset.x()
+            y = c - img_h / 2.0 + self._offset.y()
+            painter.drawPixmap(QRectF(x, y, img_w, img_h), self._source, QRectF(self._source.rect()))
+
+        outer = QPainterPath()
+        outer.addRect(QRectF(self.rect()))
+        fx = (self.CANVAS_SIZE - self.FRAME_SIZE) / 2.0
+        inner = QPainterPath()
+        inner.addEllipse(QRectF(fx, fx, self.FRAME_SIZE, self.FRAME_SIZE))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 165))
+        painter.drawPath(outer.subtracted(inner))
+
+        painter.setPen(QPen(QColor(255, 255, 255, 220), 2))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(QRectF(fx, fx, self.FRAME_SIZE, self.FRAME_SIZE))
+        painter.end()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._source:
+            self._dragging = True
+            self._drag_start = event.position()
+            self._offset_start = QPointF(self._offset)
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+
+    def mouseMoveEvent(self, event):
+        if self._dragging:
+            delta = event.position() - self._drag_start
+            self._offset = QPointF(self._offset_start.x() + delta.x(), self._offset_start.y() + delta.y())
+            self._clamp_offset()
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        self._dragging = False
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+
+    def wheelEvent(self, event):
+        if not self._source:
+            return
+        factor = 1.08 if event.angleDelta().y() > 0 else (1.0 / 1.08)
+        max_scale = self._min_scale * 4.0
+        self._scale = min(max_scale, max(self._min_scale, self._scale * factor))
+        self._clamp_offset()
+        self.update()
+        self.zoom_changed.emit(self._zoom_percent())
+
+    def get_cropped_pixmap(self, output_size: int = 512) -> QPixmap:
+        if not self._source:
+            return QPixmap()
+        c = self.CANVAS_SIZE / 2.0
+        img_x = c - (self._source.width() * self._scale) / 2.0 + self._offset.x()
+        img_y = c - (self._source.height() * self._scale) / 2.0 + self._offset.y()
+        fx = (self.CANVAS_SIZE - self.FRAME_SIZE) / 2.0
+        src_x = (fx - img_x) / self._scale
+        src_y = (fx - img_y) / self._scale
+        src_size = self.FRAME_SIZE / self._scale
+        src_rect = QRectF(src_x, src_y, src_size, src_size).intersected(QRectF(self._source.rect()))
+        cropped = self._source.copy(src_rect.toRect())
+        if cropped.isNull():
+            return QPixmap()
+        return cropped.scaled(
+            output_size, output_size,
+            Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation,
+        )
+
+
+class AvatarCropOverlay(QWidget):
+    """Full-window overlay (same look/pattern as CoverViewerOverlay) for
+    picking which region of a just-chosen image becomes the avatar, instead
+    of always silently center-cropping it."""
+
+    avatar_confirmed = pyqtSignal(QPixmap)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._backdrop_pixmap: QPixmap | None = None
+        self.hide()
+        self._build_ui()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        if self._backdrop_pixmap and not self._backdrop_pixmap.isNull():
+            painter.drawPixmap(self.rect(), self._backdrop_pixmap)
+        else:
+            painter.fillRect(self.rect(), QColor(10, 10, 12, 210))
+        painter.end()
+        super().paintEvent(event)
+
+    def _build_ui(self):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 20, 24, 0)
+
+        close_row = QHBoxLayout()
+        close_row.addStretch(1)
+        close_btn = QPushButton("✕")
+        close_btn.setFixedSize(36, 36)
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.setStyleSheet(
+            "QPushButton { background: rgba(255,255,255,0.08); border: none; border-radius: 18px; "
+            "color: #FFFFFF; font-size: 15px; }"
+            "QPushButton:hover { background: rgba(255,255,255,0.18); }"
+        )
+        close_btn.clicked.connect(self._cancel)
+        close_row.addWidget(close_btn)
+        outer.addLayout(close_row)
+
+        outer.addStretch(1)
+
+        center = QVBoxLayout()
+        center.setSpacing(16)
+
+        title = QLabel("Выберите область для аватара")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title.setStyleSheet("color: #FFFFFF; font: 600 12pt 'Segoe UI'; background: transparent;")
+        center.addWidget(title)
+
+        self._canvas = _AvatarCropCanvas()
+        self._canvas.zoom_changed.connect(self._sync_zoom_slider)
+        center.addWidget(self._canvas, 0, Qt.AlignmentFlag.AlignHCenter)
+
+        zoom_wrap = QWidget()
+        zoom_wrap.setStyleSheet("background: transparent;")
+        zoom_row = QHBoxLayout(zoom_wrap)
+        zoom_row.setContentsMargins(0, 0, 0, 0)
+        zoom_row.setSpacing(10)
+        zoom_lbl = QLabel("🔍")
+        zoom_lbl.setStyleSheet("background: transparent; font-size: 11pt;")
+        zoom_row.addWidget(zoom_lbl)
+        self._zoom_slider = QSlider(Qt.Orientation.Horizontal)
+        self._zoom_slider.setRange(0, 100)
+        self._zoom_slider.setValue(0)
+        self._zoom_slider.setFixedWidth(220)
+        self._zoom_slider.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._zoom_slider.valueChanged.connect(self._canvas.set_zoom)
+        zoom_row.addWidget(self._zoom_slider)
+        center.addWidget(zoom_wrap, 0, Qt.AlignmentFlag.AlignHCenter)
+
+        btn_wrap = QWidget()
+        btn_wrap.setStyleSheet("background: transparent;")
+        btn_row = QHBoxLayout(btn_wrap)
+        btn_row.setContentsMargins(0, 0, 0, 0)
+        btn_row.setSpacing(12)
+        cancel_btn = QPushButton("Отмена")
+        cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        cancel_btn.setFixedHeight(38)
+        cancel_btn.setStyleSheet(
+            "QPushButton { background: rgba(255,255,255,0.08); border: none; border-radius: 19px; "
+            "color: #FFFFFF; font: 600 10.5pt 'Segoe UI'; padding: 0 22px; }"
+            "QPushButton:hover { background: rgba(255,255,255,0.18); }"
+        )
+        cancel_btn.clicked.connect(self._cancel)
+        btn_row.addWidget(cancel_btn)
+
+        self._save_btn = QPushButton("Сохранить")
+        self._save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._save_btn.setFixedHeight(38)
+        self._save_btn.clicked.connect(self._confirm)
+        btn_row.addWidget(self._save_btn)
+        center.addWidget(btn_wrap, 0, Qt.AlignmentFlag.AlignHCenter)
+
+        outer.addLayout(center)
+        outer.addStretch(2)
+        self.apply_accent()
+
+    def apply_accent(self):
+        c = COLORS
+        self._save_btn.setStyleSheet(
+            f"QPushButton {{ background: {c['PRIMARY_GRADIENT']}; border: none; border-radius: 19px; "
+            f"color: #000; font: 600 10.5pt 'Segoe UI'; padding: 0 22px; }}"
+            f"QPushButton:hover {{ background: {c['PRIMARY_HOVER']}; }}"
+        )
+
+    def _sync_zoom_slider(self, value: int):
+        self._zoom_slider.blockSignals(True)
+        self._zoom_slider.setValue(value)
+        self._zoom_slider.blockSignals(False)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self._cancel()
+            return
+        super().keyPressEvent(event)
+
+    def show_for(self, pixmap: QPixmap):
+        self._canvas.set_image(pixmap)
+        self._sync_zoom_slider(0)
+        if self.parent():
+            self.setGeometry(self.parent().rect())
+            snapshot = self.parent().grab()
+            self._backdrop_pixmap = _blurred_backdrop(snapshot)
+        self.raise_()
+        self.show()
+        self.setFocus()
+        self.update()
+
+    def _cancel(self):
+        self.hide()
+
+    def _confirm(self):
+        cropped = self._canvas.get_cropped_pixmap(512)
+        self.hide()
+        if not cropped.isNull():
+            self.avatar_confirmed.emit(cropped)
+
+
 class _LoadingSpinner(QWidget):
     """Small rotating arc spinner for inline loading states."""
 
@@ -2019,7 +2336,16 @@ class SearchPage(QWidget):
         self._results = results
         self._rebuild_list()
 
-    def _rebuild_list(self):
+    def show_message(self, text: str):
+        """Empty-results state with a specific reason (e.g. a YouTube search
+        failure) instead of the generic "Ничего не найдено" — update_results([])
+        can't tell "nothing matched" apart from "the search itself broke",
+        which made the latter impossible to diagnose from a windowed app."""
+        self.set_loading(False)
+        self._results = []
+        self._rebuild_list(empty_text=text)
+
+    def _rebuild_list(self, empty_text: str = "Ничего не найдено"):
         _stop_runners(self._runners)
         self._track_title_labels.clear()
         while self._results_layout.count() > 1:
@@ -2030,14 +2356,15 @@ class SearchPage(QWidget):
         self._scroll.verticalScrollBar().setValue(0)
 
         if not self._results:
-            self._count_label.setText("Ничего не найдено")
+            self._count_label.setText(empty_text)
             return
 
         artists   = [r for r in self._results if r.type == "artist"][:4]
         albums    = [r for r in self._results if r.type == "album"][:6]
         playlists = [r for r in self._results if r.type == "playlist"][:10]
         tracks    = [r for r in self._results if r.type == "track"][:10]
-        total = len(artists) + len(albums) + len(playlists) + len(tracks)
+        youtube   = [r for r in self._results if r.type == "youtube"][:15]
+        total = len(artists) + len(albums) + len(playlists) + len(tracks) + len(youtube)
         self._count_label.setText(f"Найдено: {total}")
 
         insert_pos = 0
@@ -2058,6 +2385,9 @@ class SearchPage(QWidget):
 
         if tracks:
             _insert(self._make_grid_section("Треки", [self._make_track_row(r) for r in tracks]))
+
+        if youtube:
+            _insert(self._make_grid_section("YouTube", [self._make_youtube_row(r) for r in youtube]))
 
     def _make_grid_section(self, title: str, row_widgets: list) -> QWidget:
         """Section header + rows laid out two-per-row (row-major), so N
@@ -2256,6 +2586,46 @@ class SearchPage(QWidget):
         row.mousePressEvent = on_click
         return row
 
+    def _make_youtube_row(self, result: SearchResult) -> QWidget:
+        row = QWidget()
+        row.setCursor(Qt.CursorShape.PointingHandCursor)
+        row.setObjectName("srRow")
+        row.setStyleSheet(
+            "QWidget#srRow { background: transparent; border-radius: 8px; }"
+            f"QWidget#srRow:hover {{ background-color: {COLORS['SURFACE_LIGHT']}; }}"
+        )
+        lay = QHBoxLayout(row)
+        lay.setContentsMargins(8, 6, 8, 6)
+        lay.setSpacing(14)
+
+        yt = result.youtube_obj or {}
+
+        thumb = QLabel()
+        thumb.setFixedSize(48, 48)
+        thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        thumb.setStyleSheet(f"background: {COLORS['COVER_BG']}; border-radius: 6px;")
+        self._load_cover_into(yt.get("thumbnail", ""), thumb, 48, 6)
+        lay.addWidget(thumb)
+
+        txt = QVBoxLayout()
+        txt.setSpacing(2)
+        txt.setContentsMargins(0, 0, 0, 0)
+        title_lbl = QLabel(yt.get("title") or "")
+        title_lbl.setStyleSheet(f"color: {COLORS['TEXT_PRIMARY']}; font: 10pt 'Segoe UI';")
+        title_lbl.setWordWrap(False)
+        txt.addWidget(title_lbl)
+        duration_txt = format_duration(int(yt.get("duration") or 0) * 1000)
+        sub_lbl = QLabel(f"{yt.get('uploader') or 'YouTube'} • {duration_txt}")
+        sub_lbl.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']}; font: 9pt 'Segoe UI';")
+        txt.addWidget(sub_lbl)
+        lay.addLayout(txt, 1)
+
+        def on_click(event, r=result):
+            if event.button() == Qt.MouseButton.LeftButton:
+                self.result_selected.emit(r)
+        row.mousePressEvent = on_click
+        return row
+
     def _make_result_row(self, result: SearchResult) -> QWidget:
         if result.type == "artist":
             return self._make_artist_row(result)
@@ -2263,6 +2633,8 @@ class SearchPage(QWidget):
             return self._make_album_row(result)
         if result.type == "playlist":
             return self._make_search_playlist_row(result)
+        if result.type == "youtube":
+            return self._make_youtube_row(result)
         return self._make_track_row(result)
 
     def refresh_playing(self, url: str, track: dict | None = None):
@@ -4665,6 +5037,14 @@ class _UserSearchSignal(QObject):
     finished = pyqtSignal(int, list)
 
 
+class _YoutubeSearchSignal(QObject):
+    finished = pyqtSignal(int, list, str)  # (generation, results, error message — "" on success)
+
+
+class _YoutubeStreamSignal(QObject):
+    finished = pyqtSignal(str, str, str)  # (webpage_url, resolved_stream_url, error message)
+
+
 class _UserProfileSignal(QObject):
     finished = pyqtSignal(dict)
 
@@ -4743,6 +5123,117 @@ def _menu_style() -> str:
         f"QMenu::separator {{ height: 1px; background: {c['BORDER']}; margin: 4px 8px; }}"
         f"QMenu::icon {{ padding-left: 4px; }}"
     )
+
+
+_RU_MONTHS_SHORT = ["Янв", "Фев", "Мар", "Апр", "Май", "Июн", "Июл", "Авг", "Сен", "Окт", "Ноя", "Дек"]
+
+
+class _ListenHeatmap(QWidget):
+    """GitHub-contributions-style calendar: one column per week (Monday-start),
+    one row per weekday, cell shade = hours actually played that day.
+
+    `_stats` maps "YYYY-MM-DD" -> seconds played, mirroring MainWindow's
+    listen_stats (see _accumulate_listen_time)."""
+
+    CELL = 11
+    GAP = 3
+    ROWS = 7
+    WEEKS = 53
+    _LABEL_GUTTER = 24
+    _TOP_GUTTER = 16
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._stats: dict = {}
+        self._cells: list = []  # [(QRectF, date, seconds), ...] for hit-testing
+        self.setMouseTracking(True)
+        self.setStyleSheet("background: transparent;")
+        w = self._LABEL_GUTTER + self.WEEKS * (self.CELL + self.GAP)
+        h = self._TOP_GUTTER + self.ROWS * (self.CELL + self.GAP)
+        self.setFixedSize(w, h)
+
+    def set_stats(self, stats: dict):
+        parsed = {}
+        for k, v in (stats or {}).items():
+            try:
+                parsed[k] = float(v or 0)
+            except Exception:
+                continue
+        self._stats = parsed
+        self.update()
+
+    def _level_color(self, seconds: float) -> QColor:
+        hours = seconds / 3600.0
+        empty = QColor(COLORS["SURFACE_LIGHT"])
+        if hours <= 0:
+            return empty
+        base = QColor(COLORS["PRIMARY"])
+        if hours < 0.5:
+            t = 0.30
+        elif hours < 1.5:
+            t = 0.55
+        elif hours < 3:
+            t = 0.78
+        else:
+            t = 1.0
+        return QColor(
+            int(empty.red() + (base.red() - empty.red()) * t),
+            int(empty.green() + (base.green() - empty.green()) * t),
+            int(empty.blue() + (base.blue() - empty.blue()) * t),
+        )
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        today = date.today()
+        end_monday = today - timedelta(days=today.weekday())
+        start_monday = end_monday - timedelta(weeks=self.WEEKS - 1)
+
+        painter.setPen(QColor(COLORS["TEXT_SECONDARY"]))
+        painter.setFont(QFont("Segoe UI", 8))
+        last_month = None
+        for col in range(self.WEEKS):
+            week_monday = start_monday + timedelta(weeks=col)
+            if week_monday.day <= 7 and week_monday.month != last_month:
+                last_month = week_monday.month
+                x = self._LABEL_GUTTER + col * (self.CELL + self.GAP)
+                painter.drawText(x, self._TOP_GUTTER - 4, _RU_MONTHS_SHORT[week_monday.month - 1])
+
+        for row, text in ((0, "Пн"), (5, "Сб")):
+            y = self._TOP_GUTTER + row * (self.CELL + self.GAP) + self.CELL
+            painter.drawText(0, y, text)
+
+        self._cells = []
+        painter.setPen(Qt.PenStyle.NoPen)
+        for col in range(self.WEEKS):
+            for row in range(self.ROWS):
+                d = start_monday + timedelta(weeks=col, days=row)
+                if d > today:
+                    continue
+                seconds = self._stats.get(d.isoformat(), 0.0)
+                x = self._LABEL_GUTTER + col * (self.CELL + self.GAP)
+                y = self._TOP_GUTTER + row * (self.CELL + self.GAP)
+                rect = QRectF(x, y, self.CELL, self.CELL)
+                painter.setBrush(self._level_color(seconds))
+                painter.drawRoundedRect(rect, 2, 2)
+                self._cells.append((rect, d, seconds))
+
+    def mouseMoveEvent(self, event):
+        pos = event.position()
+        for rect, d, seconds in self._cells:
+            if rect.contains(pos):
+                hours = seconds / 3600.0
+                if seconds > 0:
+                    txt = f"{d.strftime('%d.%m.%Y')} — {hours:.1f} ч"
+                else:
+                    txt = f"{d.strftime('%d.%m.%Y')} — нет прослушиваний"
+                QToolTip.showText(event.globalPosition().toPoint(), txt, self)
+                return
+        QToolTip.hideText()
+
+    def leaveEvent(self, event):
+        QToolTip.hideText()
 
 
 class ProfilePage(QWidget):
@@ -4836,6 +5327,28 @@ class ProfilePage(QWidget):
         id_row.addLayout(fields_col, 1)
         card.addLayout(id_row)
 
+        # ── Listening activity heatmap ──────────────────────────────────
+        activity_card = _card_widget(layout)
+        activity_card.addWidget(_card_section_label("Активность прослушивания"))
+
+        self._heatmap = _ListenHeatmap()
+        heatmap_scroll = QScrollArea()
+        heatmap_scroll.setWidgetResizable(False)
+        heatmap_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        heatmap_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        heatmap_scroll.setFixedHeight(self._heatmap.height() + 4)
+        heatmap_scroll.setStyleSheet(
+            get_scrollbar_style()
+            + "QScrollArea { background: transparent; border: none; }"
+            + "QScrollArea > QWidget > QWidget { background: transparent; }"
+        )
+        heatmap_scroll.setWidget(self._heatmap)
+        activity_card.addWidget(heatmap_scroll)
+
+        self._heatmap_caption = QLabel("")
+        self._heatmap_caption.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']}; font: 9pt 'Segoe UI';")
+        activity_card.addWidget(self._heatmap_caption)
+
         # ── Playlists card ──────────────────────────────────────────────
         playlists_card = _card_widget(layout)
         playlists_hdr_row = QHBoxLayout()
@@ -4912,6 +5425,25 @@ class ProfilePage(QWidget):
 
     def apply_accent(self):
         self._avatar_btn.apply_accent()
+        self._heatmap.update()
+
+    def set_listen_stats(self, stats: dict):
+        self._heatmap.set_stats(stats)
+        cutoff = date.today() - timedelta(days=364)
+        total_seconds = 0.0
+        for k, v in (stats or {}).items():
+            try:
+                d = date.fromisoformat(k)
+            except Exception:
+                continue
+            if d < cutoff:
+                continue
+            try:
+                total_seconds += float(v or 0)
+            except Exception:
+                pass
+        total_hours = total_seconds / 3600.0
+        self._heatmap_caption.setText(f"{total_hours:.1f} ч прослушано за последние 365 дней")
 
     def set_playlists(self, playlists: list):
         for row in self._playlist_rows:
@@ -5214,6 +5746,14 @@ class MusicApp(QWidget):
         self._player_data_load_signals: list = []
         self._user_search_signals: list = []
         self._user_profile_signals: list = []
+        self._youtube_search_signals: list = []
+        self._youtube_stream_signals: list = []
+        # id(track) -> [continue_playback, ...] queued while a resolve for
+        # that exact track is already in flight — de-dupes the network call
+        # when play_track lands on the same still-unresolved YouTube track
+        # twice in quick succession (e.g. a manual click racing an
+        # auto-advance onto it), see _resolve_track_url_for_player.
+        self._youtube_resolve_pending: dict = {}
         # Player-data *saves* (likes, playlists, follow_order, settings...)
         # all funnel through one queue processed by a single worker thread —
         # serialized, so two saves fired close together can never complete
@@ -5234,6 +5774,17 @@ class MusicApp(QWidget):
         self._playing_track: dict | None = None
         self._player_warmed_up = False
         self._settings_sync_timer: QTimer | None = None
+        # Daily listening-time heatmap (ProfilePage) — "YYYY-MM-DD" -> seconds
+        # actually played that day, accumulated from real playback ticks (see
+        # _accumulate_listen_time), flushed to the account periodically (see
+        # _listen_stats_flush_timer) rather than on every tick.
+        self._listen_stats: dict = {}
+        self._listen_stats_dirty = False
+        self._listen_last_tick: float | None = None
+        self._listen_stats_flush_timer = QTimer(self)
+        self._listen_stats_flush_timer.setInterval(20000)
+        self._listen_stats_flush_timer.timeout.connect(self._flush_listen_stats)
+        self._listen_stats_flush_timer.start()
 
         self._load_settings()
         self._setup_ui()
@@ -5415,6 +5966,8 @@ class MusicApp(QWidget):
         # Full-window cover viewer overlay (parented to self so it covers everything)
         self._cover_viewer = CoverViewerOverlay(self)
         self._disc_overlay = NowPlayingDiscOverlay(self)
+        self._avatar_crop_overlay = AvatarCropOverlay(self)
+        self._avatar_crop_overlay.avatar_confirmed.connect(self._on_avatar_cropped)
 
         # Playback controls
         self._controls = PlaybackControls(self)
@@ -5556,6 +6109,29 @@ class MusicApp(QWidget):
         self._search_timer.timeout.connect(self._perform_search)
         self._search_bar.textChanged.connect(self._on_search_text_changed)
         sw_layout.addWidget(self._search_bar, 1)
+
+        # Search-source toggle: app icon (library search, default) <-> drawn
+        # YouTube glyph (see _make_youtube_icon_pixmap) — click flips
+        # _search_source and re-runs the current query (_toggle_search_source).
+        self._search_source = "library"
+        self._search_source_icon_app = (
+            QIcon(APP_ICON).pixmap(26, 26) if APP_ICON and os.path.exists(APP_ICON) else QPixmap()
+        )
+        self._search_source_icon_youtube = _make_youtube_icon_pixmap(26)
+        self._search_source_btn = QPushButton()
+        self._search_source_btn.setFixedSize(26, 26)
+        self._search_source_btn.setIconSize(QSize(26, 26))
+        self._search_source_btn.setIcon(QIcon(self._search_source_icon_app))
+        self._search_source_btn.setFlat(True)
+        self._search_source_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._search_source_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._search_source_btn.setToolTip("Искать на YouTube")
+        self._search_source_btn.setStyleSheet(
+            "QPushButton { background: transparent; border: none; border-radius: 13px; }"
+            f"QPushButton:hover {{ background: {COLORS['SURFACE_HOVER']}; }}"
+        )
+        self._search_source_btn.clicked.connect(self._toggle_search_source)
+        sw_layout.addWidget(self._search_source_btn)
 
         # ── Right panel: settings right-aligned (stretch=1) ────────────────────
         right_panel = QWidget()
@@ -5735,12 +6311,28 @@ class MusicApp(QWidget):
         self._subscriptions = data.get("subscriptions", []) or []
         self._album_subscriptions = data.get("album_subscriptions", []) or []
         self._follow_order = data.get("follow_order", []) or []
+        # Max-per-day merge, not overwrite: this fires once for the local
+        # cache and again for the network fetch, and either can be behind
+        # today's not-yet-flushed local accumulation (see
+        # _accumulate_listen_time) — seconds only ever grow within a day.
+        incoming_listen_stats = data.get("listen_stats") or {}
+        if isinstance(incoming_listen_stats, dict):
+            merged_listen_stats = dict(self._listen_stats)
+            for day, seconds in incoming_listen_stats.items():
+                try:
+                    seconds = float(seconds or 0)
+                except Exception:
+                    continue
+                if seconds > merged_listen_stats.get(day, 0.0):
+                    merged_listen_stats[day] = seconds
+            self._listen_stats = merged_listen_stats
         self._apply_synced_settings(data.get("app_settings") or {})
         self._display_name = data.get("display_name") or ""
         self._account_id = data.get("account_id") or ""
         self._apply_own_identity()
         self._apply_own_avatar(data.get("avatar_data"))
         self._profile_page.set_playlists(self._playlists)
+        self._profile_page.set_listen_stats(self._listen_stats)
         self._update_sidebar_from_account()
         self._after_track_collections_changed()
         if not self._state_restored:
@@ -5808,10 +6400,15 @@ class MusicApp(QWidget):
         if pm.isNull():
             QMessageBox.warning(self, "Аватар", "Не удалось загрузить это изображение.")
             return
-        # Center-cropped square at a moderate resolution — circular clipping
-        # happens at display time (see _AvatarButton), so the stored image
-        # just needs to be square, not already round.
-        square = make_rounded_pixmap(pm, 256, 0)
+        # Let the user pick which region becomes the avatar (Discord-style
+        # pan/zoom inside a circular frame) instead of silently center-cropping.
+        self._avatar_crop_overlay.show_for(pm)
+
+    def _on_avatar_cropped(self, cropped: QPixmap):
+        # Already square from AvatarCropOverlay — make_rounded_pixmap here
+        # just normalizes to the stored resolution (radius 0: circular
+        # clipping happens at display time, see _AvatarButton).
+        square = make_rounded_pixmap(cropped, 256, 0)
 
         buf = QBuffer()
         buf.open(QBuffer.OpenModeFlag.WriteOnly)
@@ -5972,6 +6569,9 @@ class MusicApp(QWidget):
                 "_real_album_title": last_played.get("album_title", ""),
                 "album_id": last_played.get("album_id", ""),
             }
+            if last_played.get("_is_youtube"):
+                track["_is_youtube"] = True
+                track["_youtube_channel_url"] = last_played.get("_youtube_channel_url", "")
             artist = {"artist": last_played.get("artist_name", "")}
             album = {
                 "title": last_played.get("album_title", ""),
@@ -6016,6 +6616,9 @@ class MusicApp(QWidget):
         """Load the real album/track (found via the library) into the player
         without starting playback, so pressing the bottom-bar play button
         actually resumes the last-played track instead of doing nothing."""
+        if last_played.get("_is_youtube"):
+            self._prime_youtube_resume(last_played)
+            return
         artist_name = last_played.get("artist_name", "")
         album_title = last_played.get("album_title", "")
         track_title = last_played.get("title", "")
@@ -6049,6 +6652,34 @@ class MusicApp(QWidget):
             pos = idx
         self.player.current_track = pos
         self.player.current_track_idx = idx
+
+    def _prime_youtube_resume(self, last_played: dict):
+        """_prime_player_for_resume's counterpart for a YouTube track — no
+        library lookup possible (or needed): rebuilds the same permanent-
+        link single-track virtual album/track/artist _play_youtube_result
+        builds from a fresh search result, from the saved youtube_url.
+        Playback doesn't start here either; pressing play resolves a fresh
+        stream at that point, same as picking it from search would."""
+        webpage_url = last_played.get("youtube_url", "")
+        track_title = last_played.get("title", "")
+        if not webpage_url or not track_title:
+            return
+        artist_name = last_played.get("artist_name", "") or "YouTube"
+        channel_url = last_played.get("_youtube_channel_url", "")
+        track = {
+            "title": track_title, "url": webpage_url, "artist_name": artist_name,
+            "_is_youtube": True, "_youtube_channel_url": channel_url,
+            "_youtube_thumbnail": last_played.get("album_cover", ""),
+        }
+        artist = {"artist": artist_name, "_is_youtube": True, "_youtube_channel_url": channel_url}
+        album = {
+            "title": last_played.get("album_title", "") or track_title,
+            "cover": last_played.get("album_cover", ""),
+            "tracks": [track], "_is_youtube": True,
+        }
+        self.player.set_album(album, artist)
+        self.player.current_track = 0
+        self.player.current_track_idx = 0
 
     def _retry_nav_restore(self):
         """Retry page navigation after library loaded from network (first attempt failed with empty library)."""
@@ -6196,6 +6827,7 @@ class MusicApp(QWidget):
             "app_settings": {
                 k: v for k, v in self._settings.items() if k not in _LOCAL_ONLY_SETTINGS_KEYS
             },
+            "listen_stats": self._listen_stats,
         }
         full.update(updates)
         # Write to local cache immediately so next startup sees it right away
@@ -6213,6 +6845,7 @@ class MusicApp(QWidget):
             duration_changed=self._on_duration_changed,
             album_finished=self._on_album_finished,
             album_previous=self._on_album_previous,
+            resolve_track_url=self._resolve_track_url_for_player,
         )
         saved_vol = self._settings.get("volume", 80)
         self.player.set_volume(saved_vol)
@@ -6298,6 +6931,19 @@ class MusicApp(QWidget):
             if self._page_stack.currentWidget() == self._search_page:
                 self._go_home()
 
+    def _toggle_search_source(self):
+        self._search_source = "youtube" if self._search_source == "library" else "library"
+        is_yt = self._search_source == "youtube"
+        self._search_source_btn.setIcon(
+            QIcon(self._search_source_icon_youtube if is_yt else self._search_source_icon_app)
+        )
+        self._search_source_btn.setToolTip("Искать в библиотеке Memify" if is_yt else "Искать на YouTube")
+        self._search_bar.setPlaceholderText(
+            "Поиск на YouTube..." if is_yt else "Поиск исполнителей, альбомов, треков..."
+        )
+        if self._search_bar.text().strip():
+            self._perform_search()
+
     def _perform_search(self):
         query = self._search_bar.text().strip()
         if not query:
@@ -6308,8 +6954,50 @@ class MusicApp(QWidget):
             self._prev_page_before_search = self._page_stack.currentWidget()
         self._page_stack.setCurrentWidget(self._search_page)
         self._search_page.set_loading(True)
-        if self._search_worker:
+        if self._search_source == "youtube":
+            self._perform_youtube_search(query, self._search_generation)
+        elif self._search_worker:
             self._search_worker.request.emit(query, self._search_generation)
+
+    def _perform_youtube_search(self, query: str, generation: int):
+        if not _search_youtube:
+            self._search_page.show_message(
+                "Поиск по YouTube недоступен: не установлен модуль yt-dlp."
+            )
+            return
+
+        signal = _YoutubeSearchSignal(self)
+        self._youtube_search_signals.append(signal)
+
+        def _cleanup(s=signal):
+            try:
+                self._youtube_search_signals.remove(s)
+            except ValueError:
+                pass
+
+        def _on_results(gen, items, error):
+            if gen != self._search_generation:
+                return
+            if error:
+                self._search_page.show_message(f"Ошибка поиска на YouTube: {error}")
+                return
+            results = [SearchResult("youtube", "", youtube_obj=item) for item in items]
+            self._search_page.update_results(results)
+
+        signal.finished.connect(_on_results)
+        signal.finished.connect(_cleanup)
+
+        def _worker():
+            items: list = []
+            error = ""
+            try:
+                items = _search_youtube(query, limit=15)
+            except Exception as ex:
+                error = str(ex) or ex.__class__.__name__
+                print(f"YouTube search failed: {ex}")
+            signal.finished.emit(generation, items, error)
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _on_search_results(self, results: list, generation: int):
         if generation != self._search_generation:
@@ -6387,6 +7075,112 @@ class MusicApp(QWidget):
                 self._open_playlist(result.playlist_obj.get("id", ""))
             else:
                 self._on_playlist_subscription_clicked(result.playlist_obj)
+        elif result.type == "youtube" and result.youtube_obj:
+            self._play_youtube_result(result.youtube_obj)
+            # self._search_bar.clear() above already fired _go_home() (it
+            # always does when leaving the search page with an empty query)
+            # — for every other branch something afterward lands on a real
+            # page (an artist/album/playlist page), but a YouTube pick has
+            # no page of its own, so _go_home()'s guess (an arbitrary/stale
+            # self._current_artist, once even landing on a blank, never-
+            # loaded ArtistPage) was left standing. Just go back to whatever
+            # was showing before the search started instead.
+            self._page_stack.setCurrentWidget(self._prev_page_before_search or self._welcome_page)
+
+    def _play_youtube_result(self, yt: dict):
+        """A picked search result becomes a track whose "url" is the
+        permanent youtube.com/watch?v=... link — never the resolved
+        googlevideo.com stream, which expires in a few hours. That permanent
+        link is what ends up in liked_tracks/playlists if this track gets
+        saved (see _build_track_ref); _play_track below is what actually
+        resolves a fresh stream right before playback."""
+        channel_url = yt.get("channel_url", "")
+        track = {
+            "title": yt.get("title", ""), "url": yt.get("webpage_url", ""),
+            "artist_name": yt.get("uploader", ""), "_is_youtube": True,
+            "_youtube_thumbnail": yt.get("thumbnail", ""), "_youtube_channel_url": channel_url,
+        }
+        artist = {"artist": yt.get("uploader", "") or "YouTube", "_is_youtube": True, "_youtube_channel_url": channel_url}
+        album = {
+            "title": yt.get("title", ""), "cover": yt.get("thumbnail", ""),
+            "tracks": [track], "_is_youtube": True,
+        }
+        self._play_track(0, album, artist)
+
+    def _resolve_track_url_for_player(self, track: dict, continue_playback):
+        """PlayerController's resolve_track_url hook (see set_callbacks
+        below) — called before *every* play_track, whichever path reached
+        it: a direct click, but also play_next/play_prev/repeat firing
+        mid-queue when auto-advancing onto a YouTube track. That's what
+        makes a YouTube track mixed in with regular ones "just work" instead
+        of only working when clicked directly.
+
+        Non-YouTube tracks (the overwhelming majority of calls) and already-
+        resolved YouTube tracks continue synchronously with no extra delay.
+        A YouTube track still holding its permanent watch link gets resolved
+        to a stream URL in the background and mutated in place (url,
+        _permanent_url, _resolved_stream) — same dict instance the player's
+        album/tracks list already holds, so no album/track-list rebuilding
+        is needed and sibling tracks are untouched."""
+        if not track.get("_is_youtube") or track.get("_resolved_stream"):
+            continue_playback(track.get("url", ""))
+            return
+        webpage_url = track.get("url", "")
+        if not webpage_url or not _resolve_youtube_stream:
+            continue_playback("")
+            return
+
+        # De-dupe: play_track can land on this exact still-unresolved track
+        # twice before the first resolve finishes (a manual click racing an
+        # auto-advance, or rapid skip-skip-back) — queue onto the resolve
+        # already in flight instead of firing a second redundant one.
+        key = id(track)
+        pending = self._youtube_resolve_pending.get(key)
+        if pending is not None:
+            pending.append(continue_playback)
+            return
+        self._youtube_resolve_pending[key] = [continue_playback]
+
+        self.setCursor(Qt.CursorShape.BusyCursor)
+
+        signal = _YoutubeStreamSignal(self)
+        self._youtube_stream_signals.append(signal)
+
+        def _cleanup(s=signal):
+            try:
+                self._youtube_stream_signals.remove(s)
+            except ValueError:
+                pass
+
+        def _on_resolved(_url, stream_url, error):
+            self.unsetCursor()
+            callbacks = self._youtube_resolve_pending.pop(key, [continue_playback])
+            if not stream_url:
+                detail = f"\n\n{error}" if error else ""
+                QMessageBox.warning(self, "YouTube", f"Не удалось получить поток для этого видео.{detail}")
+                for cb in callbacks:
+                    cb("")
+                return
+            track["url"] = stream_url
+            track["_permanent_url"] = webpage_url
+            track["_resolved_stream"] = True
+            for cb in callbacks:
+                cb(stream_url)
+
+        signal.finished.connect(_on_resolved)
+        signal.finished.connect(_cleanup)
+
+        def _worker():
+            stream_url = ""
+            error = ""
+            try:
+                stream_url = _resolve_youtube_stream(webpage_url) or ""
+            except Exception as ex:
+                error = str(ex) or ex.__class__.__name__
+                print(f"YouTube stream resolve failed: {ex}")
+            signal.finished.emit(webpage_url, stream_url, error)
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     # ── Navigation ────────────────────────────────────────────────────────────
 
@@ -6542,6 +7336,20 @@ class MusicApp(QWidget):
         url = lt.get("url", "")
         artist_name = lt.get("artist_name", "")
         album_title = lt.get("album_title", "")
+        if lt.get("_is_youtube"):
+            # Never in the library — url is the permanent youtube.com/watch
+            # link (see _build_track_ref), resolved to a fresh stream only
+            # when actually played (see MusicApp._resolve_track_url_for_player).
+            return {
+                "title": lt.get("track_title") or lt.get("title", ""),
+                "url": url,
+                "artist_name": artist_name,
+                "_is_youtube": True,
+                "_youtube_thumbnail": lt.get("_youtube_thumbnail", ""),
+                "_youtube_channel_url": lt.get("_youtube_channel_url", ""),
+                "_real_album_title": album_title,
+                "_real_album_cover": lt.get("_youtube_thumbnail") or lt.get("album_cover", ""),
+            }
         for artist in library:
             if not isinstance(artist, dict):
                 continue
@@ -6638,6 +7446,29 @@ class MusicApp(QWidget):
             self._fetch_player_data()
 
     def _on_controls_artist_clicked(self, artist_name: str):
+        # This slot also serves AlbumPage's own artist-name label (see
+        # artist_name_clicked wiring), which can point at a different,
+        # merely-browsed artist while a YouTube track keeps playing in the
+        # background — only redirect to the channel when the clicked name
+        # is actually the one currently loaded in the player. Read the
+        # *track* (not current_playing_artist, which is one shared virtual
+        # artist for the whole liked-tracks/playlist album, not per-track)
+        # so this also works replaying a YouTube track saved to liked
+        # tracks/a playlist, not just right after searching for it.
+        channel_url = ""
+        played_name = ""
+        playing_album = self.player.current_playing_album
+        if playing_album and self.player.current_track_idx is not None:
+            try:
+                track = playing_album["tracks"][self.player.current_track_idx]
+            except (IndexError, KeyError, TypeError):
+                track = None
+            if track and track.get("_is_youtube"):
+                channel_url = track.get("_youtube_channel_url", "")
+                played_name = (track.get("artist_name") or "").strip()
+        if channel_url and played_name and played_name == (artist_name or "").strip():
+            QDesktopServices.openUrl(QUrl(channel_url))
+            return
         artist = self._find_artist_any(artist_name)
         if artist:
             self._navigate_to_artist(artist)
@@ -6648,6 +7479,22 @@ class MusicApp(QWidget):
         # albums under the same artist share the same (cleaned) title.
         playing_album = self.player.current_playing_album
         playing_artist = self.player.current_playing_artist
+
+        # Track title and album label both land here (see PlaybackControls)
+        # — a YouTube track has no real album to navigate to, just the
+        # single-track virtual one it was wrapped in to play; open the
+        # actual video instead of that fake album page.
+        if playing_album and self.player.current_track_idx is not None:
+            try:
+                current_track = playing_album["tracks"][self.player.current_track_idx]
+            except (IndexError, KeyError, TypeError):
+                current_track = None
+            if current_track and current_track.get("_is_youtube"):
+                video_url = _track_identity_url(current_track)
+                if video_url:
+                    QDesktopServices.openUrl(QUrl(video_url))
+                return
+
         if playing_album and playing_artist and not playing_album.get("_is_liked_album"):
             self._navigate_to_album(playing_album, playing_artist)
             return
@@ -6689,6 +7536,11 @@ class MusicApp(QWidget):
         self._play_track(track_idx, album, artist)
 
     def _play_track(self, track_idx: int, album: dict, artist: dict):
+        # YouTube-track resolution (permanent watch link -> real stream URL)
+        # happens inside PlayerController itself now (see
+        # _resolve_track_url_for_player / set_callbacks), so this works the
+        # same for every track and every trigger — a direct click here, or
+        # play_next/play_prev/repeat advancing onto one mid-queue.
         self.player.set_album(album, artist)
         self.player.play_track(track_idx)
 
@@ -6721,7 +7573,7 @@ class MusicApp(QWidget):
         except (IndexError, KeyError, TypeError):
             self._controls.set_like_state(False, enabled=False)
             return
-        in_collection = bool(_track_like_keys(track_obj) & self._all_collection_keys())
+        in_collection = bool(_track_like_keys(track_obj, _track_identity_url(track_obj)) & self._all_collection_keys())
         self._controls.set_like_state(in_collection, enabled=True)
 
     # ── Like / playlist helpers ─────────────────────────────────────────────────
@@ -6804,26 +7656,42 @@ class MusicApp(QWidget):
     def _build_track_ref(self, track: dict, album: dict, artist: dict | None = None) -> dict:
         """Same track-reference shape used by liked_tracks and playlists —
         {url, artist_name, album_title, track_title, album_id} — resolved
-        against the real library later (see _resolve_liked_track)."""
+        against the real library later (see _resolve_liked_track).
+
+        For a YouTube track, "url" here is the *permanent* watch link
+        (_track_identity_url), never track["url"] as-is — once playing, that
+        field holds a resolved googlevideo.com stream that expires in a few
+        hours (see _resolve_track_url_for_player), which would leave a liked track or
+        playlist entry silently dead after that."""
         album = album or {}
-        rel_url = track.get("url", "")
+        is_youtube = bool(track.get("_is_youtube"))
+        rel_url = _track_identity_url(track) if is_youtube else track.get("url", "")
         if album.get("_is_liked_album"):
             album_title = track.get("_real_album_title", "")
         else:
             album_title = album.get("title", "") or ""
         artist_name = track.get("artist_name") or ((artist or {}).get("artist", "") if artist else "") or ""
-        return {
+        ref = {
             "url": rel_url or resolve_media_url(rel_url),
             "artist_name": artist_name,
             "album_title": album_title,
             "track_title": track.get("title", "") or "",
             "album_id": str(track.get("album_id") or "").strip(),
         }
+        if is_youtube:
+            ref["_is_youtube"] = True
+            thumb = track.get("_youtube_thumbnail") or album.get("cover", "")
+            if thumb:
+                ref["_youtube_thumbnail"] = thumb
+            channel_url = track.get("_youtube_channel_url", "")
+            if channel_url:
+                ref["_youtube_channel_url"] = channel_url
+        return ref
 
     def _show_add_to_collections_menu(self, track: dict, album: dict, artist: dict | None, anchor: QWidget):
         if not self._account_manager:
             return
-        my_keys = _track_like_keys(track, track.get("url", ""))
+        my_keys = _track_like_keys(track, _track_identity_url(track))
 
         menu = QMenu(anchor)
         menu.setStyleSheet(_menu_style())
@@ -6850,7 +7718,7 @@ class MusicApp(QWidget):
         menu.exec(QCursor.pos())
 
     def _toggle_track_liked(self, track: dict, album: dict, artist: dict | None, liked: bool):
-        my_keys = _track_like_keys(track, track.get("url", ""))
+        my_keys = _track_like_keys(track, _track_identity_url(track))
         already = bool(my_keys & self._liked_urls_set())
         if liked == already:
             return
@@ -6866,7 +7734,7 @@ class MusicApp(QWidget):
         pl = next((p for p in self._playlists if p.get("id") == playlist_id), None)
         if pl is None:
             return
-        my_keys = _track_like_keys(track, track.get("url", ""))
+        my_keys = _track_like_keys(track, _track_identity_url(track))
         tracks = pl.setdefault("tracks", [])
         already = any(_liked_entry_matches(t, my_keys) for t in tracks)
         if add == already:
@@ -7223,6 +8091,7 @@ class MusicApp(QWidget):
         self._album_page.apply_accent()
         self._artist_page.apply_accent()
         self._cover_viewer.apply_accent()
+        self._avatar_crop_overlay.apply_accent()
         self._settings_page.apply_accent()
         self._avatar_btn.apply_accent()
         self._profile_page.apply_accent()
@@ -7499,15 +8368,32 @@ class MusicApp(QWidget):
         # an empty cover — showing no artwork at startup until playback was
         # started again (which re-resolved it correctly via this same logic).
         cover = self._resolve_playing_cover_rel(album)
+        last_played_payload = {
+            "title": track.get("title", ""),
+            "artist_name": artist_name,
+            "album_title": album_title,
+            "album_cover": cover,
+            "album_id": album_id,
+        }
+        is_youtube = bool(track.get("_is_youtube"))
+        if is_youtube:
+            # No library entry to resolve back to on next launch (see
+            # _prime_player_for_resume's YouTube branch) — the permanent
+            # watch link is what makes resuming possible at all.
+            last_played_payload["_is_youtube"] = True
+            last_played_payload["youtube_url"] = _track_identity_url(track)
+            channel_url = track.get("_youtube_channel_url", "")
+            if channel_url:
+                last_played_payload["_youtube_channel_url"] = channel_url
         self._save_ui_state(
-            last_played_track={
-                "title": track.get("title", ""),
-                "artist_name": artist_name,
-                "album_title": album_title,
-                "album_cover": cover,
-                "album_id": album_id,
-            },
-            album_history=self._record_album_history(artist_name, album_title, album_id, cover),
+            last_played_track=last_played_payload,
+            # A YouTube "album" has nothing a later library lookup could
+            # ever resolve — skip it rather than leave a dead entry in the
+            # home page's "Продолжить слушать" row.
+            album_history=(
+                list(self._settings.get("album_history") or []) if is_youtube
+                else self._record_album_history(artist_name, album_title, album_id, cover)
+            ),
         )
 
     def _record_album_history(self, artist_name: str, album_title: str, album_id: str, cover: str) -> list:
@@ -7594,6 +8480,32 @@ class MusicApp(QWidget):
         self._controls.update_position(pos, dur)
         if self._mpris_service:
             self._mpris_service.update_position(pos, dur)
+        self._accumulate_listen_time()
+
+    def _accumulate_listen_time(self):
+        """Called on every ~500ms player timer tick (see PlayerController.timer
+        in core/player_vlc.py — it keeps running while paused, not just while
+        playing), so real elapsed wall-clock time is used rather than assuming
+        a fixed tick length, and progress is only credited while actually
+        playing."""
+        now = time.monotonic()
+        last_tick = self._listen_last_tick
+        self._listen_last_tick = now
+        if last_tick is None or not self.player.is_playing():
+            return
+        elapsed = now - last_tick
+        if elapsed <= 0 or elapsed > 2.0:
+            return
+        today = date.today().isoformat()
+        self._listen_stats[today] = round(self._listen_stats.get(today, 0.0) + elapsed, 1)
+        self._listen_stats_dirty = True
+
+    def _flush_listen_stats(self):
+        if not self._listen_stats_dirty:
+            return
+        self._listen_stats_dirty = False
+        self._save_player_data_async({})
+        self._profile_page.set_listen_stats(self._listen_stats)
 
     def _on_duration_changed(self):
         pos = self.player.get_current_position()
@@ -7708,6 +8620,13 @@ class MusicApp(QWidget):
     # ── Close ─────────────────────────────────────────────────────────────────
 
     def closeEvent(self, event):
+        # Flush any not-yet-synced listening seconds before player.stop()
+        # below ends the position-tick timer that accumulates them, and
+        # before _closing (next line) makes _schedule_settings_sync()
+        # a no-op that would otherwise silently drop this save.
+        if self._listen_stats_dirty:
+            self._listen_stats_dirty = False
+            self._save_player_data_async({})
         # Set before anything else so any QTimer/async callback still in
         # flight (library refresh, player-data fetch) bails out instead of
         # spawning a fresh background thread after teardown has started.

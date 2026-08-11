@@ -15,6 +15,7 @@ DEFAULT_PLAYER_DATA = {
     "playlists": [],
     "playlist_subscriptions": [],
     "app_settings": {},
+    "listen_stats": {},
     "avatar_data": None,
     "avatar_filename": None,
     "display_name": None,

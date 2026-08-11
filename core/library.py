@@ -13,7 +13,8 @@ class SearchResult:
     def __init__(self, result_type, artist_name, album_title=None, track_title=None,
                  cover_url=None, artist_obj=None, album_obj=None, track_obj=None,
                  artist_names=None, playlist_obj=None, playlist_owner_login=None,
-                 playlist_editable=False, playlist_cover_pixmap=None):
+                 playlist_editable=False, playlist_cover_pixmap=None,
+                 youtube_obj=None):
         self.type = result_type
         self.artist_name = artist_name
         self.album_title = album_title
@@ -35,6 +36,9 @@ class SearchResult:
         self.playlist_owner_login = playlist_owner_login
         self.playlist_editable = playlist_editable
         self.playlist_cover_pixmap = playlist_cover_pixmap
+        # {id, title, uploader, duration, thumbnail, webpage_url} from
+        # core/youtube.py's search_youtube() — only set when type == "youtube".
+        self.youtube_obj = youtube_obj or {}
 
     def artists_display(self) -> str:
         return ", ".join(clean_artist_name(n) for n in self.artist_names) if self.artist_names else clean_artist_name(self.artist_name)
@@ -46,6 +50,8 @@ class SearchResult:
             return f"📁 {clean_title(self.album_title)} • {self.artists_display()}"
         elif self.type == "track":
             return f"🎵 {clean_title(self.track_title)} • {self.artists_display()}"
+        elif self.type == "youtube":
+            return f"▶ {self.youtube_obj.get('title', '')}"
         return ""
 
 

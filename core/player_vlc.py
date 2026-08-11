@@ -123,6 +123,7 @@ class PlayerController(QObject):
         self.on_duration_changed = None
         self.on_album_finished = None
         self.on_album_previous = None
+        self.on_resolve_track_url = None
 
         self._warmup_network_media = None
         self._warmupNetworkParsed.connect(self._on_warmup_network_parsed)
@@ -138,13 +139,25 @@ class PlayerController(QObject):
 
     def set_callbacks(self, track_changed=None, playback_state_changed=None,
                       position_changed=None, duration_changed=None,
-                      album_finished=None, album_previous=None):
+                      album_finished=None, album_previous=None,
+                      resolve_track_url=None):
         self.on_track_changed = track_changed
         self.on_playback_state_changed = playback_state_changed
         self.on_position_changed = position_changed
         self.on_duration_changed = duration_changed
         self.on_album_finished = album_finished
         self.on_album_previous = album_previous
+        # Called as resolve_track_url(track, continue_playback) before every
+        # play_track — lets the app resolve a track['url'] that isn't
+        # directly playable yet (e.g. a YouTube watch link, see
+        # MusicApp._resolve_track_url_for_player) into a real stream URL
+        # first, whether play_track was reached directly or via play_next/
+        # play_prev/repeat (a mid-queue auto-advance onto a YouTube track
+        # goes through the exact same path as a manual click). Must call
+        # continue_playback(url) exactly once, synchronously or later from
+        # a background thread — if unset, tracks are played with their
+        # 'url' field as-is (previous behavior).
+        self.on_resolve_track_url = resolve_track_url
 
     # ── Эквалайзер ───────────────────────────────────────────────────────────
 
@@ -344,15 +357,41 @@ class PlayerController(QObject):
                 random.shuffle(self.shuffled_indices)
         if index >= len(self.shuffled_indices):
             return False
-        try:
-            self._manual_track_switch = True
-            self._ended_handled = False
-            self.current_track = index
-            self.current_track_idx = self.shuffled_indices[index]
-            track = self.current_playing_album["tracks"][self.current_track_idx]
+        # Set before the resolve hook runs (not after) — it may resolve
+        # asynchronously (see on_resolve_track_url), and this timer-tick
+        # guard needs to already be up for that whole gap so a stray Ended/
+        # Error state read off the *previous* track's still-live media
+        # object (self.timer keeps running across the transition) can't
+        # re-trigger _handle_track_end mid-resolve and skip a track.
+        self._manual_track_switch = True
+        self._ended_handled = False
+        self.current_track = index
+        self.current_track_idx = self.shuffled_indices[index]
+        track = self.current_playing_album["tracks"][self.current_track_idx]
 
+        def _continue(resolved_url: str, _track=track, _index=index):
+            self._start_playback(_index, _track, resolved_url)
+
+        if self.on_resolve_track_url:
+            self.on_resolve_track_url(track, _continue)
+        else:
+            _continue(track.get("url", ""))
+        return True
+
+    def _start_playback(self, index: int, track: dict, resolved_url: str):
+        """The actual libVLC media switch — split out from play_track so it
+        can run either immediately or after an async URL resolve completes
+        (see on_resolve_track_url)."""
+        if index != self.current_track:
+            # A newer play_track (skip, next/prev spam, ...) has since
+            # superseded this one — a resolve that finishes late must not
+            # override whatever's playing now.
+            return
+        try:
             from utils.format_utils import resolve_media_url
-            track_url = resolve_media_url(track.get("url", ""))
+            track_url = resolve_media_url(resolved_url or "")
+            if not track_url:
+                return
             media = self._vlc_instance.media_new(track_url)
             self.player.set_media(media)
             self.player.play()
@@ -365,10 +404,8 @@ class PlayerController(QObject):
 
             QTimer.singleShot(300, lambda: setattr(self, "_manual_track_switch", False))
             self.currentUrlChanged.emit(track_url)
-            return True
         except Exception as e:
             print(f"play_track error: {e}")
-            return False
 
     def toggle_playback(self):
         try:

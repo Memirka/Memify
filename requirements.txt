@@ -5,6 +5,10 @@ requests==2.34.2
 pynput==1.8.2
 pypresence==4.6.2
 python-vlc==3.0.21203
+# Resolves searches/playback for the search bar's YouTube toggle (see
+# core/youtube.py) — no official YouTube streaming API exists, this scrapes
+# it, so pin loosely and expect occasional breakage on YouTube-side changes.
+yt-dlp>=2026.7.4
 # MPRIS2 D-Bus service (utils/mpris_service.py) — lets Bluetooth headset
 # play/pause/next/prev buttons control Memify on Linux desktops, where
 # AVRCP commands are routed via MPRIS rather than synthetic media keys.
