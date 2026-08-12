@@ -23,11 +23,11 @@ from PyQt6.QtWidgets import (
     QLineEdit, QApplication, QSizePolicy, QStackedWidget,
     QMenu, QFileDialog, QProgressDialog, QSpacerItem,
     QAbstractItemView, QFrame, QMessageBox, QGraphicsDropShadowEffect,
-    QGraphicsScene, QGraphicsPixmapItem, QGraphicsBlurEffect,
+    QGraphicsScene, QGraphicsPixmapItem, QGraphicsBlurEffect, QGraphicsOpacityEffect,
     QStyledItemDelegate, QStyle, QSlider, QColorDialog, QInputDialog, QToolTip,
 )
 from PyQt6.QtCore import (
-    Qt, QTimer, QThread, QUrl, QSize, QRectF, pyqtSignal, pyqtSlot, QObject, QPoint, QPointF,
+    Qt, QTimer, QThread, QUrl, QSize, QRect, QRectF, pyqtSignal, pyqtSlot, QObject, QPoint, QPointF,
     QPropertyAnimation, pyqtProperty, QEasingCurve, QBuffer,
 )
 from datetime import date, timedelta
@@ -59,6 +59,7 @@ from workers.image_loader import ImageLoaderWorker
 from workers.search_worker import SearchWorker
 from workers.download_worker import DownloadWorker
 from workers.track_duration_worker import TrackDurationWorker
+from workers.lyrics_worker import LyricsWorker
 
 try:
     from utils.media_keys import MediaKeysHandler
@@ -156,6 +157,35 @@ def _stop_runners_and_wait(runners_store: list, timeout_ms: int = 300):
             thread.wait(timeout_ms)
         except Exception:
             pass
+
+
+def _start_lyrics_worker(
+    artist: str, title: str, album: str, duration_sec: int,
+    on_finished_cb, runners_store: list,
+):
+    """Same thread/worker bookkeeping as _start_image_loader, for a single
+    one-shot LyricsWorker lookup instead of a queue of image URLs."""
+    worker = LyricsWorker(artist, title, album, duration_sec)
+    thread = QThread(QApplication.instance())
+    worker.moveToThread(thread)
+
+    entry = [thread, worker]
+    runners_store.append(entry)
+
+    def _cleanup():
+        worker.deleteLater()
+        thread.deleteLater()
+        try:
+            runners_store.remove(entry)
+        except ValueError:
+            pass
+
+    worker.finished.connect(on_finished_cb)
+    worker.finished.connect(thread.quit)
+    thread.finished.connect(_cleanup)
+    thread.started.connect(worker.run)
+    thread.start()
+    return entry
 
 
 def _blurred_backdrop(pixmap: QPixmap, radius: float = 28.0, tint_alpha: int = 130, downscale: int = 4) -> QPixmap:
@@ -1765,6 +1795,382 @@ class CoverViewerOverlay(QWidget):
         )
         if file_path:
             self._full_pixmap.save(file_path)
+
+
+class LyricsViewerOverlay(QWidget):
+    """Full-window overlay for the current track's lyrics — opened via the
+    button next to the volume slider (PlaybackControls.lyrics_clicked, see
+    MusicApp._on_lyrics_button_clicked). Same "poverh vsego" treatment as
+    CoverViewerOverlay (blurred backdrop snapshot, Escape/click-outside to
+    close), but split instead of centered: cover settles into the left
+    half, scrollable lyrics text into the right half, each sliding in from
+    its own edge on open — cover_container/text_container are deliberately
+    NOT layout-managed (a QLayout would fight setGeometry() every frame),
+    their resting rects are computed by hand in _resting_rects().
+
+    When lrclib.net has synced (LRC) lyrics for the track, each line is its
+    own clickable QLabel instead of one big block of text — set_position()
+    (fed from MusicApp._on_position_changed while this overlay is visible)
+    highlights whichever line is currently playing and auto-scrolls it into
+    view, and clicking a line emits line_clicked(ms) to seek there. The
+    highlight itself crossfades rather than snapping — each line carries its
+    own QGraphicsOpacityEffect, dimmed at rest and animated up to full
+    brightness as it becomes current (and back down as it stops being
+    current), alongside the already-animated auto-scroll. Falls back to one
+    plain scrollable block when only unsynced text is available."""
+
+    MARGIN = 56
+    GAP = 40
+    ANIM_MS = 320
+    LINE_FADE_MS = 260
+    OPACITY_IDLE = 0.45
+    OPACITY_ACTIVE = 1.0
+
+    # Idle/active differ in weight/size/background (snap instantly, applied
+    # right when a line becomes/stops being current) — the actual "fade" the
+    # user sees comes from the per-label QGraphicsOpacityEffect animating
+    # between OPACITY_IDLE/OPACITY_ACTIVE on top of these, not from the
+    # color itself, so both styles use plain full-white text here.
+    _LINE_STYLE_IDLE = (
+        "color: #FFFFFF; font: 11pt 'Segoe UI'; "
+        "background: transparent; padding: 3px 4px; border-radius: 4px;"
+    )
+    _LINE_STYLE_ACTIVE = (
+        "color: #FFFFFF; font: 600 12pt 'Segoe UI'; "
+        "background: rgba(255,255,255,0.10); padding: 3px 4px; border-radius: 4px;"
+    )
+
+    line_clicked = pyqtSignal(int)  # ms
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._backdrop_pixmap: QPixmap | None = None
+        self._full_pixmap: QPixmap | None = None
+        self._anim_cover: QPropertyAnimation | None = None
+        self._anim_text: QPropertyAnimation | None = None
+        self._scroll_anim: QPropertyAnimation | None = None
+        self._runners: list = []
+        self._synced_lines: list[tuple[int, str]] = []
+        self._line_labels: list[QLabel] = []
+        self._line_effects: list[QGraphicsOpacityEffect] = []
+        self._line_fade_anims: dict[int, QPropertyAnimation] = {}
+        self._active_line_idx: int = -1
+        self.hide()
+        self._build_ui()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        if self._backdrop_pixmap and not self._backdrop_pixmap.isNull():
+            painter.drawPixmap(self.rect(), self._backdrop_pixmap)
+        else:
+            painter.fillRect(self.rect(), QColor(10, 10, 12, 210))
+        painter.end()
+        super().paintEvent(event)
+
+    def _build_ui(self):
+        self._close_btn = QPushButton("✕", self)
+        self._close_btn.setFixedSize(36, 36)
+        self._close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._close_btn.setStyleSheet(
+            "QPushButton { background: rgba(255,255,255,0.08); border: none; border-radius: 18px; "
+            "color: #FFFFFF; font-size: 15px; }"
+            "QPushButton:hover { background: rgba(255,255,255,0.18); }"
+        )
+        self._close_btn.clicked.connect(self.hide_viewer)
+
+        # ── Left: cover ──────────────────────────────────────────────────
+        self._cover_container = QWidget(self)
+        cover_col = QVBoxLayout(self._cover_container)
+        cover_col.setContentsMargins(0, 0, 0, 0)
+        cover_col.setSpacing(18)
+        cover_col.addStretch(1)
+
+        self._image_label = QLabel()
+        self._image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(48)
+        shadow.setOffset(0, 18)
+        shadow.setColor(QColor(0, 0, 0, 180))
+        self._image_label.setGraphicsEffect(shadow)
+        cover_col.addWidget(self._image_label, 0, Qt.AlignmentFlag.AlignHCenter)
+
+        self._caption_label = QLabel()
+        self._caption_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._caption_label.setWordWrap(True)
+        self._caption_label.setStyleSheet("color: #FFFFFF; font: 600 13pt 'Segoe UI'; background: transparent;")
+        cover_col.addWidget(self._caption_label)
+        cover_col.addStretch(1)
+
+        # ── Right: scrollable lyrics ─────────────────────────────────────
+        self._text_container = QWidget(self)
+        text_col = QVBoxLayout(self._text_container)
+        text_col.setContentsMargins(0, 0, 0, 0)
+        text_col.setSpacing(14)
+
+        lyrics_hdr = QLabel("Текст песни")
+        lyrics_hdr.setStyleSheet("color: #FFFFFF; font: 600 13pt 'Segoe UI'; background: transparent;")
+        text_col.addWidget(lyrics_hdr)
+
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._scroll.setStyleSheet(get_scrollbar_style() + "QScrollArea { background: transparent; }")
+        self._scroll.viewport().setStyleSheet("background: transparent;")
+
+        scroll_content = QWidget()
+        scroll_content.setStyleSheet("background: transparent;")
+        scroll_layout = QVBoxLayout(scroll_content)
+        scroll_layout.setContentsMargins(0, 0, 16, 0)
+        scroll_layout.setSpacing(0)
+
+        # Unsynced fallback — one big wrapped block of plain text.
+        self._plain_label = QLabel("")
+        self._plain_label.setWordWrap(True)
+        self._plain_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._plain_label.setStyleSheet(
+            "color: rgba(255,255,255,0.92); font: 11pt 'Segoe UI'; background: transparent;"
+        )
+        scroll_layout.addWidget(self._plain_label)
+
+        # Synced (LRC) — one clickable QLabel per line, filled in by
+        # set_lyrics_data(); highlighted/scrolled to by set_position().
+        self._lines_container = QWidget()
+        self._lines_container.setStyleSheet("background: transparent;")
+        self._lines_layout = QVBoxLayout(self._lines_container)
+        self._lines_layout.setContentsMargins(0, 0, 0, 0)
+        self._lines_layout.setSpacing(4)
+        scroll_layout.addWidget(self._lines_container)
+        self._lines_container.setVisible(False)
+
+        scroll_layout.addStretch(1)
+        self._scroll.setWidget(scroll_content)
+        text_col.addWidget(self._scroll, 1)
+
+    def _resting_rects(self) -> tuple[QRect, QRect]:
+        m, gap = self.MARGIN, self.GAP
+        top = m + 56  # leaves room under the close button
+        avail_h = max(1, self.height() - top - m)
+        half_w = max(1, int((self.width() - 2 * m - gap) / 2))
+        cover_rect = QRect(m, top, half_w, avail_h)
+        text_rect = QRect(m + half_w + gap, top, half_w, avail_h)
+        return cover_rect, text_rect
+
+    def _apply_resting_geometry(self):
+        cover_rect, text_rect = self._resting_rects()
+        self._cover_container.setGeometry(cover_rect)
+        self._text_container.setGeometry(text_rect)
+        self._resize_cover_pixmap()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self.parent():
+            self.setGeometry(self.parent().rect())
+        self._close_btn.move(self.width() - self.MARGIN // 2 - 36, 20)
+        self._apply_resting_geometry()
+
+    def mousePressEvent(self, event):
+        # Clicks land here only when they miss every child widget — the
+        # dim/blurred backdrop itself.
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.hide_viewer()
+        super().mousePressEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self.hide_viewer()
+            return
+        super().keyPressEvent(event)
+
+    def hide_viewer(self):
+        _stop_runners(self._runners)
+        self.hide()
+
+    def show_for(self, title: str, artist_name: str, cover_rel: str):
+        self._caption_label.setText(f"{title} • {artist_name}" if artist_name else title)
+        self._full_pixmap = None
+        self._resize_cover_pixmap()
+        self._load_cover(cover_rel)
+
+        if self.parent():
+            self.setGeometry(self.parent().rect())
+            snapshot = self.parent().grab()
+            self._backdrop_pixmap = _blurred_backdrop(snapshot)
+        self._close_btn.move(self.width() - self.MARGIN // 2 - 36, 20)
+
+        cover_rect, text_rect = self._resting_rects()
+        start_cover = QRect(-cover_rect.width(), cover_rect.y(), cover_rect.width(), cover_rect.height())
+        start_text = QRect(self.width(), text_rect.y(), text_rect.width(), text_rect.height())
+        self._cover_container.setGeometry(start_cover)
+        self._text_container.setGeometry(start_text)
+
+        self.raise_()
+        self.show()
+        self.setFocus()
+        self.update()
+
+        self._anim_cover = QPropertyAnimation(self._cover_container, b"geometry", self)
+        self._anim_cover.setDuration(self.ANIM_MS)
+        self._anim_cover.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._anim_cover.setStartValue(start_cover)
+        self._anim_cover.setEndValue(cover_rect)
+        self._anim_cover.start()
+
+        self._anim_text = QPropertyAnimation(self._text_container, b"geometry", self)
+        self._anim_text.setDuration(self.ANIM_MS)
+        self._anim_text.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._anim_text.setStartValue(start_text)
+        self._anim_text.setEndValue(text_rect)
+        self._anim_text.start()
+
+    def _resize_cover_pixmap(self):
+        if not self._full_pixmap or self._full_pixmap.isNull():
+            self._image_label.setFixedSize(1, 1)
+            self._image_label.setPixmap(QPixmap())
+            return
+        side = max(160, min(440, self._cover_container.width() - 20, self._cover_container.height() - 100))
+        self._image_label.setFixedSize(side, side)
+        scaled = self._full_pixmap.scaled(
+            side, side, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+        )
+        self._image_label.setPixmap(scaled)
+
+    def _load_cover(self, cover_rel: str):
+        # Same original-resolution fetch as CoverViewerOverlay.show_for
+        # (size=0, radius=0) — the bottom bar's own cached cover is only
+        # 56px, too blurry once scaled up to this overlay's ~400px cover.
+        if not cover_rel:
+            return
+        if os.path.isabs(cover_rel) and os.path.exists(cover_rel):
+            self._full_pixmap = QPixmap(cover_rel)
+            self._resize_cover_pixmap()
+            return
+        url = resolve_media_url(cover_rel)
+        _stop_runners(self._runners)
+
+        def on_loaded(_loaded_url, img, _size, _radius):
+            pm = QPixmap.fromImage(img) if img else QPixmap()
+            if not pm.isNull():
+                self._full_pixmap = pm
+                self._resize_cover_pixmap()
+
+        _start_image_loader([url], 0, 0, on_loaded, self._runners)
+
+    def _clear_lines(self):
+        for anim in self._line_fade_anims.values():
+            anim.stop()
+        self._line_fade_anims = {}
+        while self._lines_layout.count():
+            item = self._lines_layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+        self._line_labels = []
+        self._line_effects = []
+        self._active_line_idx = -1
+
+    def set_lyrics_loading(self):
+        self._synced_lines = []
+        self._clear_lines()
+        self._lines_container.setVisible(False)
+        self._plain_label.setVisible(True)
+        self._plain_label.setStyleSheet(
+            "color: rgba(255,255,255,0.6); font: italic 11pt 'Segoe UI'; background: transparent;"
+        )
+        self._plain_label.setText("Загрузка текста…")
+
+    def set_lyrics_data(self, plain: str, synced: list[tuple[int, str]]):
+        self._synced_lines = list(synced or [])
+        self._clear_lines()
+
+        if self._synced_lines:
+            self._plain_label.setVisible(False)
+            self._lines_container.setVisible(True)
+            for ms, text in self._synced_lines:
+                lbl = QLabel(text or "♪")
+                lbl.setWordWrap(True)
+                lbl.setCursor(Qt.CursorShape.PointingHandCursor)
+                lbl.setStyleSheet(self._LINE_STYLE_IDLE)
+                lbl.mousePressEvent = lambda _e, _ms=ms: self.line_clicked.emit(_ms)
+                effect = QGraphicsOpacityEffect(lbl)
+                effect.setOpacity(self.OPACITY_IDLE)
+                lbl.setGraphicsEffect(effect)
+                self._lines_layout.addWidget(lbl)
+                self._line_labels.append(lbl)
+                self._line_effects.append(effect)
+            return
+
+        self._lines_container.setVisible(False)
+        self._plain_label.setVisible(True)
+        if plain:
+            self._plain_label.setStyleSheet(
+                "color: rgba(255,255,255,0.92); font: 11pt 'Segoe UI'; background: transparent;"
+            )
+            self._plain_label.setText(plain)
+        else:
+            self._plain_label.setStyleSheet(
+                "color: rgba(255,255,255,0.6); font: italic 11pt 'Segoe UI'; background: transparent;"
+            )
+            self._plain_label.setText("Текст не найден")
+
+    def _fade_line(self, idx: int, target_opacity: float):
+        existing = self._line_fade_anims.pop(idx, None)
+        if existing is not None:
+            existing.stop()
+        effect = self._line_effects[idx]
+        anim = QPropertyAnimation(effect, b"opacity", self)
+        anim.setDuration(self.LINE_FADE_MS)
+        anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
+        anim.setStartValue(effect.opacity())
+        anim.setEndValue(target_opacity)
+        anim.finished.connect(lambda _idx=idx: self._line_fade_anims.pop(_idx, None))
+        self._line_fade_anims[idx] = anim
+        anim.start()
+
+    def set_position(self, ms: int):
+        """Highlights whichever synced line is currently playing and
+        scrolls it into view — called from MusicApp._on_position_changed
+        on every ~500ms player tick while this overlay is visible. The
+        highlight itself crossfades (see _fade_line) rather than snapping,
+        alongside the already-animated scroll. A no-op when the current
+        track has no synced lyrics (self._synced_lines empty, e.g.
+        plain-text-only or nothing loaded yet)."""
+        if not self._synced_lines:
+            return
+        idx = -1
+        for i, (t, _text) in enumerate(self._synced_lines):
+            if t <= ms:
+                idx = i
+            else:
+                break
+        if idx == self._active_line_idx:
+            return
+        if 0 <= self._active_line_idx < len(self._line_labels):
+            self._line_labels[self._active_line_idx].setStyleSheet(self._LINE_STYLE_IDLE)
+            self._fade_line(self._active_line_idx, self.OPACITY_IDLE)
+        self._active_line_idx = idx
+        if 0 <= idx < len(self._line_labels):
+            lbl = self._line_labels[idx]
+            lbl.setStyleSheet(self._LINE_STYLE_ACTIVE)
+            self._fade_line(idx, self.OPACITY_ACTIVE)
+            self._scroll_to_label(lbl)
+
+    def _scroll_to_label(self, lbl: QLabel):
+        content = self._scroll.widget()
+        if not content:
+            return
+        y = lbl.mapTo(content, QPoint(0, 0)).y()
+        target = y - self._scroll.viewport().height() // 2 + lbl.height() // 2
+        bar = self._scroll.verticalScrollBar()
+        target = max(bar.minimum(), min(bar.maximum(), target))
+        if self._scroll_anim is not None:
+            self._scroll_anim.stop()
+        self._scroll_anim = QPropertyAnimation(bar, b"value", self)
+        self._scroll_anim.setDuration(220)
+        self._scroll_anim.setStartValue(bar.value())
+        self._scroll_anim.setEndValue(target)
+        self._scroll_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._scroll_anim.start()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -5703,6 +6109,311 @@ class UserProfilePage(QWidget):
             self._playlist_rows.append(row)
 
 
+class _PanelToggleHandle(QPushButton):
+    """Thin always-visible strip docked at the window's right edge — click
+    to slide NowPlayingSidePanel open/closed. Hand-drawn triangle (same
+    technique as _ChevronButton) points left while collapsed (invites
+    opening) and flips to point right once expanded (invites closing)."""
+
+    def __init__(self, parent=None):
+        super().__init__("", parent)
+        self.setCheckable(True)
+        self.setChecked(False)  # collapsed by default
+        self.setFixedWidth(20)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setToolTip("Сейчас играет")
+        self.setStyleSheet(
+            f"QPushButton {{ background: {COLORS['SURFACE']}; border: none; "
+            f"border-left: 1px solid {COLORS['SURFACE_LIGHT']}; }}"
+            f"QPushButton:hover {{ background: {COLORS['SURFACE_LIGHT']}; }}"
+        )
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rf = QRectF(self.rect())
+        cx, cy = rf.center().x(), rf.center().y()
+        s = 4.5
+        path = QPainterPath()
+        if self.isChecked():
+            # Expanded — pointing right (click collapses).
+            path.moveTo(cx - s * 0.55, cy - s)
+            path.lineTo(cx + s * 0.65, cy)
+            path.lineTo(cx - s * 0.55, cy + s)
+        else:
+            # Collapsed — pointing left (click expands).
+            path.moveTo(cx + s * 0.55, cy - s)
+            path.lineTo(cx - s * 0.65, cy)
+            path.lineTo(cx + s * 0.55, cy + s)
+        path.closeSubpath()
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(COLORS["TEXT_SECONDARY"]))
+        p.drawPath(path)
+        p.end()
+
+
+class NowPlayingSidePanel(QWidget):
+    """Collapsible right-hand panel, mirroring the left Sidebar's presence
+    but toggled via _PanelToggleHandle instead of always shown: the
+    currently playing track (cover/title/artist, all clickable through to
+    the album/artist), an "Об исполнителе" card with a subscribe toggle
+    for the *playing* artist (independent of whatever artist the user
+    happens to be browsing — see MusicApp._on_now_playing_subscribe_clicked),
+    and "Далее в очереди" showing what plays next given the current
+    shuffle/repeat state. Closed (0px wide) by default."""
+
+    cover_clicked = pyqtSignal()
+    title_clicked = pyqtSignal()
+    artist_clicked = pyqtSignal()
+    subscribe_clicked = pyqtSignal()
+    queue_track_clicked = pyqtSignal()
+
+    PANEL_WIDTH = 300
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._panel_width = 0
+        self._is_subscribed = False
+        self._anim: QPropertyAnimation | None = None
+        self.setObjectName("nowPlayingPanel")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(
+            f"QWidget#nowPlayingPanel {{ background-color: {COLORS['SURFACE']}; "
+            f"border-left: 1px solid {COLORS['BORDER']}; }}"
+        )
+        self.setFixedWidth(0)
+        self._build_ui()
+
+    # Animated via QPropertyAnimation like _RotatingSpinner's `angle` /
+    # SettingsPage's `knobPos` elsewhere in this file — QWidget itself has
+    # no single animatable "width" property, so setFixedWidth() (pins both
+    # min and max) is driven from a custom one instead.
+    def _get_panel_width(self):
+        return self._panel_width
+
+    def _set_panel_width(self, w):
+        self._panel_width = w
+        self.setFixedWidth(max(0, int(w)))
+
+    panelWidth = pyqtProperty(int, _get_panel_width, _set_panel_width)
+
+    def set_expanded(self, expanded: bool):
+        self._anim = QPropertyAnimation(self, b"panelWidth", self)
+        self._anim.setDuration(220)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._anim.setStartValue(self.width())
+        self._anim.setEndValue(self.PANEL_WIDTH if expanded else 0)
+        self._anim.start()
+
+    def _build_ui(self):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(20, 20, 20, 20)
+        outer.setSpacing(16)
+
+        # ── Now playing ──────────────────────────────────────────────────
+        self._cover_label = QLabel()
+        self._cover_label.setFixedSize(180, 180)
+        self._cover_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._cover_label.setStyleSheet(f"background: {COLORS['SURFACE_LIGHT']}; border-radius: 8px;")
+        self._cover_label.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._cover_label.mousePressEvent = lambda e: self.cover_clicked.emit()
+        cover_row = QHBoxLayout()
+        cover_row.addStretch(1)
+        cover_row.addWidget(self._cover_label)
+        cover_row.addStretch(1)
+        outer.addLayout(cover_row)
+
+        self._title_label = QLabel("Ничего не играет")
+        self._title_label.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
+        self._title_label.setStyleSheet(f"color: {COLORS['TEXT_PRIMARY']};")
+        self._title_label.setWordWrap(True)
+        self._title_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self._title_label.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._title_label.mousePressEvent = lambda e: self.title_clicked.emit()
+        outer.addWidget(self._title_label)
+
+        self._now_artist_label = QLabel("")
+        self._now_artist_label.setFont(QFont("Segoe UI", 10))
+        self._now_artist_label.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']};")
+        self._now_artist_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self._now_artist_label.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._now_artist_label.mousePressEvent = lambda e: self.artist_clicked.emit()
+        outer.addWidget(self._now_artist_label)
+
+        # ── Об исполнителе ───────────────────────────────────────────────
+        self._about_section = QWidget()
+        about_col = QVBoxLayout(self._about_section)
+        about_col.setContentsMargins(0, 0, 0, 0)
+        about_col.setSpacing(10)
+
+        divider1 = QFrame()
+        divider1.setFrameShape(QFrame.Shape.HLine)
+        divider1.setStyleSheet(f"color: {COLORS['BORDER']};")
+        about_col.addWidget(divider1)
+
+        about_hdr = QLabel("Об исполнителе")
+        about_hdr.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
+        about_hdr.setStyleSheet(f"color: {COLORS['TEXT_PRIMARY']};")
+        about_col.addWidget(about_hdr)
+
+        self._artist_avatar = QLabel()
+        self._artist_avatar.setFixedSize(72, 72)
+        self._artist_avatar.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._artist_avatar.setStyleSheet(f"background: {COLORS['SURFACE_LIGHT']}; border-radius: 36px;")
+        self._artist_avatar.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._artist_avatar.mousePressEvent = lambda e: self.artist_clicked.emit()
+        avatar_row = QHBoxLayout()
+        avatar_row.addStretch(1)
+        avatar_row.addWidget(self._artist_avatar)
+        avatar_row.addStretch(1)
+        about_col.addLayout(avatar_row)
+
+        self._about_artist_name = QLabel("")
+        self._about_artist_name.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
+        self._about_artist_name.setStyleSheet(f"color: {COLORS['TEXT_PRIMARY']};")
+        self._about_artist_name.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self._about_artist_name.setWordWrap(True)
+        self._about_artist_name.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._about_artist_name.mousePressEvent = lambda e: self.artist_clicked.emit()
+        about_col.addWidget(self._about_artist_name)
+
+        self._subscribe_btn = QPushButton("Подписаться")
+        self._subscribe_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._subscribe_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._subscribe_btn.setFixedHeight(32)
+        self._subscribe_btn.clicked.connect(self.subscribe_clicked.emit)
+        sub_row = QHBoxLayout()
+        sub_row.addStretch(1)
+        sub_row.addWidget(self._subscribe_btn)
+        sub_row.addStretch(1)
+        about_col.addLayout(sub_row)
+
+        outer.addWidget(self._about_section)
+        self._apply_subscribe_style()
+
+        # ── Далее в очереди ──────────────────────────────────────────────
+        self._queue_section = QWidget()
+        queue_col = QVBoxLayout(self._queue_section)
+        queue_col.setContentsMargins(0, 0, 0, 0)
+        queue_col.setSpacing(10)
+
+        divider2 = QFrame()
+        divider2.setFrameShape(QFrame.Shape.HLine)
+        divider2.setStyleSheet(f"color: {COLORS['BORDER']};")
+        queue_col.addWidget(divider2)
+
+        queue_hdr = QLabel("Далее в очереди")
+        queue_hdr.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
+        queue_hdr.setStyleSheet(f"color: {COLORS['TEXT_PRIMARY']};")
+        queue_col.addWidget(queue_hdr)
+
+        self._queue_track_widget = QWidget()
+        self._queue_track_widget.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._queue_track_widget.mousePressEvent = lambda e: self.queue_track_clicked.emit()
+        queue_row = QHBoxLayout(self._queue_track_widget)
+        queue_row.setContentsMargins(0, 0, 0, 0)
+        queue_row.setSpacing(10)
+        self._queue_cover = QLabel()
+        self._queue_cover.setFixedSize(44, 44)
+        self._queue_cover.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._queue_cover.setStyleSheet(f"background: {COLORS['SURFACE_LIGHT']}; border-radius: 4px;")
+        queue_row.addWidget(self._queue_cover)
+        queue_text_col = QVBoxLayout()
+        queue_text_col.setSpacing(2)
+        self._queue_title = QLabel("")
+        self._queue_title.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        self._queue_title.setStyleSheet(f"color: {COLORS['TEXT_PRIMARY']};")
+        self._queue_title.setWordWrap(True)
+        self._queue_artist = QLabel("")
+        self._queue_artist.setFont(QFont("Segoe UI", 9))
+        self._queue_artist.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']};")
+        self._queue_artist.setWordWrap(True)
+        queue_text_col.addWidget(self._queue_title)
+        queue_text_col.addWidget(self._queue_artist)
+        queue_row.addLayout(queue_text_col, 1)
+        queue_col.addWidget(self._queue_track_widget)
+
+        self._queue_empty_label = QLabel("Треков в очереди больше нет")
+        self._queue_empty_label.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']}; font: 9pt 'Segoe UI';")
+        self._queue_empty_label.setWordWrap(True)
+        queue_col.addWidget(self._queue_empty_label)
+
+        outer.addWidget(self._queue_section)
+        outer.addStretch(1)
+
+        self._about_section.setVisible(False)
+        self._queue_section.setVisible(False)
+
+    def _apply_subscribe_style(self):
+        c = COLORS
+        if self._is_subscribed:
+            self._subscribe_btn.setText("Вы подписаны")
+            self._subscribe_btn.setToolTip("Отписаться от исполнителя")
+            self._subscribe_btn.setStyleSheet(
+                f"QPushButton {{ background: transparent; border: 1.5px solid {c['PRIMARY']}; border-radius: 16px; "
+                f"color: {c['PRIMARY']}; font: 9.5pt 'Segoe UI'; font-weight: 600; padding: 0 16px; }}"
+                f"QPushButton:hover {{ color: {c['PRIMARY_HOVER']}; border-color: {c['PRIMARY_HOVER']}; }}"
+            )
+        else:
+            self._subscribe_btn.setText("Подписаться")
+            self._subscribe_btn.setToolTip("Подписаться на исполнителя")
+            self._subscribe_btn.setStyleSheet(
+                f"QPushButton {{ background: {c['PRIMARY_GRADIENT']}; border: none; border-radius: 16px; "
+                f"color: #000; font: 9.5pt 'Segoe UI'; font-weight: 600; padding: 0 16px; }}"
+                f"QPushButton:hover {{ background: {c['PRIMARY_HOVER']}; }}"
+            )
+
+    def set_track(self, title: str, artist_name: str):
+        self._title_label.setText(title or "Неизвестно")
+        self._now_artist_label.setText(artist_name)
+        self._now_artist_label.setVisible(bool(artist_name))
+
+    def set_cover_pixmap(self, pixmap: QPixmap | None):
+        self._cover_label.setPixmap(pixmap if pixmap and not pixmap.isNull() else QPixmap())
+
+    def set_about_artist(self, artist_name: str, subscribable: bool):
+        has_artist = bool(artist_name)
+        self._about_section.setVisible(has_artist)
+        if not has_artist:
+            return
+        self._about_artist_name.setText(artist_name)
+        self._artist_avatar.setPixmap(QPixmap())
+        self._subscribe_btn.setVisible(subscribable)
+
+    def set_artist_avatar_pixmap(self, pixmap: QPixmap | None):
+        self._artist_avatar.setPixmap(pixmap if pixmap and not pixmap.isNull() else QPixmap())
+
+    def set_subscribed(self, subscribed: bool):
+        self._is_subscribed = subscribed
+        self._apply_subscribe_style()
+
+    def set_queue_track(self, title: str | None, artist_name: str | None):
+        self._queue_section.setVisible(True)
+        has_track = bool(title)
+        self._queue_track_widget.setVisible(has_track)
+        self._queue_empty_label.setVisible(not has_track)
+        if has_track:
+            self._queue_title.setText(title)
+            self._queue_artist.setText(artist_name or "")
+            self._queue_artist.setVisible(bool(artist_name))
+
+    def set_queue_cover_pixmap(self, pixmap: QPixmap | None):
+        self._queue_cover.setPixmap(pixmap if pixmap and not pixmap.isNull() else QPixmap())
+
+    def clear(self):
+        self._title_label.setText("Ничего не играет")
+        self._now_artist_label.setText("")
+        self._now_artist_label.setVisible(False)
+        self._cover_label.setPixmap(QPixmap())
+        self._about_section.setVisible(False)
+        self._queue_section.setVisible(False)
+
+    def apply_accent(self):
+        self._apply_subscribe_style()
+
+
 class MusicApp(QWidget):
     logout_requested = pyqtSignal()
 
@@ -5736,6 +6447,11 @@ class MusicApp(QWidget):
         self._search_worker: SearchWorker | None = None
         self._download_threads: list[QThread] = []
         self._img_runners: list = []   # [thread, worker] entries from _start_image_loader
+        self._lyrics_runners: list = []   # [thread, worker] entries from _start_lyrics_worker
+        # (artist, title) -> {"plain": str, "synced": list[(ms, text)]} — present-but-empty "plain" means looked up, not found
+        self._lyrics_cache: dict[tuple[str, str], dict] = {}
+        self._lyrics_request_id = 0   # staleness guard — see _refresh_now_playing_lyrics
+        self._lyrics_viewer_key: tuple[str, str] | None = None   # (artist, title) LyricsViewerOverlay is showing
         self._prev_page_before_search: QWidget | None = None
         self._loading = False
         self._closing = False  # set once closeEvent starts, so scheduled/async
@@ -5864,6 +6580,8 @@ class MusicApp(QWidget):
         self._sidebar.set_server_collapsed(bool(self._settings.get("library_collapsed", False)))
         self._sidebar.set_local_collapsed(bool(self._settings.get("local_library_collapsed", False)))
 
+        self._now_playing_toggle.setChecked(bool(self._settings.get("now_playing_panel_open", False)))
+
         local_lib_enabled = bool(self._settings.get("local_library_enabled", False))
         self._settings_page.set_local_library_enabled(local_lib_enabled)
         if self._offline:
@@ -5983,6 +6701,26 @@ class MusicApp(QWidget):
         )
         body_row.addWidget(self._page_stack, 1)
 
+        # Now-playing side panel — collapsed by default, opened via the
+        # always-visible toggle handle docked at the far right edge. Lives
+        # in body_row itself (not a floating overlay) so opening it yields
+        # page_stack width, same as the sidebar on the other side.
+        self._now_playing_panel = NowPlayingSidePanel()
+        self._now_playing_panel.cover_clicked.connect(self._on_now_playing_cover_clicked)
+        self._now_playing_panel.title_clicked.connect(self._on_now_playing_album_clicked)
+        self._now_playing_panel.artist_clicked.connect(self._on_now_playing_artist_clicked)
+        self._now_playing_panel.subscribe_clicked.connect(self._on_now_playing_subscribe_clicked)
+        # Same slot the physical "next" transport button uses — the queue
+        # panel's "next up" row is exactly what play_next() would play.
+        self._now_playing_panel.queue_track_clicked.connect(self.player.play_next)
+        self._now_playing_panel.clear()
+        body_row.addWidget(self._now_playing_panel)
+
+        self._now_playing_toggle = _PanelToggleHandle()
+        self._now_playing_toggle.toggled.connect(self._now_playing_panel.set_expanded)
+        self._now_playing_toggle.toggled.connect(self._on_now_playing_panel_toggled)
+        body_row.addWidget(self._now_playing_toggle)
+
         main.addWidget(body, 1)
 
         # Full-window cover viewer overlay (parented to self so it covers everything)
@@ -5990,12 +6728,15 @@ class MusicApp(QWidget):
         self._disc_overlay = NowPlayingDiscOverlay(self)
         self._avatar_crop_overlay = AvatarCropOverlay(self)
         self._avatar_crop_overlay.avatar_confirmed.connect(self._on_avatar_cropped)
+        self._lyrics_viewer = LyricsViewerOverlay(self)
 
         # Playback controls
         self._controls = PlaybackControls(self)
         self._controls.artist_clicked.connect(self._on_controls_artist_clicked)
         self._controls.album_clicked.connect(self._on_controls_album_clicked)
         self._controls.cover_clicked.connect(self._open_now_playing_disc)
+        self._controls.lyrics_clicked.connect(self._on_lyrics_button_clicked)
+        self._lyrics_viewer.line_clicked.connect(self.player.seek_to_ms)
         self._controls.play_btn.clicked.connect(self.player.toggle_playback)
         self._controls.prev_btn.clicked.connect(self.player.play_prev)
         self._controls.next_btn.clicked.connect(self.player.play_next)
@@ -6589,35 +7330,49 @@ class MusicApp(QWidget):
         if needs_restart:
             self._offer_restart()
 
+    def _apply_last_played_display(self, last_played: dict):
+        """Rebuilds the bottom bar's AND the side panel's "now playing"
+        display from a saved last_played_track entry, without starting
+        playback. Shared by _restore_ui_state (first attempt, right after
+        launch) and _retry_nav_restore (retried once the library's actually
+        loaded, for whichever parts needed it and came up empty the first
+        time)."""
+        track = {
+            "title": last_played.get("title", ""),
+            "artist_name": last_played.get("artist_name", ""),
+            "_real_album_title": last_played.get("album_title", ""),
+            "album_id": last_played.get("album_id", ""),
+        }
+        if last_played.get("_is_youtube"):
+            track["_is_youtube"] = True
+            track["_youtube_channel_url"] = last_played.get("_youtube_channel_url", "")
+        artist = {"artist": last_played.get("artist_name", "")}
+        album = {
+            "title": last_played.get("album_title", ""),
+            "cover": last_played.get("album_cover", ""),
+        }
+        display_artist_names = self._display_artist_names(
+            last_played.get("album_id", ""), last_played.get("artist_name", "")
+        )
+        self._controls.update_track_info(track, artist, album, display_artist_names=display_artist_names)
+        self._load_controls_cover(album)
+        self._refresh_now_playing_panel(track, last_played.get("artist_name", ""), last_played.get("album_cover", ""))
+
     def _restore_ui_state(self):
         if self._state_restored:
             return
         self._state_restored = True
 
-        # Restore bottom bar track display, and prime the player with the real
-        # album/track so the play button can actually resume it (not just show it).
+        # Restore bottom bar + side panel track display, and prime the player
+        # with the real album/track so the play button can actually resume
+        # it (not just show it).
         last_played = self._settings.get("last_played_track")
         if isinstance(last_played, dict) and last_played.get("title"):
-            track = {
-                "title": last_played.get("title", ""),
-                "artist_name": last_played.get("artist_name", ""),
-                "_real_album_title": last_played.get("album_title", ""),
-                "album_id": last_played.get("album_id", ""),
-            }
-            if last_played.get("_is_youtube"):
-                track["_is_youtube"] = True
-                track["_youtube_channel_url"] = last_played.get("_youtube_channel_url", "")
-            artist = {"artist": last_played.get("artist_name", "")}
-            album = {
-                "title": last_played.get("album_title", ""),
-                "cover": last_played.get("album_cover", ""),
-            }
-            display_artist_names = self._display_artist_names(
-                last_played.get("album_id", ""), last_played.get("artist_name", "")
-            )
-            self._controls.update_track_info(track, artist, album, display_artist_names=display_artist_names)
-            self._load_controls_cover(album)
+            # Priming first: _apply_last_played_display's panel refresh peeks
+            # at self.player.current_playing_album/current_track for "Далее
+            # в очереди", which only _prime_player_for_resume populates.
             self._prime_player_for_resume(last_played)
+            self._apply_last_played_display(last_played)
 
         # Restore navigation
         page = self._settings.get("last_view_page", "")
@@ -6650,14 +7405,42 @@ class MusicApp(QWidget):
     def _prime_player_for_resume(self, last_played: dict):
         """Load the real album/track (found via the library) into the player
         without starting playback, so pressing the bottom-bar play button
-        actually resumes the last-played track instead of doing nothing."""
+        actually resumes the last-played track instead of doing nothing.
+
+        A track last played from a playlist or "Понравившиеся" gets its
+        actual queue rebuilt here too (see _on_track_changed's
+        last_played_payload) — resuming straight into the track's real
+        album instead would silently swap the queue out from under the
+        user, so next/prev would walk through the wrong tracklist after
+        a restart."""
         if last_played.get("_is_youtube"):
             self._prime_youtube_resume(last_played)
             return
+        track_title = last_played.get("title", "")
+        if not track_title:
+            return
+
+        playlist_id = last_played.get("_playlist_id", "")
+        if playlist_id:
+            pl = next((p for p in self._playlists if p.get("id") == playlist_id), None)
+            if pl is not None:
+                login = (self._account_manager.active_login if self._account_manager else "") or ""
+                creator_name = self._display_name or login
+                virtual_album = self._build_playlist_virtual_album(pl, creator_name, True, login)
+                if self._prime_from_virtual_album(virtual_album, {"artist": ""}, track_title):
+                    return
+            # Playlist deleted/renamed since, or the track's gone from it —
+            # fall through to the real-album resume below instead of
+            # resuming into nothing.
+
+        if last_played.get("_is_liked_album"):
+            virtual_album, virtual_artist = self._build_liked_virtual_album()
+            if self._prime_from_virtual_album(virtual_album, virtual_artist, track_title):
+                return
+
         artist_name = last_played.get("artist_name", "")
         album_title = last_played.get("album_title", "")
-        track_title = last_played.get("title", "")
-        if not artist_name or not album_title or not track_title:
+        if not artist_name or not album_title:
             return
 
         artist = self._find_artist_any(artist_name)
@@ -6672,13 +7455,16 @@ class MusicApp(QWidget):
         if not album:
             return
 
+        self._prime_from_virtual_album(album, artist, track_title)
+
+    def _prime_from_virtual_album(self, album: dict, artist: dict, track_title: str) -> bool:
         idx = None
         for i, t in enumerate(album.get("tracks", [])):
             if clean_title(t.get("title", "")) == clean_title(track_title):
                 idx = i
                 break
         if idx is None:
-            return
+            return False
 
         self.player.set_album(album, artist)
         try:
@@ -6687,6 +7473,7 @@ class MusicApp(QWidget):
             pos = idx
         self.player.current_track = pos
         self.player.current_track_idx = idx
+        return True
 
     def _prime_youtube_resume(self, last_played: dict):
         """_prime_player_for_resume's counterpart for a YouTube track — no
@@ -6722,6 +7509,11 @@ class MusicApp(QWidget):
             last_played = self._settings.get("last_played_track")
             if isinstance(last_played, dict) and last_played.get("title"):
                 self._prime_player_for_resume(last_played)
+                if self.player.current_playing_album is not None:
+                    # Bottom bar/panel text was already showing correctly
+                    # (it comes straight from last_played, not the library)
+                    # — only "Далее в очереди" needed priming to actually work.
+                    self._refresh_now_playing_queue()
 
         page = self._settings.get("last_view_page", "")
         artist_name = self._settings.get("last_view_artist", "")
@@ -7434,8 +8226,7 @@ class MusicApp(QWidget):
             "_real_album_cover": lt.get("album_cover", ""),
         }
 
-    def _on_liked_tracks_selected(self):
-        """Show liked tracks as a virtual album in the album page."""
+    def _build_liked_virtual_album(self) -> tuple[dict, dict]:
         library = self.library_manager.get_library()
         tracks = []
         for lt in self._liked_tracks:
@@ -7453,6 +8244,11 @@ class MusicApp(QWidget):
             "_is_liked_album": True,
         }
         virtual_artist = {"artist": ""}
+        return virtual_album, virtual_artist
+
+    def _on_liked_tracks_selected(self):
+        """Show liked tracks as a virtual album in the album page."""
+        virtual_album, virtual_artist = self._build_liked_virtual_album()
         self._current_album = virtual_album
         self._current_artist = virtual_artist
         self._album_page.load_album(
@@ -7586,6 +8382,49 @@ class MusicApp(QWidget):
                 if clean_title(al.get("title", "")) == cleaned:
                     return al
         return None
+
+    def _on_now_playing_album_clicked(self):
+        # Same title/artist text PlaybackControls already tracks for its
+        # own cover/title clicks (see PlaybackControls.update_track_info)
+        # — reused so cover/title in the side panel land on exactly the
+        # same album (or open the same YouTube video) as clicking the
+        # bottom bar would.
+        self._on_controls_album_clicked(self._controls.current_album_title, self._controls.current_artist_name)
+
+    def _on_now_playing_artist_clicked(self):
+        self._on_controls_artist_clicked(self._controls.current_artist_name)
+
+    def _on_now_playing_cover_clicked(self):
+        # Same full-size viewer (with download) AlbumPage's own cover opens
+        # — see AlbumPage's cover_clicked, gated the exact same way there:
+        # only real albums with an actual cover field, not playlists/liked
+        # tracks (those don't carry one "album" cover of their own).
+        album = self.player.current_playing_album
+        artist = self.player.current_playing_artist
+        if album and album.get("cover") and not album.get("_is_liked_album"):
+            self._cover_viewer.show_for(album, artist)
+
+    def _on_now_playing_panel_toggled(self, expanded: bool):
+        self._save_ui_state(now_playing_panel_open=expanded)
+
+    def _on_lyrics_button_clicked(self):
+        # current_artist_name/track_title mirror _on_now_playing_album_clicked's
+        # reasoning — populated by PlaybackControls.update_track_info on
+        # every real track change AND on session resume (_apply_last_played_
+        # display), unlike self._playing_track which resume never sets.
+        title = self._controls.track_title.text()
+        if not title or title == "Нет трека":
+            return
+        artist_name = clean_artist_name(self._controls.current_artist_name or "")
+        cache_key = (artist_name.lower(), title.lower())
+        self._lyrics_viewer_key = cache_key
+        cover_rel = self._resolve_playing_cover_rel(self.player.current_playing_album)
+        self._lyrics_viewer.show_for(title, artist_name, cover_rel)
+        cached = self._lyrics_cache.get(cache_key)
+        if cached:
+            self._lyrics_viewer.set_lyrics_data(cached["plain"], cached["synced"])
+        else:
+            self._lyrics_viewer.set_lyrics_loading()
 
     # ── Playback ──────────────────────────────────────────────────────────────
 
@@ -8135,6 +8974,36 @@ class MusicApp(QWidget):
         })
         self._update_sidebar_from_account()
 
+    def _on_now_playing_subscribe_clicked(self):
+        # Deliberately independent of _on_artist_like_clicked/self._current_artist,
+        # which is whatever artist page the user happens to be *browsing* —
+        # the side panel's subscribe button is always about the *playing*
+        # artist (see PlaybackControls.update_track_info), which can be a
+        # different one entirely.
+        if not self._account_manager:
+            return
+        artist_name = (self._controls.current_artist_name or "").strip()
+        if not artist_name:
+            return
+        order_key = f"artist::{artist_name}"
+        if artist_name in self._subscriptions:
+            self._subscriptions.remove(artist_name)
+            if order_key in self._follow_order:
+                self._follow_order.remove(order_key)
+            subscribed = False
+        else:
+            self._subscriptions.append(artist_name)
+            self._follow_order.insert(0, order_key)
+            subscribed = True
+        self._now_playing_panel.set_subscribed(subscribed)
+        # Keep ArtistPage's own button in sync if it's showing this same artist.
+        if self._current_artist and (self._current_artist.get("artist") or "").strip() == artist_name:
+            self._artist_page.set_liked(subscribed)
+        self._save_player_data_async({
+            "subscriptions": self._subscriptions, "follow_order": self._follow_order,
+        })
+        self._update_sidebar_from_account()
+
     def _on_accent_changed(self, color: str, color2: str):
         # Single source of truth for persistence — avoid a second writer
         # (SettingsPage used to write the file itself, which got clobbered
@@ -8155,6 +9024,7 @@ class MusicApp(QWidget):
         self._settings_page.apply_accent()
         self._avatar_btn.apply_accent()
         self._profile_page.apply_accent()
+        self._now_playing_panel.apply_accent()
         c = COLORS
         # The search field's pill border lives on _search_wrapper, not on the
         # QLineEdit itself (which stays borderless) — just refresh it for the
@@ -8372,11 +9242,13 @@ class MusicApp(QWidget):
         if self.player.shuffle_enabled != checked:
             self.player.toggle_shuffle()
         self._save_ui_state(shuffle=self.player.shuffle_enabled)
+        self._refresh_now_playing_queue()
 
     def _on_repeat(self):
         mode = self.player.toggle_repeat()
         self._controls.set_repeat(mode)
         self._save_ui_state(repeat=mode)
+        self._refresh_now_playing_queue()
 
     def _on_seek(self):
         value = self._controls.progress_slider.value()
@@ -8436,6 +9308,7 @@ class MusicApp(QWidget):
         # an empty cover — showing no artwork at startup until playback was
         # started again (which re-resolved it correctly via this same logic).
         cover = self._resolve_playing_cover_rel(album)
+        self._refresh_now_playing_panel(track, artist_name, cover)
         last_played_payload = {
             "title": track.get("title", ""),
             "artist_name": artist_name,
@@ -8453,6 +9326,17 @@ class MusicApp(QWidget):
             channel_url = track.get("_youtube_channel_url", "")
             if channel_url:
                 last_played_payload["_youtube_channel_url"] = channel_url
+        elif album and album.get("_is_playlist"):
+            # album_title/album_id above are already the track's *real*
+            # album (see _resolve_playing_cover_rel's comment) — that's
+            # right for album_history's "Продолжить слушать", but resuming
+            # into that real album instead of the playlist would silently
+            # swap the queue out from under the user (next/prev would walk
+            # through the wrong tracklist). Recorded separately so
+            # _prime_player_for_resume can rebuild the actual playlist.
+            last_played_payload["_playlist_id"] = album.get("_playlist_id", "")
+        elif album and album.get("_is_liked_album"):
+            last_played_payload["_is_liked_album"] = True
         self._save_ui_state(
             last_played_track=last_played_payload,
             # A YouTube "album" has nothing a later library lookup could
@@ -8523,6 +9407,179 @@ class MusicApp(QWidget):
 
         _start_image_loader([cover_url], 56, 6, on_loaded, self._img_runners)
 
+    def _resolve_track_cover_rel(self, album: dict, track: dict) -> str:
+        """Same "real per-track cover for a virtual album" resolution as
+        _resolve_playing_cover_rel, but for an arbitrary track (the queue
+        panel's "next up" track isn't necessarily the currently *playing*
+        one, which is all _resolve_playing_cover_rel can look at)."""
+        cover_rel = (album or {}).get("cover", "")
+        is_virtual = bool(album) and (album.get("_is_liked_album") or album.get("_is_playlist"))
+        if is_virtual:
+            real = (track or {}).get("_real_album_cover", "")
+            if real:
+                cover_rel = real
+        return cover_rel
+
+    def _refresh_now_playing_panel(self, track: dict, artist_name: str, cover_rel: str):
+        """Pushes the just-started track into the side panel — called from
+        _on_track_changed, right alongside the same bottom-bar update."""
+        panel = self._now_playing_panel
+        title = clean_title(track.get("title", "")) or "Неизвестно"
+        panel.set_track(title, clean_artist_name(artist_name) if artist_name else "")
+        self._load_now_playing_cover(cover_rel)
+
+        real_artist = self._find_artist_any(artist_name) if artist_name else None
+        panel.set_about_artist(
+            clean_artist_name(artist_name) if artist_name else "",
+            subscribable=bool(real_artist),
+        )
+        if artist_name:
+            panel.set_subscribed(artist_name in self._subscriptions)
+        if real_artist and real_artist.get("cover"):
+            self._load_now_playing_artist_avatar(resolve_media_url(real_artist["cover"]))
+        else:
+            panel.set_artist_avatar_pixmap(None)
+
+        self._refresh_now_playing_queue()
+        self._refresh_now_playing_lyrics(track, title, artist_name)
+
+    def _refresh_now_playing_lyrics(self, track: dict, title: str, artist_name: str):
+        """Pre-fetches lyrics (plain + synced, when lrclib has an LRC
+        version) for the track that just started, cached in memory per
+        (artist, title) for the rest of the session — so by the time the
+        user actually opens LyricsViewerOverlay (the button next to the
+        volume slider, see _on_lyrics_button_clicked), it's usually already
+        there instead of starting the fetch only on click. title is already
+        clean_title()'d by the caller (_refresh_now_playing_panel);
+        artist_name is not."""
+        clean_artist = clean_artist_name(artist_name) if artist_name else ""
+        if not title or not clean_artist:
+            return
+
+        cache_key = (clean_artist.lower(), title.lower())
+        if cache_key in self._lyrics_cache:
+            return
+
+        self._lyrics_request_id += 1
+        request_id = self._lyrics_request_id
+        album_title = clean_title(track.get("_real_album_title", "")) if track.get("_real_album_title") else ""
+        duration_sec = int((track.get("duration") or 0) / 1000)
+
+        def on_finished(plain: str, synced: list, _rid=request_id, _key=cache_key):
+            if _rid != self._lyrics_request_id:
+                return  # a newer track started playing before this returned
+            self._lyrics_cache[_key] = {"plain": plain, "synced": synced}
+            # Only live-update the viewer if it's open AND still showing
+            # this exact track — it doesn't follow later track changes on
+            # its own (see _on_lyrics_button_clicked).
+            if self._lyrics_viewer.isVisible() and self._lyrics_viewer_key == _key:
+                self._lyrics_viewer.set_lyrics_data(plain, synced)
+
+        _start_lyrics_worker(clean_artist, title, album_title, duration_sec, on_finished, self._lyrics_runners)
+
+    def _next_queue_track(self) -> tuple[dict | None, dict | None]:
+        """(track, album) that will start once the current one ends, given
+        the live shuffle/repeat state — mirrors PlayerController.play_next's
+        own branching (core/player_vlc.py) without actually advancing
+        anything. Crossing into the *next album* (the on_album_finished
+        hand-off) isn't resolved here — that hand-off picks the next
+        artist/album via a whole separate lookup or a random pick keyed off
+        subscriptions, not a simple queue peek, so it isn't shown."""
+        p = self.player
+        album = p.current_playing_album
+        if not album or p.current_track is None or not p.shuffled_indices:
+            return None, None
+        tracks = album.get("tracks", []) or []
+        if p.repeat_mode == "track":
+            idx = p.current_track_idx
+        else:
+            next_pos = p.current_track + 1
+            if next_pos < len(p.shuffled_indices):
+                idx = p.shuffled_indices[next_pos]
+            elif p.repeat_mode == "album":
+                idx = p.shuffled_indices[0]
+            else:
+                idx = None
+        if idx is None:
+            return None, None
+        try:
+            return tracks[idx], album
+        except (IndexError, TypeError):
+            return None, None
+
+    def _refresh_now_playing_queue(self):
+        track, album = self._next_queue_track()
+        panel = self._now_playing_panel
+        if not track:
+            panel.set_queue_track(None, None)
+            return
+        title = clean_title(track.get("title", "")) or "Неизвестно"
+        artist_name = track.get("artist_name") or (self.player.current_playing_artist or {}).get("artist", "") or ""
+        panel.set_queue_track(title, clean_artist_name(artist_name) if artist_name else "")
+        self._load_now_playing_queue_cover(self._resolve_track_cover_rel(album, track))
+
+    def _load_now_playing_cover(self, cover_rel: str):
+        if not cover_rel or (os.path.isabs(cover_rel) and os.path.exists(cover_rel)):
+            self._now_playing_panel.set_cover_pixmap(None)
+            return
+        cover_url = resolve_media_url(cover_rel)
+        key = cache_key(cover_url, 180, 8)
+        cached = cover_cache.get(key)
+        if cached and not cached.isNull():
+            self._now_playing_panel.set_cover_pixmap(cached)
+            return
+
+        def on_loaded(url, img, size, radius):
+            try:
+                pm = QPixmap.fromImage(img) if img else QPixmap()
+                if not pm.isNull():
+                    cover_cache.set(cache_key(url, size, radius), pm)
+                    self._now_playing_panel.set_cover_pixmap(pm)
+            except Exception:
+                pass
+
+        _start_image_loader([cover_url], 180, 8, on_loaded, self._img_runners)
+
+    def _load_now_playing_artist_avatar(self, url: str):
+        key = cache_key(url, 72, 36)
+        cached = cover_cache.get(key)
+        if cached and not cached.isNull():
+            self._now_playing_panel.set_artist_avatar_pixmap(cached)
+            return
+
+        def on_loaded(loaded_url, img, size, radius):
+            try:
+                pm = QPixmap.fromImage(img) if img else QPixmap()
+                if not pm.isNull():
+                    cover_cache.set(cache_key(loaded_url, size, radius), pm)
+                    self._now_playing_panel.set_artist_avatar_pixmap(pm)
+            except Exception:
+                pass
+
+        _start_image_loader([url], 72, 36, on_loaded, self._img_runners)
+
+    def _load_now_playing_queue_cover(self, cover_rel: str):
+        if not cover_rel or (os.path.isabs(cover_rel) and os.path.exists(cover_rel)):
+            self._now_playing_panel.set_queue_cover_pixmap(None)
+            return
+        cover_url = resolve_media_url(cover_rel)
+        key = cache_key(cover_url, 44, 4)
+        cached = cover_cache.get(key)
+        if cached and not cached.isNull():
+            self._now_playing_panel.set_queue_cover_pixmap(cached)
+            return
+
+        def on_loaded(url, img, size, radius):
+            try:
+                pm = QPixmap.fromImage(img) if img else QPixmap()
+                if not pm.isNull():
+                    cover_cache.set(cache_key(url, size, radius), pm)
+                    self._now_playing_panel.set_queue_cover_pixmap(pm)
+            except Exception:
+                pass
+
+        _start_image_loader([cover_url], 44, 4, on_loaded, self._img_runners)
+
     def _open_now_playing_disc(self):
         album = self.player.current_playing_album
         if not album:
@@ -8548,6 +9605,8 @@ class MusicApp(QWidget):
         self._controls.update_position(pos, dur)
         if self._mpris_service:
             self._mpris_service.update_position(pos, dur)
+        if self._lyrics_viewer.isVisible():
+            self._lyrics_viewer.set_position(pos)
         self._accumulate_listen_time()
 
     def _accumulate_listen_time(self):
@@ -8693,6 +9752,8 @@ class MusicApp(QWidget):
             self._cover_viewer.setGeometry(self.rect())
         if getattr(self, "_disc_overlay", None) and self._disc_overlay.isVisible():
             self._disc_overlay.setGeometry(self.rect())
+        if getattr(self, "_lyrics_viewer", None) and self._lyrics_viewer.isVisible():
+            self._lyrics_viewer.setGeometry(self.rect())
 
     # ── Close ─────────────────────────────────────────────────────────────────
 
@@ -8748,11 +9809,13 @@ class MusicApp(QWidget):
         # causes "QThread: Destroyed while thread is still running" aborts, so
         # give each a brief grace period to actually finish, not just a signal to stop.
         _stop_runners_and_wait(self._img_runners)
+        _stop_runners_and_wait(self._lyrics_runners)
         _stop_runners_and_wait(self._artist_page._runners)
         _stop_runners_and_wait(self._artist_page._album_grid._runners)
         _stop_runners_and_wait(self._album_page._runners)
         _stop_runners_and_wait(self._cover_viewer._runners)
         _stop_runners_and_wait(self._disc_overlay._runners)
+        _stop_runners_and_wait(self._lyrics_viewer._runners)
         _stop_runners_and_wait(self._search_page._runners)
         _stop_runners_and_wait(self._sidebar._runners)
         # Stop bare download threads

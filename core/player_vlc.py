@@ -494,6 +494,16 @@ class PlayerController(QObject):
         if self.on_playback_state_changed:
             self.on_playback_state_changed(False)
 
+    def seek_to_ms(self, ms: int):
+        """Absolute seek by millisecond — used by synced lyrics (a clicked
+        line's exact LRC timestamp), where converting to seek_position()'s
+        0-100 percentage would just reintroduce the rounding it's trying to
+        avoid."""
+        try:
+            self.player.set_time(max(0, int(ms)))
+        except Exception:
+            pass
+
     def seek_position(self, value: float):
         try:
             length = self.player.get_length()

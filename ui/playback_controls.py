@@ -432,11 +432,57 @@ class _GlyphButton(QPushButton):
         p.end()
 
 
+class _LyricsButton(QPushButton):
+    """Hand-drawn "lyrics" glyph (three text-like bars, decreasing width) —
+    no good single Unicode symbol for "song lyrics" reads clearly at this
+    size, and the project avoids emoji (see main_window.py's
+    _make_youtube_icon_pixmap for the same reasoning). Same idle/hover
+    color logic as _GlyphButton (TEXT_PRIMARY idle, accent on hover)."""
+
+    def __init__(self, parent=None):
+        super().__init__("", parent)
+        self._hovered = False
+        self.setFixedSize(28, 28)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setStyleSheet("background: transparent; border: none;")
+        self.setToolTip("Текст песни")
+
+    def enterEvent(self, event):
+        self._hovered = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hovered = False
+        self.update()
+        super().leaveEvent(event)
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        c = styles_module.COLORS
+        r = self.rect()
+        if self._hovered:
+            pen = QPen(styles_module.accent_brush(r.left(), 0, r.right(), 0), 2)
+        else:
+            pen = QPen(QColor(c["TEXT_PRIMARY"]), 2)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        cx, cy = r.center().x(), r.center().y()
+        y = cy - 7
+        for w in (12, 9, 6):
+            p.drawLine(int(cx - 7), int(y), int(cx - 7 + w), int(y))
+            y += 6
+        p.end()
+
+
 class PlaybackControls(QWidget):
     artist_clicked = pyqtSignal(str)
     album_clicked = pyqtSignal(str, str)
     like_clicked = pyqtSignal()
     cover_clicked = pyqtSignal()
+    lyrics_clicked = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -631,6 +677,10 @@ class PlaybackControls(QWidget):
         row.setSpacing(8)
         row.setContentsMargins(0, 0, 0, 0)
         row.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        self.lyrics_btn = _LyricsButton()
+        self.lyrics_btn.clicked.connect(self.lyrics_clicked.emit)
+        row.addWidget(self.lyrics_btn)
 
         self.volume_slider = ClickableSlider(Qt.Orientation.Horizontal)
         self.volume_slider.setMinimum(0)
