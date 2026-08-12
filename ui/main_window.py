@@ -31,7 +31,7 @@ from PyQt6.QtCore import (
     QPropertyAnimation, pyqtProperty, QEasingCurve, QBuffer,
 )
 from datetime import date, timedelta
-from PyQt6.QtGui import QFont, QColor, QPalette, QIcon, QPixmap, QFontMetrics, QCursor, QPainter, QPainterPath, QPen, QBrush, QLinearGradient, QDesktopServices
+from PyQt6.QtGui import QFont, QColor, QPalette, QIcon, QPixmap, QImage, QFontMetrics, QCursor, QPainter, QPainterPath, QPen, QBrush, QLinearGradient, QDesktopServices
 
 from config import SERVER_URL, APP_ICON, ICONS_DIR, APP_SETTINGS_FILE, PLAYER_DATA_CACHE_DIR, LIBRARY_CACHE_FILE, WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT, DATA_DIR, APP_VERSION, LOCAL_MUSIC_DIR
 from core.library import LibraryManager, SearchResult
@@ -60,6 +60,8 @@ from workers.search_worker import SearchWorker
 from workers.download_worker import DownloadWorker
 from workers.track_duration_worker import TrackDurationWorker
 from workers.lyrics_worker import LyricsWorker
+from workers.artist_bio_worker import ArtistBioWorker
+from workers.public_playlists_worker import PublicPlaylistsWorker
 
 try:
     from utils.media_keys import MediaKeysHandler
@@ -188,6 +190,88 @@ def _start_lyrics_worker(
     return entry
 
 
+def _start_artist_bio_worker(artist: str, on_finished_cb, runners_store: list):
+    """Same thread/worker bookkeeping as _start_lyrics_worker, for a single
+    one-shot ArtistBioWorker lookup."""
+    worker = ArtistBioWorker(artist)
+    thread = QThread(QApplication.instance())
+    worker.moveToThread(thread)
+
+    entry = [thread, worker]
+    runners_store.append(entry)
+
+    def _cleanup():
+        worker.deleteLater()
+        thread.deleteLater()
+        try:
+            runners_store.remove(entry)
+        except ValueError:
+            pass
+
+    worker.finished.connect(on_finished_cb)
+    worker.finished.connect(thread.quit)
+    thread.finished.connect(_cleanup)
+    thread.started.connect(worker.run)
+    thread.start()
+    return entry
+
+
+def _start_public_playlists_worker(artist_name: str, album_ids: list, limit: int, on_finished_cb, runners_store: list):
+    """Same thread/worker bookkeeping as _start_artist_bio_worker, for a
+    single one-shot PublicPlaylistsWorker lookup."""
+    worker = PublicPlaylistsWorker(artist_name, album_ids, limit)
+    thread = QThread(QApplication.instance())
+    worker.moveToThread(thread)
+
+    entry = [thread, worker]
+    runners_store.append(entry)
+
+    def _cleanup():
+        worker.deleteLater()
+        thread.deleteLater()
+        try:
+            runners_store.remove(entry)
+        except ValueError:
+            pass
+
+    worker.finished.connect(on_finished_cb)
+    worker.finished.connect(thread.quit)
+    thread.finished.connect(_cleanup)
+    thread.started.connect(worker.run)
+    thread.start()
+    return entry
+
+
+# artist name (lowercased) -> bio text, shared for the whole process lifetime
+# between the "Об исполнителе" now-playing card and the artist page — opening
+# the same artist in both only ever fetches it once.
+_artist_bio_cache: dict[str, str] = {}
+
+
+def _lookup_artist_bio(artist: str, on_result_cb, runners_store: list):
+    """Resolves `artist`'s bio via _artist_bio_cache when already known,
+    otherwise fetches it through ArtistBioWorker and caches the result.
+    on_result_cb(bio: str) is always called exactly once, synchronously on
+    a cache hit or from the worker's finished signal on a miss — callers
+    that care about staleness (the artist changing again before a fetch
+    returns) need their own request-id guard inside the callback, same as
+    _refresh_now_playing_lyrics does for lyrics."""
+    key = artist.strip().lower()
+    if not key:
+        on_result_cb("")
+        return
+    cached = _artist_bio_cache.get(key)
+    if cached is not None:
+        on_result_cb(cached)
+        return
+
+    def on_finished(_artist, bio, _key=key):
+        _artist_bio_cache[_key] = bio
+        on_result_cb(bio)
+
+    _start_artist_bio_worker(artist, on_finished, runners_store)
+
+
 def _blurred_backdrop(pixmap: QPixmap, radius: float = 28.0, tint_alpha: int = 130, downscale: int = 4) -> QPixmap:
     """Frosted-glass style backdrop: downscale (for speed + softer blur),
     blur via QGraphicsBlurEffect, scale back up, then darken with a translucent tint."""
@@ -312,6 +396,59 @@ def _decode_base64_pixmap(data: str) -> QPixmap | None:
     except Exception:
         pass
     return None
+
+
+def _dominant_cover_color(pm: QPixmap) -> QColor | None:
+    """Extracts a representative accent color from a cover pixmap, the way
+    Spotify/Apple Music tint their now-playing view — a saturation-weighted
+    average over a small downscale, rather than a plain pixel average (which
+    tends toward a muddy grey/brown once you mix a whole cover together).
+    Near-black and near-white/near-grey pixels are excluded from the weighted
+    pool since they're usually letterboxing or a plain background rather
+    than "the color of this cover", but still count in a fallback plain
+    average for all-grayscale covers (e.g. b&w photography) that would
+    otherwise have nothing left to weight. Returns None for a null/empty
+    pixmap."""
+    if pm is None or pm.isNull():
+        return None
+    img = pm.toImage().scaled(16, 16, Qt.AspectRatioMode.IgnoreAspectRatio,
+                               Qt.TransformationMode.FastTransformation)
+    img = img.convertToFormat(QImage.Format.Format_RGB32)
+
+    weighted_r = weighted_g = weighted_b = weight_total = 0.0
+    plain_r = plain_g = plain_b = 0
+    count = 0
+    for y in range(img.height()):
+        for x in range(img.width()):
+            c = QColor(img.pixel(x, y))
+            r, g, b = c.red(), c.green(), c.blue()
+            plain_r += r
+            plain_g += g
+            plain_b += b
+            count += 1
+            _, s, v, _ = c.getHsvF()
+            if v < 0.12 or (s < 0.12 and v > 0.92):
+                continue
+            weight = s + 0.05
+            weighted_r += r * weight
+            weighted_g += g * weight
+            weighted_b += b * weight
+            weight_total += weight
+
+    if count == 0:
+        return None
+    if weight_total > 0:
+        return QColor(int(weighted_r / weight_total), int(weighted_g / weight_total), int(weighted_b / weight_total))
+    return QColor(int(plain_r / count), int(plain_g / count), int(plain_b / count))
+
+
+def _blend_color(base: QColor, tint: QColor, t: float) -> QColor:
+    """Linear RGB blend of `base` toward `tint` by fraction `t` (0..1)."""
+    return QColor(
+        int(base.red() + (tint.red() - base.red()) * t),
+        int(base.green() + (tint.green() - base.green()) * t),
+        int(base.blue() + (tint.blue() - base.blue()) * t),
+    )
 
 
 def _make_placeholder_cover(size: int, radius: int, glyph: str = "♪") -> QPixmap:
@@ -572,20 +709,89 @@ class AlbumGridWidget(QWidget):
 # ──────────────────────────────────────────────────────────────────────────────
 
 class ArtistPage(QWidget):
-    """Pre-built page showing an artist's albums grid."""
+    """Pre-built page: artist header, bio, then a capped one-row preview of
+    their albums (see _fill_album_row) with a "Показать всё" through to
+    ArtistAllAlbumsPage for the rest — added instead of loading every
+    album's cover up front like the old full grid did here, which is what
+    actually made visiting a prolific artist's page slow."""
     album_clicked = pyqtSignal(dict, dict)  # (album, artist)
     artist_like_clicked = pyqtSignal()
+    show_all_albums_clicked = pyqtSignal(dict)  # (artist,)
+    track_play_requested = pyqtSignal(int, dict, dict)  # (track_idx_in_album, album, artist)
+    track_like_clicked = pyqtSignal(dict, dict, dict)  # (track, album, artist) — album varies per row here
+    playlist_clicked = pyqtSignal(dict)  # {"id", "name", "cover_data", "owner_login"} — see _fill_playlist_row
+
+    ROW_ALBUM_CAP = 14  # cards actually built + cover-loaded; how many of
+    # them are shown is separately capped by how many fit the current width
+    # (see _reflow_album_row) — this is just the outer ceiling so an
+    # artist with dozens of albums never gets them all loaded up front.
+    _ALBUM_CARD_STEP = 170 + 16  # AlbumWidget width + row spacing
+
+    RANDOM_TRACKS_INITIAL = 5
+    RANDOM_TRACKS_MAX = 10
+
+    PLAYLIST_CARD_CAP = 14  # random sample size when more than this many of
+    # the account's own playlists feature the artist
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._current_artist: dict = {}
-        self._runners: list = []
+        self._runners: list = []          # artist header cover only
+        self._album_row_runners: list = []   # kept separate from self._runners —
+        # _fill_album_row cancels this list at its own start on every
+        # load_artist() call, same as HomePage's _fill_albums; sharing it
+        # with the header cover loader used to mean that cancellation also
+        # killed the header avatar fetch a few milliseconds after it
+        # started, before it ever got a chance to call back — the avatar
+        # would then just keep showing whatever the previous artist's was.
+        self._bio_runners: list = []
+        self._bio_request_id = 0
         self._is_liked: bool = False
+        self._album_cards: list = []
+        self._total_album_count = 0
+        self._random_cover_runners: list = []
+        self._random_duration_worker: TrackDurationWorker | None = None
+        self._random_track_rows: list = []
+        self._random_tracks_pool: list = []  # [(track_idx_in_album, track, album), ...]
+        self._random_shown_count = 0
+        self._random_expanded = False
+        self._last_playing_url = ""
+        self._last_playing_track: dict | None = None
+        self._last_paused = False
+        self._playlist_cards: list = []
+        self._playlist_runners: list = []
+        self._playlist_request_id = 0
         self._build_ui()
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        QTimer.singleShot(0, self._reflow_playlist_row)
+        QTimer.singleShot(0, self._reflow_album_row)
+
     def _build_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 16, 20, 0)
+        # Scroll-wrapped (rather than a plain QVBoxLayout directly on self)
+        # since this page used to rely on the old full album grid's own
+        # internal QScrollArea to absorb any overflow — now that grid is
+        # gone (replaced by the one-row preview), nothing else here scrolls,
+        # and header + bio + up to 10 random tracks + the album row easily
+        # exceeds the window's minimum height on its own. Without this,
+        # content past the bottom edge doesn't just get clipped cleanly —
+        # widgets that manage their own height dynamically (the random
+        # tracks list growing from 5 to 10 rows on "Ещё") fight the page's
+        # fixed available height and visibly overlap instead.
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        page_scroll = QScrollArea()
+        page_scroll.setWidgetResizable(True)
+        page_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        page_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        page_scroll.setStyleSheet(get_scrollbar_style())
+
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(20, 16, 20, 16)
         layout.setSpacing(16)
 
         # Header
@@ -650,15 +856,117 @@ class ArtistPage(QWidget):
         divider.setStyleSheet(f"color: {COLORS['BORDER']};")
         layout.addWidget(divider, 0)
 
-        albums_label = QLabel("Альбомы")
-        albums_label.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
-        albums_label.setStyleSheet(f"color: {COLORS['TEXT_PRIMARY']};")
-        layout.addWidget(albums_label, 0)
+        # Bio — hidden until a lookup actually returns text (see _load_bio),
+        # since not every artist has one available.
+        self._bio_label = QLabel("")
+        self._bio_label.setWordWrap(True)
+        self._bio_label.setFont(QFont("Segoe UI", 10))
+        self._bio_label.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']};")
+        self._bio_label.setVisible(False)
+        layout.addWidget(self._bio_label, 0)
 
-        # Album grid
-        self._album_grid = AlbumGridWidget(self)
-        self._album_grid.album_clicked.connect(self._on_album_clicked)
-        layout.addWidget(self._album_grid, 1)
+        # ── Random tracks — a small taster row pulled from across every
+        # album, shown above "Музыка" itself (see RANDOM_TRACKS_INITIAL/MAX,
+        # _fill_random_tracks). Whole section hidden when the artist has no
+        # tracks at all instead of showing an empty header.
+        self._random_section = QWidget()
+        random_section_layout = QVBoxLayout(self._random_section)
+        random_section_layout.setContentsMargins(0, 0, 0, 0)
+        random_section_layout.setSpacing(12)
+
+        random_label = QLabel("Случайные треки")
+        random_label.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
+        random_label.setStyleSheet(f"color: {COLORS['TEXT_PRIMARY']};")
+        random_section_layout.addWidget(random_label)
+
+        self._random_tracks_container = QWidget()
+        self._random_tracks_layout = QVBoxLayout(self._random_tracks_container)
+        self._random_tracks_layout.setContentsMargins(0, 0, 0, 0)
+        self._random_tracks_layout.setSpacing(2)
+        random_section_layout.addWidget(self._random_tracks_container)
+
+        # Below the list, under the last row (5 or 10) — not up in the
+        # header — toggles between expanding to 10 and collapsing back to 5.
+        self._random_toggle_btn = QPushButton("Ещё")
+        self._random_toggle_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._random_toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._random_toggle_btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; border: none; color: {COLORS['TEXT_SECONDARY']}; "
+            f"font: 9.5pt 'Segoe UI'; font-weight: 600; }}"
+            f"QPushButton:hover {{ color: {COLORS['TEXT_PRIMARY']}; }}"
+        )
+        self._random_toggle_btn.clicked.connect(self._on_random_toggle_clicked)
+        self._random_toggle_btn.setVisible(False)
+        toggle_row = QHBoxLayout()
+        toggle_row.addStretch(1)
+        toggle_row.addWidget(self._random_toggle_btn)
+        toggle_row.addStretch(1)
+        random_section_layout.addLayout(toggle_row)
+
+        layout.addWidget(self._random_section, 0)
+
+        music_hdr_row = QHBoxLayout()
+        music_hdr_row.setSpacing(10)
+        music_label = QLabel("Музыка")
+        music_label.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
+        music_label.setStyleSheet(f"color: {COLORS['TEXT_PRIMARY']};")
+        music_hdr_row.addWidget(music_label)
+        music_hdr_row.addStretch(1)
+        self._show_all_btn = QPushButton("Показать всё")
+        self._show_all_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._show_all_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._show_all_btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; border: none; color: {COLORS['TEXT_SECONDARY']}; "
+            f"font: 9.5pt 'Segoe UI'; font-weight: 600; }}"
+            f"QPushButton:hover {{ color: {COLORS['TEXT_PRIMARY']}; }}"
+        )
+        self._show_all_btn.clicked.connect(
+            lambda: self.show_all_albums_clicked.emit(self._current_artist)
+        )
+        self._show_all_btn.setVisible(False)
+        music_hdr_row.addWidget(self._show_all_btn)
+        layout.addLayout(music_hdr_row)
+
+        # One-row album preview, styled like the old full grid's cards —
+        # no scrolling/arrows, just however many actually fit the current
+        # width (see _reflow_album_row); shrinks the visible count on a
+        # narrower window instead of wrapping to a second row or scrolling.
+        self._album_row_widget = QWidget()
+        self._album_row_layout = QHBoxLayout(self._album_row_widget)
+        self._album_row_layout.setContentsMargins(0, 0, 0, 0)
+        self._album_row_layout.setSpacing(16)
+        layout.addWidget(self._album_row_widget, 0)
+
+        # ── Playlists featuring this artist — same one-row, fit-to-width
+        # card style as the album row above (see _reflow_playlist_row).
+        # Only ever searches the account's own playlists (see
+        # _fill_playlist_row) — "+"-ed/subscribed ones aren't stored with
+        # their track list locally, so checking those would mean a network
+        # round trip per playlist just to find out whether any of them even
+        # qualify. Whole section stays hidden when nothing matches.
+        self._playlist_section = QWidget()
+        playlist_section_layout = QVBoxLayout(self._playlist_section)
+        playlist_section_layout.setContentsMargins(0, 0, 0, 0)
+        playlist_section_layout.setSpacing(12)
+
+        playlist_label = QLabel("Плейлисты, в которых есть исполнитель")
+        playlist_label.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
+        playlist_label.setStyleSheet(f"color: {COLORS['TEXT_PRIMARY']};")
+        playlist_section_layout.addWidget(playlist_label)
+
+        self._playlist_row_widget = QWidget()
+        self._playlist_row_layout = QHBoxLayout(self._playlist_row_widget)
+        self._playlist_row_layout.setContentsMargins(0, 0, 0, 0)
+        self._playlist_row_layout.setSpacing(16)
+        playlist_section_layout.addWidget(self._playlist_row_widget)
+
+        layout.addWidget(self._playlist_section, 0)
+        self._playlist_section.setVisible(False)
+
+        layout.addStretch(1)
+
+        page_scroll.setWidget(content)
+        root.addWidget(page_scroll)
 
     def load_artist(self, artist: dict):
         """Update this page for a different artist. Called on every navigation."""
@@ -682,8 +990,355 @@ class ArtistPage(QWidget):
         else:
             self._cover_label.setPixmap(QPixmap())
 
-        # Load albums grid (clear + refill)
-        self._album_grid.load_albums(albums, artist)
+        self._load_bio(name)
+        self._fill_random_tracks(albums)
+        self._fill_album_row(albums)
+        self._fill_playlist_row(name, albums)
+
+    def _fill_album_row(self, albums: list):
+        _stop_runners(self._album_row_runners)
+        row = self._album_row_layout
+        while row.count():
+            item = row.takeAt(0)
+            if item and item.widget():
+                # hide() immediately, not just deleteLater() — a removed
+                # widget otherwise stays visible at its old geometry (still
+                # a real child, just no longer layout-managed) until Qt
+                # actually gets around to the deferred delete, which can
+                # briefly paint it overlapping the newly reflowed cards.
+                item.widget().hide()
+                item.widget().deleteLater()
+        self._album_cards.clear()
+        self._total_album_count = len(albums)
+
+        preview = albums[:self.ROW_ALBUM_CAP]
+        if not preview:
+            placeholder = QLabel("Нет альбомов")
+            placeholder.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']};")
+            row.addWidget(placeholder, 0, Qt.AlignmentFlag.AlignTop)
+            self._show_all_btn.setVisible(False)
+            return
+
+        cover_urls = []
+        for album in preview:
+            cover_url = resolve_media_url(album["cover"]) if album.get("cover") else ""
+            card = AlbumWidget(album, cover_url, widget_size=170, cover_size=150)
+            card.clicked.connect(self._on_album_clicked)
+            row.addWidget(card, 0, Qt.AlignmentFlag.AlignTop)
+            self._album_cards.append(card)
+            cover_urls.append(cover_url)
+        row.addStretch(1)
+
+        self._load_row_covers(cover_urls)
+        # Deferred, not called synchronously — right after building these
+        # cards, self._album_row_widget.width() can still be a stale value
+        # from before layout has actually run this pass (same reason
+        # AlbumGridWidget.resizeEvent defers its own _reflow()).
+        QTimer.singleShot(0, self._reflow_album_row)
+
+    def _reflow_album_row(self):
+        """However many AlbumWidget cards fit the current width, edge to
+        edge, stay visible; the rest are hidden (not wrapped to a second
+        row, not scrollable) — matches how the old full grid's column count
+        itself responded to the window width, just clamped to one row."""
+        if not self._album_cards:
+            return
+        available = self._album_row_widget.width() or self.width()
+        fit = max(1, available // self._ALBUM_CARD_STEP)
+        visible = min(fit, len(self._album_cards))
+        for i, card in enumerate(self._album_cards):
+            card.setVisible(i < visible)
+        self._show_all_btn.setVisible(self._total_album_count > visible)
+
+    def _fill_playlist_row(self, artist_name: str, albums: list):
+        """Kicks off a server-side search (see PublicPlaylistsWorker /
+        server.py's /playlists/public_for_artist) for public playlists —
+        from any account, not just this one — that feature this artist,
+        since that's data no client has locally. Section stays as it was
+        (or empty, on first load) until the result comes back."""
+        _stop_runners(self._playlist_runners)
+        album_ids = [
+            str(a.get("album_id") or "").strip()
+            for a in albums if isinstance(a, dict) and a.get("album_id")
+        ]
+        self._playlist_request_id += 1
+        request_id = self._playlist_request_id
+
+        def on_finished(playlists: list, _rid=request_id):
+            if _rid != self._playlist_request_id:
+                return  # a newer artist was opened before this returned
+            self._apply_playlist_results(playlists)
+
+        if not artist_name and not album_ids:
+            self._apply_playlist_results([])
+            return
+
+        _start_public_playlists_worker(
+            artist_name, album_ids, self.PLAYLIST_CARD_CAP, on_finished, self._playlist_runners
+        )
+
+    def _apply_playlist_results(self, playlists: list):
+        row = self._playlist_row_layout
+        while row.count():
+            item = row.takeAt(0)
+            if item and item.widget():
+                item.widget().hide()
+                item.widget().deleteLater()
+        self._playlist_cards.clear()
+
+        self._playlist_section.setVisible(bool(playlists))
+        if not playlists:
+            return
+
+        for pl in playlists:
+            if not isinstance(pl, dict):
+                continue
+            name = pl.get("name") or "Плейлист"
+            card = AlbumWidget({"title": name}, "", widget_size=170, cover_size=150)
+            pixmap = _decode_base64_pixmap(pl.get("cover_data") or "") or _make_placeholder_cover(150, 14)
+            card.set_cover(pixmap)
+            summary = {
+                "id": pl.get("id", ""), "name": name,
+                "cover_data": pl.get("cover_data") or "",
+                "owner_login": pl.get("owner_login", ""),
+            }
+            card.clicked.connect(lambda _pl, s=summary: self.playlist_clicked.emit(s))
+            row.addWidget(card, 0, Qt.AlignmentFlag.AlignTop)
+            self._playlist_cards.append(card)
+        row.addStretch(1)
+        QTimer.singleShot(0, self._reflow_playlist_row)
+
+    def _reflow_playlist_row(self):
+        """Same fit-to-width, single-row behavior as _reflow_album_row —
+        the whole reason for it was "displayed also in one row like
+        albums", so this reuses the identical approach rather than a
+        different one."""
+        if not self._playlist_cards:
+            return
+        available = self._playlist_row_widget.width() or self.width()
+        fit = max(1, available // self._ALBUM_CARD_STEP)
+        visible = min(fit, len(self._playlist_cards))
+        for i, card in enumerate(self._playlist_cards):
+            card.setVisible(i < visible)
+
+    def _fill_random_tracks(self, albums: list):
+        _stop_runners(self._random_cover_runners)
+        self._stop_random_duration_loader()
+        while self._random_tracks_layout.count():
+            item = self._random_tracks_layout.takeAt(0)
+            if item and item.widget():
+                item.widget().hide()
+                item.widget().deleteLater()
+        self._random_track_rows.clear()
+
+        pool = []
+        for album in albums:
+            for track_idx, track in enumerate(album.get("tracks", []) or []):
+                if isinstance(track, dict):
+                    pool.append((track_idx, track, album))
+
+        self._random_tracks_pool = (
+            random.sample(pool, min(self.RANDOM_TRACKS_MAX, len(pool))) if pool else []
+        )
+        self._random_shown_count = 0
+        self._random_expanded = False
+        self._random_toggle_btn.setText("Ещё")
+        self._random_section.setVisible(bool(self._random_tracks_pool))
+        if self._random_tracks_pool:
+            self._reveal_random_tracks(self.RANDOM_TRACKS_INITIAL)
+        self._random_toggle_btn.setVisible(len(self._random_tracks_pool) > self.RANDOM_TRACKS_INITIAL)
+
+    def _reveal_random_tracks(self, up_to: int):
+        target = min(up_to, len(self._random_tracks_pool))
+        cover_pairs = []
+        urls_needing_duration = []
+        while self._random_shown_count < target:
+            track_idx, track, album = self._random_tracks_pool[self._random_shown_count]
+            row_idx = len(self._random_track_rows)
+            row = TrackRow(track_idx, track, display_number=row_idx + 1)
+            row.show_cover(True)
+            row.play_requested.connect(
+                lambda idx, al=album, ar=self._current_artist: self.track_play_requested.emit(idx, al, ar)
+            )
+            row.like_clicked.connect(
+                lambda _idx, t=track, al=album, ar=self._current_artist: self.track_like_clicked.emit(t, al, ar)
+            )
+            self._random_tracks_layout.addWidget(row)
+            self._random_track_rows.append(row)
+
+            # A newly built row needs the current playing/paused state
+            # applied right away — otherwise it sits un-highlighted until
+            # the next track change even if it happens to be the track
+            # already playing (e.g. right after load_artist(), or after
+            # "Ещё" reveals rows 6-10 mid-playback).
+            keys = _track_like_keys(self._last_playing_track or {}, self._last_playing_url)
+            is_playing = bool(keys) and bool(row.track_identity_keys() & keys)
+            row.set_playing(is_playing)
+            if is_playing:
+                row.set_paused(self._last_paused)
+
+            cover_rel = album.get("cover", "")
+            if cover_rel:
+                cover_pairs.append((row_idx, resolve_media_url(cover_rel)))
+
+            if not track.get("duration"):
+                url = resolve_media_url(track.get("url", ""))
+                if url:
+                    urls_needing_duration.append((row_idx, url))
+
+            self._random_shown_count += 1
+
+        if cover_pairs:
+            self._load_random_covers(cover_pairs)
+        if urls_needing_duration:
+            self._start_random_duration_loader(urls_needing_duration)
+
+    def _collapse_random_tracks(self):
+        self._stop_random_duration_loader()
+        while len(self._random_track_rows) > self.RANDOM_TRACKS_INITIAL:
+            row = self._random_track_rows.pop()
+            self._random_tracks_layout.removeWidget(row)
+            row.hide()
+            row.deleteLater()
+        self._random_shown_count = len(self._random_track_rows)
+
+    def _on_random_toggle_clicked(self):
+        if self._random_expanded:
+            self._collapse_random_tracks()
+            self._random_expanded = False
+            self._random_toggle_btn.setText("Ещё")
+        else:
+            self._reveal_random_tracks(self.RANDOM_TRACKS_MAX)
+            self._random_expanded = True
+            self._random_toggle_btn.setText("Свернуть")
+
+    def _load_random_covers(self, pairs: list):
+        to_load = []
+        for row_idx, url in pairs:
+            key = cache_key(url, 36, 4)
+            cached = cover_cache.get(key)
+            if cached and not cached.isNull() and row_idx < len(self._random_track_rows):
+                self._random_track_rows[row_idx].set_cover_pixmap(cached)
+            else:
+                to_load.append((row_idx, url))
+        if not to_load:
+            return
+
+        # Multiple random-picked tracks very commonly share the same
+        # album (and so the same cover url) — map to every row that wants
+        # it, not just the first, since ImageLoaderWorker only fetches/
+        # emits once per distinct url. Mapping to a single index left
+        # every row past the first one blank once the image arrived,
+        # which is exactly the "some tracks have no cover" bug this fixes.
+        rows_by_url: dict[str, list[int]] = {}
+        for row_idx, url in to_load:
+            rows_by_url.setdefault(url, []).append(row_idx)
+        load_urls = list(rows_by_url.keys())
+
+        def on_loaded(url, img, size, radius):
+            if img is None:
+                return
+            try:
+                pm = QPixmap.fromImage(img)
+                if pm.isNull():
+                    return
+                cover_cache.set(cache_key(url, size, radius), pm)
+                for row_idx in rows_by_url.get(url, []):
+                    if row_idx < len(self._random_track_rows):
+                        self._random_track_rows[row_idx].set_cover_pixmap(pm)
+            except Exception:
+                pass
+
+        _start_image_loader(load_urls, 36, 4, on_loaded, self._random_cover_runners)
+
+    def _start_random_duration_loader(self, index_url_pairs: list):
+        urls = [u for _, u in index_url_pairs]
+        idx_map = {u: i for i, u in index_url_pairs}
+
+        worker = TrackDurationWorker(urls, parent=self)
+        self._random_duration_worker = worker
+
+        def on_duration(url: str, ms: int):
+            if ms <= 0:
+                return
+            idx = idx_map.get(url)
+            if idx is not None and idx < len(self._random_track_rows):
+                self._random_track_rows[idx].update_duration(ms)
+
+        def on_finished(w=worker):
+            if self._random_duration_worker is w:
+                self._random_duration_worker = None
+            w.deleteLater()
+
+        worker.duration_ready.connect(on_duration)
+        worker.finished.connect(on_finished)
+        worker.start()
+
+    def _stop_random_duration_loader(self):
+        if self._random_duration_worker:
+            try:
+                self._random_duration_worker.stop()
+            except Exception:
+                pass
+            self._random_duration_worker = None
+
+    def _load_row_covers(self, urls: list):
+        valid = [(i, u) for i, u in enumerate(urls) if u]
+        if not valid:
+            return
+        to_load = []
+        for i, url in valid:
+            key = cache_key(url, 150, 14)
+            cached = cover_cache.get(key)
+            if cached and not cached.isNull() and i < len(self._album_cards):
+                self._album_cards[i].set_cover(cached)
+            else:
+                to_load.append((i, url))
+        if not to_load:
+            return
+
+        # A url can legitimately appear more than once (two albums sharing
+        # a cover file) — map to every card that wants it, not just the
+        # first, since ImageLoaderWorker only fetches/emits once per
+        # distinct url. Mapping to a single index left every card past the
+        # first one blank.
+        cards_by_url: dict[str, list[int]] = {}
+        for i, url in to_load:
+            cards_by_url.setdefault(url, []).append(i)
+        load_urls = list(cards_by_url.keys())
+
+        def on_loaded(url, img, size, radius):
+            if img is None:
+                return
+            try:
+                pm = QPixmap.fromImage(img)
+                if pm.isNull():
+                    return
+                cover_cache.set(cache_key(url, size, radius), pm)
+                for card_idx in cards_by_url.get(url, []):
+                    if card_idx < len(self._album_cards):
+                        self._album_cards[card_idx].set_cover(pm)
+            except Exception:
+                pass
+
+        _start_image_loader(load_urls, 150, 14, on_loaded, self._album_row_runners)
+
+    def _load_bio(self, artist_name: str):
+        _stop_runners(self._bio_runners)
+        self._bio_label.setText("")
+        self._bio_label.setVisible(False)
+        if not artist_name:
+            return
+        self._bio_request_id += 1
+        request_id = self._bio_request_id
+
+        def on_result(bio: str, _rid=request_id):
+            if _rid != self._bio_request_id:
+                return  # a newer artist was opened before this returned
+            self._bio_label.setText(bio)
+            self._bio_label.setVisible(bool(bio))
+
+        _lookup_artist_bio(artist_name, on_result, self._bio_runners)
 
     def _load_artist_cover(self, url: str):
         key = cache_key(url, 120, 60)
@@ -708,6 +1363,23 @@ class ArtistPage(QWidget):
     def _on_album_clicked(self, album: dict):
         self.album_clicked.emit(album, self._current_artist)
 
+    def mark_random_tracks_playing(self, url: str, track: dict | None = None):
+        """Highlights (accent color + the number-column play/pause glyph,
+        both built into TrackRow already) whichever random-tracks row
+        matches the track currently playing — same matching/behavior as
+        AlbumPage.mark_playing_url, just against self._random_track_rows
+        instead of a single album's own tracklist."""
+        self._last_playing_url = url
+        self._last_playing_track = track
+        keys = _track_like_keys(track or {}, url)
+        for row in self._random_track_rows:
+            row.set_playing(bool(keys) and bool(row.track_identity_keys() & keys))
+
+    def set_random_tracks_paused(self, is_paused: bool):
+        self._last_paused = is_paused
+        for row in self._random_track_rows:
+            row.set_paused(is_paused)
+
     def set_liked(self, liked: bool):
         self._is_liked = liked
         c = COLORS
@@ -730,6 +1402,62 @@ class ArtistPage(QWidget):
 
     def apply_accent(self):
         self.set_liked(self._is_liked)
+        for row in self._random_track_rows:
+            row.apply_accent()
+
+
+class ArtistAllAlbumsPage(QWidget):
+    """Every album from one artist, plain — reached via ArtistPage's
+    "Показать всё". Kept as its own page rather than expanding the row
+    strip in place specifically so ArtistPage's own visit never has to load
+    every cover; this page only starts loading them once the user actually
+    asks to see everything."""
+    album_clicked = pyqtSignal(dict, dict)  # (album, artist)
+    back_clicked = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._current_artist: dict = {}
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 16, 20, 0)
+        layout.setSpacing(16)
+
+        header_row = QHBoxLayout()
+        header_row.setSpacing(12)
+
+        back_btn = QPushButton("←")
+        back_btn.setFixedSize(34, 34)
+        back_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        back_btn.setStyleSheet(
+            f"QPushButton {{ background: {COLORS['SURFACE_LIGHT']}; border: none; border-radius: 17px; "
+            f"color: {COLORS['TEXT_PRIMARY']}; font: 13pt 'Segoe UI'; }}"
+            f"QPushButton:hover {{ background: {COLORS['SURFACE_HOVER']}; }}"
+        )
+        back_btn.clicked.connect(self.back_clicked.emit)
+        header_row.addWidget(back_btn)
+
+        self._title_label = QLabel("Музыка")
+        self._title_label.setFont(QFont("Segoe UI", 16, QFont.Weight.Bold))
+        self._title_label.setStyleSheet(f"color: {COLORS['TEXT_PRIMARY']};")
+        header_row.addWidget(self._title_label, 1)
+        layout.addLayout(header_row, 0)
+
+        self._album_grid = AlbumGridWidget(self)
+        self._album_grid.album_clicked.connect(self._on_album_clicked)
+        layout.addWidget(self._album_grid, 1)
+
+    def load_artist(self, artist: dict):
+        self._current_artist = artist
+        name = clean_artist_name(artist.get("artist", "") or "")
+        self._title_label.setText(f"Музыка — {name}" if name else "Музыка")
+        self._album_grid.load_albums(artist.get("albums", []) or [], artist)
+
+    def _on_album_clicked(self, album: dict):
+        self.album_clicked.emit(album, self._current_artist)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -6177,14 +6905,12 @@ class NowPlayingSidePanel(QWidget):
         self._panel_width = 0
         self._is_subscribed = False
         self._anim: QPropertyAnimation | None = None
+        self._dominant_color: QColor | None = None
         self.setObjectName("nowPlayingPanel")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.setStyleSheet(
-            f"QWidget#nowPlayingPanel {{ background-color: {COLORS['SURFACE']}; "
-            f"border-left: 1px solid {COLORS['BORDER']}; }}"
-        )
         self.setFixedWidth(0)
         self._build_ui()
+        self._apply_panel_background()
 
     # Animated via QPropertyAnimation like _RotatingSpinner's `angle` /
     # SettingsPage's `knobPos` elsewhere in this file — QWidget itself has
@@ -6208,7 +6934,23 @@ class NowPlayingSidePanel(QWidget):
         self._anim.start()
 
     def _build_ui(self):
-        outer = QVBoxLayout(self)
+        # Wrapped in a scroll area (rather than a plain QVBoxLayout directly
+        # on self, like before the artist bio was added) since the bio text
+        # is variable-length and, combined with everything else already in
+        # this panel, can now exceed the window's minimum height — without
+        # this, content would just get clipped instead of scrolling.
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        panel_scroll = QScrollArea()
+        panel_scroll.setWidgetResizable(True)
+        panel_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        panel_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        panel_scroll.setStyleSheet(get_scrollbar_style())
+
+        content = QWidget()
+        outer = QVBoxLayout(content)
         outer.setContentsMargins(20, 20, 20, 20)
         outer.setSpacing(16)
 
@@ -6290,6 +7032,13 @@ class NowPlayingSidePanel(QWidget):
         sub_row.addStretch(1)
         about_col.addLayout(sub_row)
 
+        self._about_bio_label = QLabel("")
+        self._about_bio_label.setFont(QFont("Segoe UI", 10))
+        self._about_bio_label.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']};")
+        self._about_bio_label.setWordWrap(True)
+        self._about_bio_label.setVisible(False)
+        about_col.addWidget(self._about_bio_label)
+
         outer.addWidget(self._about_section)
         self._apply_subscribe_style()
 
@@ -6343,6 +7092,9 @@ class NowPlayingSidePanel(QWidget):
         outer.addWidget(self._queue_section)
         outer.addStretch(1)
 
+        panel_scroll.setWidget(content)
+        root.addWidget(panel_scroll)
+
         self._about_section.setVisible(False)
         self._queue_section.setVisible(False)
 
@@ -6371,16 +7123,50 @@ class NowPlayingSidePanel(QWidget):
         self._now_artist_label.setVisible(bool(artist_name))
 
     def set_cover_pixmap(self, pixmap: QPixmap | None):
-        self._cover_label.setPixmap(pixmap if pixmap and not pixmap.isNull() else QPixmap())
+        has_cover = bool(pixmap and not pixmap.isNull())
+        self._cover_label.setPixmap(pixmap if has_cover else QPixmap())
+        self._dominant_color = _dominant_cover_color(pixmap) if has_cover else None
+        self._apply_panel_background()
+
+    def _apply_panel_background(self):
+        """Tints the panel's background toward the current cover's dominant
+        color, fading to the plain surface color further down — the same
+        blend ratio in both light/dark themes keeps it subtle enough that
+        text contrast never needs special-casing per theme. Falls back to
+        the old flat surface color with nothing playing / no cover."""
+        surface = QColor(COLORS['SURFACE'])
+        if self._dominant_color is None:
+            bg = f"background-color: {COLORS['SURFACE']};"
+        else:
+            top = _blend_color(surface, self._dominant_color, 0.24)
+            bg = (
+                f"background: qlineargradient(x1:0, y1:0, x2:0, y2:1, "
+                f"stop:0 {top.name()}, stop:0.6 {COLORS['SURFACE']}, stop:1 {COLORS['SURFACE']});"
+            )
+        self.setStyleSheet(
+            f"QWidget#nowPlayingPanel {{ {bg} "
+            f"border-left: 1px solid {COLORS['BORDER']}; }}"
+        )
 
     def set_about_artist(self, artist_name: str, subscribable: bool):
         has_artist = bool(artist_name)
         self._about_section.setVisible(has_artist)
+        # Cleared unconditionally here (not just on the no-artist branch) —
+        # the bio itself arrives later via a separate async set_bio() call
+        # (see MusicApp._refresh_now_playing_bio), and without this a stale
+        # bio from the *previous* artist would stay on screen under the new
+        # artist's name until that lookup resolves.
+        self.set_bio("")
         if not has_artist:
             return
         self._about_artist_name.setText(artist_name)
         self._artist_avatar.setPixmap(QPixmap())
         self._subscribe_btn.setVisible(subscribable)
+
+    def set_bio(self, text: str):
+        text = (text or "").strip()
+        self._about_bio_label.setText(text)
+        self._about_bio_label.setVisible(bool(text))
 
     def set_artist_avatar_pixmap(self, pixmap: QPixmap | None):
         self._artist_avatar.setPixmap(pixmap if pixmap and not pixmap.isNull() else QPixmap())
@@ -6409,9 +7195,16 @@ class NowPlayingSidePanel(QWidget):
         self._cover_label.setPixmap(QPixmap())
         self._about_section.setVisible(False)
         self._queue_section.setVisible(False)
+        self.set_bio("")
+        self._dominant_color = None
+        self._apply_panel_background()
 
     def apply_accent(self):
         self._apply_subscribe_style()
+        # Theme switches change COLORS['SURFACE']/['BORDER'] under us — redo
+        # the blend against the new surface color, not just leave the old
+        # theme's gradient sitting there.
+        self._apply_panel_background()
 
 
 class MusicApp(QWidget):
@@ -6452,6 +7245,8 @@ class MusicApp(QWidget):
         self._lyrics_cache: dict[tuple[str, str], dict] = {}
         self._lyrics_request_id = 0   # staleness guard — see _refresh_now_playing_lyrics
         self._lyrics_viewer_key: tuple[str, str] | None = None   # (artist, title) LyricsViewerOverlay is showing
+        self._now_playing_bio_runners: list = []   # [thread, worker] entries from _start_artist_bio_worker
+        self._now_playing_bio_request_id = 0   # staleness guard — see _refresh_now_playing_bio
         self._prev_page_before_search: QWidget | None = None
         self._loading = False
         self._closing = False  # set once closeEvent starts, so scheduled/async
@@ -6683,6 +7478,7 @@ class MusicApp(QWidget):
         self._welcome_page = WelcomePage()
         self._home_page = HomePage()
         self._artist_page = ArtistPage()
+        self._artist_all_albums_page = ArtistAllAlbumsPage()
         self._album_page = AlbumPage()
         self._search_page = SearchPage()
         self._all_artists_page = AllArtistsPage()
@@ -6690,8 +7486,8 @@ class MusicApp(QWidget):
         self._profile_page = ProfilePage()
         self._user_profile_page = UserProfilePage()
 
-        for page in [self._welcome_page, self._home_page, self._artist_page, self._album_page,
-                     self._search_page, self._all_artists_page, self._settings_page,
+        for page in [self._welcome_page, self._home_page, self._artist_page, self._artist_all_albums_page,
+                     self._album_page, self._search_page, self._all_artists_page, self._settings_page,
                      self._profile_page, self._user_profile_page]:
             self._page_stack.addWidget(page)
 
@@ -6755,6 +7551,14 @@ class MusicApp(QWidget):
         # Wire album/artist page signals
         self._artist_page.album_clicked.connect(self._on_album_selected)
         self._artist_page.artist_like_clicked.connect(self._on_artist_like_clicked)
+        self._artist_page.show_all_albums_clicked.connect(self._show_all_albums_for_artist)
+        self._artist_page.track_play_requested.connect(self._on_track_play_requested)
+        self._artist_page.track_like_clicked.connect(self._on_artist_random_track_add_clicked)
+        self._artist_page.playlist_clicked.connect(self._on_artist_public_playlist_clicked)
+        self._artist_all_albums_page.album_clicked.connect(self._on_album_selected)
+        self._artist_all_albums_page.back_clicked.connect(
+            lambda: self._page_stack.setCurrentWidget(self._artist_page)
+        )
         self._album_page.track_play_requested.connect(self._on_track_play_requested)
         self._album_page.artist_name_clicked.connect(self._on_controls_artist_clicked)
         self._album_page.download_album_requested.connect(self._download_album)
@@ -8062,6 +8866,12 @@ class MusicApp(QWidget):
         self._current_artist = artist
         self._sidebar.select_artist(artist.get("artist", ""))
         self._artist_page.load_artist(artist)
+        # load_artist() rebuilds the random-tracks rows from scratch, so
+        # whatever playing/paused state ArtistPage remembered from before
+        # this navigation is stale (still the previous artist's) until
+        # pushed again here.
+        self._artist_page.mark_random_tracks_playing(self._playing_url, self._playing_track)
+        self._artist_page.set_random_tracks_paused(not self.player.is_playing())
         artist_name = (artist.get("artist") or "").strip()
         self._artist_page.set_liked(artist_name in self._subscriptions)
         self._page_stack.setCurrentWidget(self._artist_page)
@@ -8070,6 +8880,10 @@ class MusicApp(QWidget):
             last_view_artist=artist_name,
             last_view_album="",
         )
+
+    def _show_all_albums_for_artist(self, artist: dict):
+        self._artist_all_albums_page.load_artist(artist)
+        self._page_stack.setCurrentWidget(self._artist_all_albums_page)
 
     def _navigate_to_album(self, album: dict, artist: dict):
         self._current_album = album
@@ -8808,6 +9622,61 @@ class MusicApp(QWidget):
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    def _on_artist_public_playlist_clicked(self, summary: dict):
+        """A card clicked in the artist page's "Плейлисты, в которых есть
+        исполнитель" row — same snapshot-then-refresh flow as
+        _on_playlist_subscription_clicked just above, since this can be any
+        account's playlist, not necessarily one already subscribed to."""
+        owner_login = summary.get("owner_login", "")
+        playlist_id = summary.get("id", "")
+        if not owner_login or not playlist_id or not self._account_manager:
+            return
+        snapshot = {
+            "id": playlist_id, "name": summary.get("name") or "Плейлист",
+            "cover_data": summary.get("cover_data", ""), "tracks": [],
+        }
+        my_login = (self._account_manager.active_login if self._account_manager else "") or ""
+        editable = bool(my_login) and my_login == owner_login
+        self._show_playlist_album(snapshot, summary.get("name") or owner_login, editable=editable, owner_login=owner_login)
+
+        signal = _UserProfileSignal(self)
+        self._user_profile_signals.append(signal)
+
+        def _cleanup(s=signal):
+            try:
+                self._user_profile_signals.remove(s)
+            except ValueError:
+                pass
+
+        def _on_result(payload):
+            profile = payload.get("profile") or {}
+            pl = payload.get("playlist")
+            if not pl:
+                return  # deleted or made private since this row loaded — keep showing the snapshot
+            if not (self._current_album or {}).get("_is_playlist"):
+                return
+            if (self._current_album or {}).get("_playlist_owner_login") != owner_login:
+                return
+            creator_name = profile.get("display_name") or profile.get("login") or owner_login
+            self._show_playlist_album(pl, creator_name, editable=editable, owner_login=owner_login)
+
+        signal.finished.connect(_on_result)
+        signal.finished.connect(_cleanup)
+
+        account_manager = self._account_manager
+
+        def _worker():
+            try:
+                profile = account_manager.get_public_profile(login=owner_login)
+                pl = None
+                if profile:
+                    pl = next((p for p in (profile.get("playlists") or []) if p.get("id") == playlist_id), None)
+                signal.finished.emit({"profile": profile or {}, "playlist": pl})
+            except Exception:
+                signal.finished.emit({"profile": {}, "playlist": None})
+
+        threading.Thread(target=_worker, daemon=True).start()
+
     def _on_playlist_subscribe_clicked(self):
         """The '+' library button on someone else's playlist page."""
         album = self._current_album or {}
@@ -8928,6 +9797,11 @@ class MusicApp(QWidget):
         if not self._account_manager:
             return
         self._show_add_to_collections_menu(track, self._current_album or {}, self._current_artist, self._album_page)
+
+    def _on_artist_random_track_add_clicked(self, track: dict, album: dict, artist: dict):
+        if not self._account_manager:
+            return
+        self._show_add_to_collections_menu(track, album, artist, self._artist_page)
 
     def _on_album_like_clicked(self):
         if not self._account_manager or not self._current_album:
@@ -9293,6 +10167,8 @@ class MusicApp(QWidget):
         self._playing_track = track
         self._album_page.mark_playing_url(self._playing_url, track)
         self._album_page.set_paused(False)  # a freshly-started track is always playing, never paused
+        self._artist_page.mark_random_tracks_playing(self._playing_url, track)
+        self._artist_page.set_random_tracks_paused(False)
         self._sync_play_all_button(True)
         self._search_page.refresh_playing(self._playing_url, track)
         # Save track info for next-launch restore
@@ -9429,10 +10305,8 @@ class MusicApp(QWidget):
         self._load_now_playing_cover(cover_rel)
 
         real_artist = self._find_artist_any(artist_name) if artist_name else None
-        panel.set_about_artist(
-            clean_artist_name(artist_name) if artist_name else "",
-            subscribable=bool(real_artist),
-        )
+        clean_artist = clean_artist_name(artist_name) if artist_name else ""
+        panel.set_about_artist(clean_artist, subscribable=bool(real_artist))
         if artist_name:
             panel.set_subscribed(artist_name in self._subscriptions)
         if real_artist and real_artist.get("cover"):
@@ -9440,8 +10314,26 @@ class MusicApp(QWidget):
         else:
             panel.set_artist_avatar_pixmap(None)
 
+        self._refresh_now_playing_bio(clean_artist)
         self._refresh_now_playing_queue()
         self._refresh_now_playing_lyrics(track, title, artist_name)
+
+    def _refresh_now_playing_bio(self, clean_artist: str):
+        """Fetches the "Об исполнителе" bio for the artist just shown in
+        the panel (see set_about_artist above) — shares a process-lifetime
+        cache with ArtistPage's own bio lookup (_lookup_artist_bio), so
+        this is usually instant once either place has already loaded that
+        artist once this session."""
+        panel = self._now_playing_panel
+        self._now_playing_bio_request_id += 1
+        request_id = self._now_playing_bio_request_id
+
+        def on_result(bio: str, _rid=request_id):
+            if _rid != self._now_playing_bio_request_id:
+                return  # a newer track started playing before this returned
+            panel.set_bio(bio)
+
+        _lookup_artist_bio(clean_artist, on_result, self._now_playing_bio_runners)
 
     def _refresh_now_playing_lyrics(self, track: dict, title: str, artist_name: str):
         """Pre-fetches lyrics (plain + synced, when lrclib has an LRC
@@ -9593,6 +10485,7 @@ class MusicApp(QWidget):
         self._controls.set_playing(is_playing)
         self._disc_overlay.set_playing(is_playing)
         self._album_page.set_paused(not is_playing)
+        self._artist_page.set_random_tracks_paused(not is_playing)
         self._sync_play_all_button(is_playing)
         self._schedule_discord_presence_refresh(90)
         self._schedule_discord_presence_refresh(650)
@@ -9798,6 +10691,7 @@ class MusicApp(QWidget):
             time.sleep(0.02)
 
         self._album_page._stop_duration_loader()
+        self._artist_page._stop_random_duration_loader()
         for t in list(_dying_threads):
             try:
                 t.wait(300)
@@ -9811,7 +10705,12 @@ class MusicApp(QWidget):
         _stop_runners_and_wait(self._img_runners)
         _stop_runners_and_wait(self._lyrics_runners)
         _stop_runners_and_wait(self._artist_page._runners)
-        _stop_runners_and_wait(self._artist_page._album_grid._runners)
+        _stop_runners_and_wait(self._artist_page._album_row_runners)
+        _stop_runners_and_wait(self._artist_page._bio_runners)
+        _stop_runners_and_wait(self._artist_page._random_cover_runners)
+        _stop_runners_and_wait(self._artist_page._playlist_runners)
+        _stop_runners_and_wait(self._artist_all_albums_page._album_grid._runners)
+        _stop_runners_and_wait(self._now_playing_bio_runners)
         _stop_runners_and_wait(self._album_page._runners)
         _stop_runners_and_wait(self._cover_viewer._runners)
         _stop_runners_and_wait(self._disc_overlay._runners)
