@@ -828,7 +828,19 @@ class TrackRow(QWidget):
             self._artist_label = QLabel(clean_artist_name(artist_name))
             self._artist_label.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']}; font: 8.5pt 'Segoe UI';")
             self._artist_label.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
-            title_col.addWidget(self._artist_label)
+            if self._track.get("_is_youtube"):
+                artist_row = QHBoxLayout()
+                artist_row.setContentsMargins(0, 0, 0, 0)
+                artist_row.setSpacing(4)
+                yt_icon_lbl = QLabel()
+                yt_icon_lbl.setFixedSize(11, 11)
+                yt_icon_lbl.setPixmap(_make_youtube_icon_pixmap(11))
+                artist_row.addWidget(yt_icon_lbl)
+                artist_row.addWidget(self._artist_label)
+                artist_row.addStretch(1)
+                title_col.addLayout(artist_row)
+            else:
+                title_col.addWidget(self._artist_label)
 
         row.addLayout(title_col, 1)
 
@@ -1147,8 +1159,13 @@ class AlbumPage(QWidget):
         btn_row.addWidget(dl_btn)
         btn_row.addStretch(1)
 
-        info_col.addLayout(btn_row)
+        # Stretch goes *before* btn_row (not after) so it's the one absorbing
+        # the gap between the meta text and the buttons — pushes "Слушать"/
+        # "Скачать альбом" all the way down to sit flush with the cover's
+        # bottom edge, matching the web client's .page-actions (margin-top:
+        # auto in style.css), instead of just trailing right under the text.
         info_col.addStretch(1)
+        info_col.addLayout(btn_row)
         header_row.addLayout(info_col, 1)
         layout.addWidget(header, 0)
 
@@ -1350,11 +1367,7 @@ class AlbumPage(QWidget):
                     last_disc_number = disc_number
 
                 display_number = track.get("disc_track_number") if show_disc_headers else None
-                if is_liked_album:
-                    display_track = {k: v for k, v in track.items() if k != "artist_name"}
-                    row = TrackRow(i, display_track, display_number=display_number)
-                else:
-                    row = TrackRow(i, track, display_number=display_number)
+                row = TrackRow(i, track, display_number=display_number)
                 row.play_requested.connect(lambda idx, al=album, ar=artist: self.track_play_requested.emit(idx, al, ar))
                 row.download_requested.connect(self._on_track_download_requested)
                 row.like_clicked.connect(lambda idx, t=track: self.track_like_clicked.emit(t))
@@ -7135,6 +7148,13 @@ class MusicApp(QWidget):
             "title": yt.get("title", ""), "url": yt.get("webpage_url", ""),
             "artist_name": yt.get("uploader", ""), "_is_youtube": True,
             "_youtube_thumbnail": yt.get("thumbnail", ""), "_youtube_channel_url": channel_url,
+            # yt-dlp already gave us this at search time — TrackRow shows it
+            # straight away and, just as importantly, skips queuing an async
+            # probe for it (see AlbumPage.load_album's "if not
+            # track.get('duration')" check), which would've tried to read a
+            # duration off the permanent youtube.com/watch link — not audio,
+            # so that probe could only ever silently fail.
+            "duration": int(yt.get("duration") or 0) * 1000,
         }
         artist = {"artist": yt.get("uploader", "") or "YouTube", "_is_youtube": True, "_youtube_channel_url": channel_url}
         album = {
@@ -7385,6 +7405,7 @@ class MusicApp(QWidget):
                 "_youtube_channel_url": lt.get("_youtube_channel_url", ""),
                 "_real_album_title": album_title,
                 "_real_album_cover": lt.get("_youtube_thumbnail") or lt.get("album_cover", ""),
+                "duration": lt.get("duration") or 0,
             }
         for artist in library:
             if not isinstance(artist, dict):
@@ -7722,6 +7743,9 @@ class MusicApp(QWidget):
             channel_url = track.get("_youtube_channel_url", "")
             if channel_url:
                 ref["_youtube_channel_url"] = channel_url
+            duration = track.get("duration") or 0
+            if duration:
+                ref["duration"] = duration
         return ref
 
     def _show_add_to_collections_menu(self, track: dict, album: dict, artist: dict | None, anchor: QWidget):
