@@ -7268,6 +7268,10 @@ class MusicApp(QWidget):
         # keys, letting artists and albums be freely interleaved instead of
         # always grouped as all-artists-then-all-albums.
         self._follow_order: list = []
+        # False until _on_player_data_loaded has actually populated the
+        # fields above at least once (from local cache or network) — see
+        # its guard in _save_player_data_async.
+        self._player_data_ready = False
         self._display_name: str = ""
         self._account_id: str = ""
         self._user_search_generation: int = 0
@@ -7915,8 +7919,19 @@ class MusicApp(QWidget):
         self._profile_page.set_listen_stats(self._listen_stats)
         self._update_sidebar_from_account()
         self._after_track_collections_changed()
+        was_ready = self._player_data_ready
+        self._player_data_ready = True
         if not self._state_restored:
             QTimer.singleShot(0, self._restore_ui_state)
+        # A settings change that landed before this (first) load — e.g. a
+        # setting applied while restoring window state — was skipped by the
+        # guard in _save_player_data_async rather than sent with whatever
+        # self._subscriptions/_liked_tracks/etc. still held from __init__'s
+        # empty defaults. Give it one real chance now that they're populated
+        # for real, instead of silently dropping that change until the user
+        # happens to touch a setting again.
+        if not was_ready:
+            self._schedule_settings_sync()
 
     def _apply_own_identity(self):
         login = (self._account_manager.active_login if self._account_manager else "") or ""
@@ -8448,6 +8463,19 @@ class MusicApp(QWidget):
 
     def _save_player_data_async(self, updates: dict):
         if not self._account_manager:
+            return
+        if not self._player_data_ready:
+            # self._liked_tracks/_subscriptions/_album_subscriptions/
+            # _follow_order are still whatever __init__ set them to (empty)
+            # — _on_player_data_loaded hasn't run yet, from local cache or
+            # network. Sending "full" now wouldn't just skip an update, it
+            # would overwrite the real local cache *and* server copies with
+            # these empty placeholders — which is exactly what happened when
+            # a settings-sync (_schedule_settings_sync, 800ms debounce) won
+            # the race against the first load: real subscriptions/likes/
+            # follow_order, gone, both locally and on the server, replaced
+            # by nothing. _on_player_data_loaded flips the guard and retries
+            # this once real data is in, so nothing here is lost for good.
             return
         # Always send full current state to avoid partial overwrites on server.
         # "playlists" belongs here too, not just in explicit playlist-mutation
