@@ -4831,6 +4831,9 @@ class Sidebar(QWidget):
     # section ("server"/"local") and the new *collapsed* state, for
     # persisting to settings.
     section_collapsed_changed = pyqtSignal(str, bool)
+    # "Открыть папку music" clicked from the empty-state hint (see
+    # _local_hint) — same destination as the identical button in Settings.
+    open_local_folder_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -4966,6 +4969,53 @@ class Sidebar(QWidget):
         self._list_local.model().rowsMoved.connect(lambda *_: self._on_rows_moved("local"))
         self._local_container.setVisible(False)  # hidden until enabled in settings
 
+        # Empty-state hint — shown instead of the (then-empty) list when the
+        # music/ folder has no Artist/Album subfolders yet, so a freshly
+        # created folder doesn't just look broken/blank in the sidebar.
+        self._local_hint = QFrame()
+        self._local_hint.setObjectName("localLibraryHint")
+        self._local_hint.setStyleSheet(
+            f"QFrame#localLibraryHint {{ background: {COLORS['SURFACE_LIGHT']}; "
+            f"border: 1px dashed {COLORS['BORDER']}; border-radius: 8px; }}"
+        )
+        hint_layout = QVBoxLayout(self._local_hint)
+        hint_layout.setContentsMargins(10, 10, 10, 10)
+        hint_layout.setSpacing(6)
+
+        hint_title = QLabel("Как добавить музыку")
+        hint_title.setStyleSheet(f"color: {COLORS['TEXT_PRIMARY']}; font: bold 9.5pt 'Segoe UI';")
+        hint_layout.addWidget(hint_title)
+
+        hint_text = QLabel(
+            "Разложите треки по папкам:\n"
+            "music / Исполнитель / Альбом / трек.mp3\n\n"
+            "Например:\n"
+            "music / Imagine Dragons / Evolve / 01 - Believer.mp3\n\n"
+            "Каждый исполнитель — отдельная папка, внутри неё — папка "
+            "каждого альбома, а треки (mp3, flac, m4a, ogg, wav, opus) — "
+            "прямо в папке альбома.\n\n"
+            "Обложка — необязательно: положите файл cover.png (или jpg/png/webp) "
+            "рядом, в папку исполнителя и/или альбома."
+        )
+        hint_text.setWordWrap(True)
+        hint_text.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']}; font: 9pt 'Segoe UI';")
+        hint_layout.addWidget(hint_text)
+
+        hint_open_btn = QPushButton("Открыть папку music")
+        hint_open_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        hint_open_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        hint_open_btn.setFixedHeight(28)
+        hint_open_btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; border: 1px solid {COLORS['BORDER']}; "
+            f"border-radius: 6px; color: {COLORS['TEXT_SECONDARY']}; font: 9pt 'Segoe UI'; padding: 0 10px; }}"
+            f"QPushButton:hover {{ border-color: {COLORS['TEXT_PRIMARY']}; color: {COLORS['TEXT_PRIMARY']}; }}"
+        )
+        hint_open_btn.clicked.connect(self.open_local_folder_requested.emit)
+        hint_layout.addWidget(hint_open_btn, 0, Qt.AlignmentFlag.AlignLeft)
+
+        self._local_container.layout().addWidget(self._local_hint)
+        self._local_hint.setVisible(False)  # toggled in load_local_content()
+
         layout.addStretch(1)
 
     def set_username(self, login: str):
@@ -5044,6 +5094,7 @@ class Sidebar(QWidget):
         """Same shape as load_account_content's entries, for the local
         library section — no "liked"/playlists concept there."""
         self._fill_list(self._list_local, entries)
+        self._local_hint.setVisible(not entries)
 
     def _fill_list(self, list_widget: QListWidget, entries: list | None):
         self._rebuilding = True
@@ -7471,6 +7522,7 @@ class MusicApp(QWidget):
         self._sidebar.playlist_subscription_selected.connect(self._on_playlist_subscription_clicked)
         self._sidebar.order_changed.connect(self._on_sidebar_order_changed)
         self._sidebar.section_collapsed_changed.connect(self._on_sidebar_section_collapsed_changed)
+        self._sidebar.open_local_folder_requested.connect(self._on_open_local_folder_clicked)
         if self._offline:
             self._sidebar.set_offline_mode()
         elif self._account_manager and self._account_manager.active_login:
@@ -7536,7 +7588,7 @@ class MusicApp(QWidget):
         self._controls.album_clicked.connect(self._on_controls_album_clicked)
         self._controls.cover_clicked.connect(self._open_now_playing_disc)
         self._controls.lyrics_clicked.connect(self._on_lyrics_button_clicked)
-        self._lyrics_viewer.line_clicked.connect(self.player.seek_to_ms)
+        self._lyrics_viewer.line_clicked.connect(self._on_lyrics_seek)
         self._controls.play_btn.clicked.connect(self.player.toggle_playback)
         self._controls.prev_btn.clicked.connect(self.player.play_prev)
         self._controls.next_btn.clicked.connect(self.player.play_next)
@@ -10155,6 +10207,16 @@ class MusicApp(QWidget):
     def _on_seek(self):
         value = self._controls.progress_slider.value()
         self.player.seek_position(value / 10.0)
+        # Seeking doesn't fire track_changed/playback_state_changed, so
+        # Discord's activity timestamps would otherwise stay stuck at the
+        # pre-seek position/duration until the next play/pause/track event.
+        self._schedule_discord_presence_refresh(90)
+        self._schedule_discord_presence_refresh(650)
+
+    def _on_lyrics_seek(self, ms: int):
+        self.player.seek_to_ms(ms)
+        self._schedule_discord_presence_refresh(90)
+        self._schedule_discord_presence_refresh(650)
 
     # ── Player callbacks ──────────────────────────────────────────────────────
 
