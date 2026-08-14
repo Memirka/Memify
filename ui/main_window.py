@@ -6235,7 +6235,10 @@ class _LibraryLoadSignal(QObject):
 
 
 class _PlayerDataLoadSignal(QObject):
-    finished = pyqtSignal(dict)
+    # object, not dict — a failed fetch with nothing cached yet to fall back
+    # on carries None through here (see AccountManager.fetch_player_data),
+    # which a dict-typed signal can't transport.
+    finished = pyqtSignal(object)
 
 
 class _UserSearchSignal(QObject):
@@ -7930,14 +7933,27 @@ class MusicApp(QWidget):
 
         def _worker():
             try:
-                data = account_manager.fetch_player_data() or {}
+                data = account_manager.fetch_player_data()
             except Exception:
-                data = {}
+                data = None
             signal.finished.emit(data)
 
         threading.Thread(target=_worker, daemon=True).start()
 
-    def _on_player_data_loaded(self, data: dict):
+    def _on_player_data_loaded(self, data: dict | None):
+        if data is None:
+            # The network fetch failed (timeout/server error) and there was
+            # nothing already cached in this session to fall back on — do
+            # NOT treat that as "this account has no likes/playlists/etc.",
+            # or the next save (a settings change, a reorder, ...) would
+            # persist that emptiness right back to the server, permanently
+            # wiping the real data over what was just a transient blip.
+            # Leave whatever's already loaded (local cache, or still
+            # __init__'s empty defaults if there wasn't one) alone and try
+            # again shortly.
+            if not self._closing:
+                QTimer.singleShot(5000, self._fetch_player_data)
+            return
         self._liked_tracks = data.get("liked_tracks", []) or []
         self._playlists = [p for p in (data.get("playlists", []) or []) if isinstance(p, dict)]
         self._playlist_subscriptions = [

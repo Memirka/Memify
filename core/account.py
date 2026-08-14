@@ -29,7 +29,11 @@ class AccountManager:
         self.login_file = LOGIN_FILE
         self.active_login: Optional[str] = None
         self._password: Optional[str] = None
-        self._player_cache: Dict = {}
+        # None (not {}) until a fetch/save actually succeeds — fetch_player_data()
+        # falls back to this on a failed load, and None vs. {} is the signal
+        # the caller (ui/main_window.py) uses to tell "never got real data
+        # yet" apart from "this account genuinely has nothing saved".
+        self._player_cache: Optional[Dict] = None
         self.last_error: str = ""
 
     # === validation ===
@@ -117,7 +121,7 @@ class AccountManager:
         self._password = password
         if persist:
             self._write_login_file(login, password)
-        self._player_cache = {}
+        self._player_cache = None
         self.last_error = ""
 
     def logout(self) -> bool:
@@ -131,7 +135,7 @@ class AccountManager:
             print(f"login.json delete error: {e}")
         self.active_login = None
         self._password = None
-        self._player_cache = {}
+        self._player_cache = None
         self.last_error = ""
         return removed or (not os.path.exists(self.login_file))
 
@@ -289,20 +293,30 @@ class AccountManager:
             return False
 
     # === player data ===
-    def fetch_player_data(self) -> dict:
+    def fetch_player_data(self) -> dict | None:
+        """None means "couldn't get real data" (network/server error, and
+        nothing fetched/saved yet this session to fall back on) — the caller
+        (ui/main_window.py's _fetch_player_data) must leave whatever's
+        already loaded (local cache) alone in that case rather than treat it
+        as a genuinely-empty account. Returning dict(DEFAULT_PLAYER_DATA)
+        here on a transient failure used to look identical to "this account
+        really has no likes/playlists/subscriptions" to that caller, which
+        would then get persisted right back to the server as truth the next
+        time anything triggered a save — silently wiping real data on any
+        blip during the very first fetch of a session."""
         if not self.active_login or not self._password:
             return dict(DEFAULT_PLAYER_DATA)
         try:
             resp = self._post("/player/load", {"login": self.active_login, "password": self._password}, timeout=5)
             if resp.status_code != 200:
-                return self._player_cache or dict(DEFAULT_PLAYER_DATA)
+                return self._player_cache
             data = resp.json() if resp.content else {}
             payload = {k: data.get(k, DEFAULT_PLAYER_DATA[k]) for k in DEFAULT_PLAYER_DATA}
             self._player_cache = payload
             return payload
         except Exception as e:
             print(f"Player data fetch failed: {e}")
-            return self._player_cache or dict(DEFAULT_PLAYER_DATA)
+            return self._player_cache
 
     def save_player_data(self, updates: dict) -> bool:
         if not self.active_login or not self._password or not isinstance(updates, dict):
