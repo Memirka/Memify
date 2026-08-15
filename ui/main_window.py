@@ -7276,6 +7276,126 @@ class NowPlayingSidePanel(QWidget):
         self._apply_panel_background()
 
 
+class _AnimatedStackedWidget(QStackedWidget):
+    """Drop-in QStackedWidget — every navigation call site in this file
+    already just calls self._page_stack.setCurrentWidget(...)/
+    setCurrentIndex(...) (home, artist, album, search, settings, back, ...),
+    so overriding those two here animates every page switch everywhere at
+    once, with zero changes anywhere else. Animates the *incoming* page in
+    only (a gentle slide, not a full crossfade) — the outgoing one is
+    simply not current anymore, same as plain QStackedWidget.
+
+    Deliberately a plain position slide, no QGraphicsOpacityEffect/opacity
+    fade — an earlier version used one, and on some pages (heavier
+    content, or a not-yet-cached cover still loading over the network
+    while the animation was still running) it produced a brief black
+    flash. QGraphicsOpacityEffect forces the whole widget subtree to be
+    repainted into an offscreen buffer and composited from there instead
+    of Qt's normal (fast, direct) widget painting, and that's fragile —
+    doubly so for pages that nest their own QGraphicsEffect (drop shadows,
+    blur) or whose content is still changing (a cover popping in) mid-
+    composite. A plain .pos() animation never touches any of that: the
+    page paints itself completely normally throughout, just at a
+    temporarily offset position, so there is nothing left that *can*
+    render as an empty/black buffer — regardless of how slow a cover on a
+    weak connection takes to arrive.
+
+    Deliberately retriggers even when the target is already the current
+    widget: ArtistPage/AlbumPage/etc. are single pre-built pages whose
+    *content* gets swapped out under them (load_artist()/load_album()) —
+    artist-to-artist or album-to-album navigation calls setCurrentWidget
+    with that same page object every time, and skipping the animation
+    whenever the widget identity happens to match would silently skip it
+    for exactly that case.
+
+    Also deliberately kept hidden (plain setVisible(False), not an effect
+    — see above) for two deferred ticks past setCurrentWidget before the
+    slide starts, rather than revealing immediately: the caller's own
+    load_artist()/load_album() (called right after this returns) builds
+    the page's content synchronously, but some of *that* only settles one
+    more deferred tick later — e.g. ArtistPage's fit-to-width album row
+    (_reflow_album_row) builds every card up front and only hides the ones
+    that don't fit on a QTimer.singleShot(0, ...) queued from inside that
+    same synchronous call. Revealing right away (one tick isn't enough —
+    that reflow's own singleShot(0) is queued *after* one registered here,
+    so a single deferred tick fires before it) used to mean the user
+    watched that settle in real time — cards flashing in then some of them
+    disappearing, tracks/rows visibly populating — instead of just seeing
+    the finished page slide into place."""
+
+    _DURATION_MS = 220
+    _SLIDE_PX = 22
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # id(widget) -> QPropertyAnimation. PyQt drops an animation as soon
+        # as nothing in Python still references it, even mid-flight — this
+        # keeps it alive for its whole duration, one slot per widget so
+        # switching to two different pages in quick succession doesn't have
+        # one's cleanup drop the other's still-running animation.
+        self._anims: dict[int, QPropertyAnimation] = {}
+
+    def setCurrentWidget(self, widget):
+        self._switch(widget)
+
+    def setCurrentIndex(self, index):
+        self._switch(self.widget(index))
+
+    def _switch(self, widget):
+        if widget is None:
+            return
+        # Landed back on a page whose own previous slide hasn't finished
+        # yet (fast repeated navigation, e.g. spamming "next artist") —
+        # stop that one instead of letting two animations fight over the
+        # same position property.
+        old = self._anims.pop(id(widget), None)
+        if old is not None:
+            old.stop()
+
+        super().setCurrentWidget(widget)
+        widget.setVisible(False)
+
+        # Widget geometry is layout-managed by the stack (fills the whole
+        # content rect) — animating .pos() directly rather than fighting
+        # the layout for it works because nothing re-lays-out mid-navigation
+        # (only a window resize would), so the manually-set position holds
+        # for the animation's short lifetime.
+        end_pos = widget.pos()
+        start_pos = QPoint(end_pos.x(), end_pos.y() + self._SLIDE_PX)
+        widget.move(start_pos)
+
+        def _reveal(w=widget, sp=start_pos, ep=end_pos):
+            if w is not self.currentWidget():
+                return  # superseded by another navigation before this fired
+            w.setVisible(True)
+            self._start_slide(w, sp, ep)
+
+        QTimer.singleShot(0, lambda: QTimer.singleShot(0, _reveal))
+
+    def _start_slide(self, widget, start_pos, end_pos):
+        old = self._anims.pop(id(widget), None)
+        if old is not None:
+            old.stop()
+
+        anim = QPropertyAnimation(widget, b"pos", widget)
+        anim.setDuration(self._DURATION_MS)
+        anim.setStartValue(start_pos)
+        anim.setEndValue(end_pos)
+        anim.setEasingCurve(QEasingCurve.Type.OutQuad)
+
+        def _cleanup():
+            # Re-snap geometry to exactly fill the stack (what
+            # QStackedLayout would enforce regardless), in case a resize
+            # landed mid-animation and end_pos is no longer correct.
+            if widget is self.currentWidget():
+                widget.setGeometry(self.rect())
+            self._anims.pop(id(widget), None)
+
+        anim.finished.connect(_cleanup)
+        self._anims[id(widget)] = anim
+        anim.start()
+
+
 class MusicApp(QWidget):
     logout_requested = pyqtSignal()
 
@@ -7552,8 +7672,10 @@ class MusicApp(QWidget):
             self._sidebar.set_username(self._display_name or self._account_manager.active_login)
         body_row.addWidget(self._sidebar)
 
-        # Page stack — pre-built, never recreated
-        self._page_stack = QStackedWidget()
+        # Page stack — pre-built, never recreated. _AnimatedStackedWidget
+        # (not plain QStackedWidget) so every setCurrentWidget/
+        # setCurrentIndex call anywhere below fades the new page in.
+        self._page_stack = _AnimatedStackedWidget()
         self._welcome_page = WelcomePage()
         self._home_page = HomePage()
         self._artist_page = ArtistPage()
