@@ -576,49 +576,61 @@ class DiscordRPC:
 
     def disconnect(self):
         """Закрывает соединение с Discord RPC."""
-        # pypresence opens its own asyncio event loop per connection. If
-        # rpc.close() raises partway through (e.g. the Discord IPC socket
-        # was already gone), the loop can end up abandoned — Python then
-        # prints a harmless-but-noisy "Exception ignored ... Invalid file
-        # descriptor" from its __del__ at garbage-collection time. Grab the
-        # loop up front and force-close it ourselves regardless.
-        loop = getattr(self.rpc, "loop", None) if self.rpc else None
-        try:
-            if self.rpc:
-                self.rpc.close()
-        except Exception:
-            pass
-        finally:
+        # ui/main_window.py now calls set_play()/set_pause()/clear() from a
+        # background thread (their GET_IMAGE round trip over the Discord
+        # IPC pipe can block for real, up to a few seconds — doing that on
+        # the Qt main thread used to freeze the whole app on every track
+        # change). That means disconnect() — always called from the main
+        # thread — can now genuinely race one of those calls. Flip
+        # `connected` first so any call that hasn't started yet bails out
+        # immediately via its own guard, then take _rpc_lock (the same lock
+        # _safe_update/_rpc_request hold for the whole length of their own
+        # IPC round trip) before tearing anything down, so a call already
+        # in flight finishes cleanly on the still-live rpc/loop instead of
+        # having them yanked out from under it mid-request.
+        self.connected = False
+        with self._rpc_lock:
+            # pypresence opens its own asyncio event loop per connection. If
+            # rpc.close() raises partway through (e.g. the Discord IPC socket
+            # was already gone), the loop can end up abandoned — Python then
+            # prints a harmless-but-noisy "Exception ignored ... Invalid file
+            # descriptor" from its __del__ at garbage-collection time. Grab the
+            # loop up front and force-close it ourselves regardless.
+            loop = getattr(self.rpc, "loop", None) if self.rpc else None
+            try:
+                if self.rpc:
+                    self.rpc.close()
+            except Exception:
+                pass
             try:
                 if loop is not None and not loop.is_closed():
                     loop.close()
             except Exception:
                 pass
             self.rpc = None
-            self.connected = False
-            try:
-                self._external_image_cache.clear()
-                self._external_image_fail_ts.clear()
-            except Exception:
-                pass
-            try:
-                srv = getattr(self, "_cover_proxy_server", None)
-                if srv is not None:
-                    try:
-                        srv.shutdown()
-                    except Exception:
-                        pass
-                    try:
-                        srv.server_close()
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-            self._cover_proxy_server = None
-            self._cover_proxy_thread = None
-            self._cover_proxy_port = None
-            try:
-                with self._cover_proxy_lock:
-                    self._cover_proxy_map.clear()
-            except Exception:
-                pass
+        try:
+            self._external_image_cache.clear()
+            self._external_image_fail_ts.clear()
+        except Exception:
+            pass
+        try:
+            srv = getattr(self, "_cover_proxy_server", None)
+            if srv is not None:
+                try:
+                    srv.shutdown()
+                except Exception:
+                    pass
+                try:
+                    srv.server_close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self._cover_proxy_server = None
+        self._cover_proxy_thread = None
+        self._cover_proxy_port = None
+        try:
+            with self._cover_proxy_lock:
+                self._cover_proxy_map.clear()
+        except Exception:
+            pass

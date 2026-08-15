@@ -1347,6 +1347,14 @@ class ArtistPage(QWidget):
             self._cover_label.setPixmap(cached)
             return
 
+        # Not cached — about to fetch over the network, which on a slow
+        # connection can take a while. Without this, self._cover_label (one
+        # persistent widget, reused across every artist this page ever
+        # navigates to) would keep showing whichever artist's photo loaded
+        # last until the new one finally arrives — looking like the page
+        # hadn't actually navigated yet.
+        self._cover_label.setPixmap(_make_placeholder_cover(120, 60))
+
         _stop_runners(self._runners)
 
         def on_loaded(loaded_url, img, size, radius):
@@ -2175,6 +2183,13 @@ class AlbumPage(QWidget):
         if cached and not cached.isNull():
             self._cover_label.setPixmap(cached)
             return
+
+        # Same reasoning as ArtistPage._load_artist_cover: this label is
+        # reused across every album/playlist the page ever shows, so a slow
+        # fetch would otherwise leave the previous album's cover on screen
+        # — looking like navigation silently did nothing — until this one
+        # eventually finishes.
+        self._cover_label.setPixmap(_make_placeholder_cover(180, 14))
 
         _stop_runners(self._runners)
 
@@ -7359,6 +7374,11 @@ class MusicApp(QWidget):
         self._discord_connecting = False
         self._discord_connect_signal = None
         self._discord_refresh_timer: QTimer | None = None
+        # Bumped on every _refresh_discord_presence call — lets a background
+        # send (see its own comment) started by an older call notice a
+        # newer one has since superseded it and skip sending, same de-dupe
+        # idea as _playlist_request_id/_user_search_generation elsewhere.
+        self._discord_refresh_generation = 0
         self._state_restored = False
         self._nav_restored = False   # True once page navigation succeeded
         self._playing_url: str = ""
@@ -8961,6 +8981,19 @@ class MusicApp(QWidget):
     def _navigate_to_artist(self, artist: dict):
         self._current_artist = artist
         self._sidebar.select_artist(artist.get("artist", ""))
+        # setCurrentWidget() BEFORE load_artist(): the album/playlist rows'
+        # fit-to-width reflow (_reflow_album_row/_reflow_playlist_row) reads
+        # the row widget's width() from a QTimer.singleShot(0, ...) queued
+        # inside load_artist(). While ArtistPage is still the *hidden*
+        # stack page, that width can be stale (its size from whenever it
+        # was last shown, or never-laid-out construction-time geometry on
+        # the very first visit) — that's what made the row sometimes
+        # overflow past the edge or under-fill until an unrelated resize
+        # (or toggling the Now Playing panel) forced a real resizeEvent to
+        # recompute it correctly. Switching pages first means the widget is
+        # already visible, at its real final size, by the time that
+        # deferred reflow runs.
+        self._page_stack.setCurrentWidget(self._artist_page)
         self._artist_page.load_artist(artist)
         # load_artist() rebuilds the random-tracks rows from scratch, so
         # whatever playing/paused state ArtistPage remembered from before
@@ -8970,7 +9003,6 @@ class MusicApp(QWidget):
         self._artist_page.set_random_tracks_paused(not self.player.is_playing())
         artist_name = (artist.get("artist") or "").strip()
         self._artist_page.set_liked(artist_name in self._subscriptions)
-        self._page_stack.setCurrentWidget(self._artist_page)
         self._save_ui_state(
             last_view_page="artist",
             last_view_artist=artist_name,
@@ -8978,8 +9010,10 @@ class MusicApp(QWidget):
         )
 
     def _show_all_albums_for_artist(self, artist: dict):
-        self._artist_all_albums_page.load_artist(artist)
+        # Same ordering fix as _navigate_to_artist above, for the same
+        # fit-to-width reflow reason — see AlbumGridWidget.resizeEvent/_reflow.
         self._page_stack.setCurrentWidget(self._artist_all_albums_page)
+        self._artist_all_albums_page.load_artist(artist)
 
     def _navigate_to_album(self, album: dict, artist: dict):
         self._current_album = album
@@ -9259,6 +9293,14 @@ class MusicApp(QWidget):
                 return
 
         if playing_album and playing_artist and not playing_album.get("_is_liked_album"):
+            if playing_album.get("_is_playlist"):
+                # Same virtual-album object built by _show_playlist_album/
+                # _build_playlist_virtual_album when the playlist started
+                # playing — reuse it as-is instead of routing through
+                # _navigate_to_album, which has no concept of playlists and
+                # would show the "+"/subscribe button even for your own.
+                self._display_playlist_virtual_album(playing_album, playing_artist)
+                return
             self._navigate_to_album(playing_album, playing_artist)
             return
 
@@ -9631,6 +9673,18 @@ class MusicApp(QWidget):
     def _show_playlist_album(self, playlist: dict, creator_name: str, editable: bool, owner_login: str = ""):
         virtual_album = self._build_playlist_virtual_album(playlist, creator_name, editable, owner_login)
         virtual_artist = {"artist": ""}
+        self._display_playlist_virtual_album(virtual_album, virtual_artist)
+
+    def _display_playlist_virtual_album(self, virtual_album: dict, virtual_artist: dict):
+        """Shared tail of _show_playlist_album — also used by
+        _on_controls_album_clicked when the bottom bar's track title is
+        clicked while a playlist is playing, so it re-shows that same
+        playlist (own or subscribed) instead of falling through to
+        _navigate_to_album's generic artist/album logic, which doesn't know
+        about _playlist_editable and always shows the "+"/subscribe button
+        — making your own playlist look like someone else's."""
+        editable = bool(virtual_album.get("_playlist_editable"))
+        owner_login = virtual_album.get("_playlist_owner_login", "")
         self._current_album = virtual_album
         self._current_artist = virtual_artist
         self._album_page.load_album(
@@ -9642,7 +9696,9 @@ class MusicApp(QWidget):
             self._album_page._album_like_btn.setVisible(False)
         else:
             self._album_page._album_like_btn.setVisible(True)
-            self._album_page.set_album_liked(self._is_playlist_subscribed(owner_login, playlist.get("id", "")))
+            self._album_page.set_album_liked(
+                self._is_playlist_subscribed(owner_login, virtual_album.get("_playlist_id", ""))
+            )
         self._album_page.refresh_track_likes(self._all_collection_keys())
         self._sync_play_all_button()
         self._page_stack.setCurrentWidget(self._album_page)
@@ -10161,6 +10217,18 @@ class MusicApp(QWidget):
         self._discord_refresh_timer.start(max(0, delay_ms))
 
     def _refresh_discord_presence(self):
+        # Everything in this try block is cheap (dict/attr reads already
+        # sitting in memory) — safe to keep on the main thread. The actual
+        # rpc.set_play()/set_pause()/clear() calls are dispatched to a
+        # background thread below instead of made here directly: they can
+        # block for real, up to a few seconds at a time — DiscordRPC talks
+        # to the Discord client over a local IPC pipe with its own blocking
+        # asyncio wait per request (see discord_rpc.py's _rpc_request/
+        # GET_IMAGE lookups), and every track/album with a not-yet-cached
+        # cover needs one of those round trips. Doing that on this QTimer
+        # callback — i.e. the Qt main thread — froze the whole UI for that
+        # entire stretch on every single album/playlist start, which is
+        # exactly what it looked like from the outside.
         try:
             rpc = self._discord_rpc
             if not rpc or not getattr(rpc, "connected", False):
@@ -10168,15 +10236,15 @@ class MusicApp(QWidget):
             album = self.player.current_playing_album
             artist = self.player.current_playing_artist
             if not album or self.player.current_track_idx is None:
-                rpc.clear()
+                self._send_discord_presence_async(rpc, None)
                 return
             try:
                 track = album["tracks"][self.player.current_track_idx]
             except (IndexError, KeyError, TypeError):
-                rpc.clear()
+                self._send_discord_presence_async(rpc, None)
                 return
             if not track:
-                rpc.clear()
+                self._send_discord_presence_async(rpc, None)
                 return
 
             rpc_title = track.get("title", "") or "Неизвестно"
@@ -10202,11 +10270,37 @@ class MusicApp(QWidget):
             rpc_dur_ms = self.player.get_duration()
 
             if self.player.is_playing():
-                rpc.set_play(rpc_title, rpc_artist, rpc_album_title, rpc_cover, rpc_pos_ms, rpc_dur_ms)
+                payload = ("play", rpc_title, rpc_artist, rpc_album_title, rpc_cover, rpc_pos_ms, rpc_dur_ms)
             else:
-                rpc.set_pause()
+                payload = ("pause",)
+            self._send_discord_presence_async(rpc, payload)
         except Exception as e:
             print(f"[RPC] refresh error: {e}")
+
+    def _send_discord_presence_async(self, rpc, payload: tuple | None):
+        self._discord_refresh_generation += 1
+        my_gen = self._discord_refresh_generation
+
+        def _worker():
+            # A newer _refresh_discord_presence already ran (another track/
+            # play-pause change landed before this one got to actually talk
+            # to Discord) — sending this stale snapshot now would just flash
+            # outdated info before the newer call's own send catches up, so
+            # skip it instead.
+            if my_gen != self._discord_refresh_generation:
+                return
+            try:
+                if payload is None:
+                    rpc.clear()
+                elif payload[0] == "play":
+                    _, title, artist_s, album_title, cover, pos_ms, dur_ms = payload
+                    rpc.set_play(title, artist_s, album_title, cover, pos_ms, dur_ms)
+                else:
+                    rpc.set_pause()
+            except Exception as e:
+                print(f"[RPC] async send error: {e}")
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _on_shuffle(self, checked: bool):
         if self.player.shuffle_enabled != checked:
