@@ -190,16 +190,18 @@ def _apply_update_windows(target: str, new_file_path: str) -> tuple[bool, str]:
     try:
         with open(bat_path, "w", encoding="utf-8") as f:
             f.write(script)
-        # CREATE_NO_WINDOW alone is enough to launch cmd.exe hidden and
-        # detached from this process's lifetime. Combined with
-        # DETACHED_PROCESS, CreateProcess can fail outright on some Windows
-        # versions (the two flags describe contradictory console setups) —
-        # that failure was silent (caught below) and left the .bat written
-        # to disk but never run, which is exactly the "leftover files, exe
-        # never swaps" symptom this was fixed for.
-        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        # The PyInstaller parent/child process arrangement can terminate a
+        # normal child cmd.exe as the app exits. Put the helper in its own
+        # detached process group so it survives long enough to copy the new
+        # executable. CREATE_NO_WINDOW is deliberately retained: with
+        # DETACHED_PROCESS it is ignored by Windows, but harmless.
+        creationflags = (
+            getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            | getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        )
         subprocess.Popen(
-            ["cmd.exe", "/c", bat_path],
+            ["cmd.exe", "/d", "/c", bat_path],
             creationflags=creationflags,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
