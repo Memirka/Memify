@@ -134,9 +134,9 @@ def _apply_update_linux(target: str, new_file_path: str) -> tuple[bool, str]:
 
 
 def _apply_update_windows(target: str, new_file_path: str) -> tuple[bool, str]:
-    # Windows keeps the running .exe's file locked, so a tiny detached helper
-    # script waits for this process to exit, then swaps the file in place.
-    pid = os.getpid()
+    # Windows keeps the running .exe's file locked. The helper retries the
+    # replacement itself; relying on tasklist/PID polling can wait forever
+    # after a process shutdown or a PID reuse.
     bat_path = os.path.join(os.path.dirname(target), "memify_update.bat")
     # Both files always live next to the helper. Resolving them from %~dp0 in
     # the batch avoids cmd.exe mangling an absolute path with non-ASCII
@@ -153,26 +153,10 @@ def _apply_update_windows(target: str, new_file_path: str) -> tuple[bool, str]:
         'set "TARGET=%~dp0' + target_name + '"\n'
         'set "LOG=%~dp0memify_update.log"\n'
         'echo [%date% %time%] updater started >> "%LOG%"\n'
-        ":wait\n"
-        f'tasklist /FI "PID eq {pid}" 2>NUL | find "{pid}" >NUL\n'
-        # `if errorlevel 1` here means the PID was NOT found (process
-        # exited) — deliberately flat, one `goto` per line, no `goto`
-        # nested inside `( )` blocks: cmd.exe pre-tokenizes an entire
-        # parenthesized block before running any line inside it, and a
-        # `goto` that jumps back into/out of a NESTED `if ( if ( ... ) )`
-        # (an earlier version of this script had exactly that, in the
-        # retry loop below) is a well-known source of batch scripts that
-        # silently never reach their own last line — which would explain
-        # reports of the .update file AND this .bat both still sitting
-        # there afterward, since `del "%~f0"` would then never run either.
-        "if errorlevel 1 goto move_retry_init\n"
-        # `timeout` refuses to run ("Input redirection is not supported")
-        # when launched without a real console, which this helper always is
-        # (see creationflags below) — `ping` needs no console/stdin and is
-        # the standard batch-script sleep workaround for that case.
-        "ping 127.0.0.1 -n 2 >NUL\n"
-        "goto wait\n"
-        ":move_retry_init\n"
+        # Give QApplication a moment to exit, then let copy.exe's file-lock
+        # result decide when the replacement is safe. ping works without a
+        # console, unlike timeout in a detached cmd.exe process.
+        "ping 127.0.0.1 -n 3 >NUL\n"
         # The exe is no longer running by this point, but `move` can still
         # fail transiently right after a fresh download — most commonly
         # Windows Defender (or another AV) doing an on-access scan of the
