@@ -6811,6 +6811,28 @@ class UserProfilePage(QWidget):
         head_row.addLayout(text_col, 1)
         card.addLayout(head_row)
 
+        activity_card = _card_widget(root)
+        self._activity_card_widget = activity_card.parentWidget()
+        activity_card.addWidget(_card_section_label("Активность прослушивания"))
+
+        self._heatmap = _ListenHeatmap()
+        heatmap_scroll = QScrollArea()
+        heatmap_scroll.setWidgetResizable(False)
+        heatmap_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        heatmap_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        heatmap_scroll.setFixedHeight(self._heatmap.height() + 4)
+        heatmap_scroll.setStyleSheet(
+            get_scrollbar_style()
+            + "QScrollArea { background: transparent; border: none; }"
+            + "QScrollArea > QWidget > QWidget { background: transparent; }"
+        )
+        heatmap_scroll.setWidget(self._heatmap)
+        activity_card.addWidget(heatmap_scroll)
+
+        self._heatmap_caption = QLabel("")
+        self._heatmap_caption.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']}; font: 9pt 'Segoe UI';")
+        activity_card.addWidget(self._heatmap_caption)
+
         playlists_card = _card_widget(root)
         playlists_card.addWidget(_card_section_label("Плейлисты"))
         self._playlists_col = QVBoxLayout()
@@ -6837,6 +6859,12 @@ class UserProfilePage(QWidget):
             parts.append("Исполнитель")
         self._sub_lbl.setText("  •  ".join(parts))
         self._avatar.set_fallback_letter(display_name or login)
+
+        privacy = profile.get("privacy") or {}
+        show_listens = not (isinstance(privacy, dict) and privacy.get("show_listens") is False)
+        if self._activity_card_widget is not None:
+            self._activity_card_widget.setVisible(show_listens)
+        self.set_listen_stats(profile.get("listen_stats") or {})
 
         # The initial "partial" render (from a search result, before the full
         # /users/profile fetch lands) has no "playlists" key at all — leave
@@ -6866,6 +6894,24 @@ class UserProfilePage(QWidget):
             except Exception:
                 pass
         _start_image_loader([url], 88, 44, on_loaded, self._runners)
+
+    def set_listen_stats(self, stats: dict):
+        self._heatmap.set_stats(stats)
+        cutoff = date.today() - timedelta(days=364)
+        total_seconds = 0.0
+        for k, v in (stats or {}).items():
+            try:
+                d = date.fromisoformat(k)
+            except Exception:
+                continue
+            if d < cutoff:
+                continue
+            try:
+                total_seconds += float(v or 0)
+            except Exception:
+                pass
+        total_hours = total_seconds / 3600.0
+        self._heatmap_caption.setText(f"{total_hours:.1f} ч прослушано за последние 365 дней")
 
     def _set_playlists(self, playlists: list, creator_name: str):
         for row in self._playlist_rows:

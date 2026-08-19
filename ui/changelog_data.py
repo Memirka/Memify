@@ -5,6 +5,10 @@ one matches the version the running build was downloaded with.
 """
 
 CHANGELOG: dict[str, list[str]] = {
+    "1.4.9": [
+        "В чужих профилях теперь показывается активность прослушивания — "
+        "тот же календарь за последние 365 дней, что и в своём профиле",
+    ],
     "1.4.8": [
         "Исправлено автообновление Windows: пути к Memify.exe и "
         ".Memify.exe.update больше не собираются через %~dp0, из-за чего "
