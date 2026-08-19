@@ -138,12 +138,21 @@ def _apply_update_windows(target: str, new_file_path: str) -> tuple[bool, str]:
     # script waits for this process to exit, then swaps the file in place.
     pid = os.getpid()
     bat_path = os.path.join(os.path.dirname(target), "memify_update.bat")
+    # Both files always live next to the helper. Resolving them from %~dp0 in
+    # the batch avoids cmd.exe mangling an absolute path with non-ASCII
+    # characters, spaces, or shell metacharacters.
+    update_name = os.path.basename(new_file_path)
+    target_name = os.path.basename(target)
     script = (
         "@echo off\n"
         # attempt is both set and read within the same retry pass — without
         # delayed expansion, %attempt% could resolve to a stale value read
         # at block-parse time rather than the one just assigned to it.
         "setlocal enabledelayedexpansion\n"
+        'set "UPDATE=%~dp0' + update_name + '"\n'
+        'set "TARGET=%~dp0' + target_name + '"\n'
+        'set "LOG=%~dp0memify_update.log"\n'
+        'echo [%date% %time%] updater started >> "%LOG%"\n'
         ":wait\n"
         f'tasklist /FI "PID eq {pid}" 2>NUL | find "{pid}" >NUL\n'
         # `if errorlevel 1` here means the PID was NOT found (process
@@ -176,11 +185,21 @@ def _apply_update_windows(target: str, new_file_path: str) -> tuple[bool, str]:
         "set attempt=0\n"
         ":move_retry\n"
         "set /a attempt+=1\n"
-        f'move /Y "{new_file_path}" "{target}"\n'
-        "if not errorlevel 1 goto done\n"
-        "if !attempt! geq 30 goto done\n"
+        # Copying to an existing file is more reliable than move.exe for a
+        # just-unlocked executable on Windows; only remove the downloaded
+        # file after a successful copy.
+        'copy /B /Y "%UPDATE%" "%TARGET%" >NUL 2>&1\n'
+        "if errorlevel 1 goto move_failed\n"
+        'del /F /Q "%UPDATE%" >NUL 2>&1\n'
+        'echo [%date% %time%] update applied >> "%LOG%"\n'
+        "goto done\n"
+        ":move_failed\n"
+        'echo [%date% %time%] copy attempt !attempt! failed >> "%LOG%"\n'
+        "if !attempt! geq 30 goto failed\n"
         "ping 127.0.0.1 -n 2 >NUL\n"
         "goto move_retry\n"
+        ":failed\n"
+        'echo [%date% %time%] update failed; keeping "%UPDATE%" >> "%LOG%"\n'
         ":done\n"
         'del "%~f0"\n'
     )
