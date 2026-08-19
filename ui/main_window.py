@@ -2618,6 +2618,9 @@ class LyricsViewerOverlay(QWidget):
     )
 
     line_clicked = pyqtSignal(int)  # ms
+    prev_clicked = pyqtSignal()
+    play_clicked = pyqtSignal()
+    next_clicked = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2632,6 +2635,7 @@ class LyricsViewerOverlay(QWidget):
         self._line_effects: list[QGraphicsOpacityEffect] = []
         self._line_fade_anims: dict[int, QPropertyAnimation] = {}
         self._active_line_idx: int = -1
+        self._is_playing = False
         self.hide()
         self._build_ui()
 
@@ -2670,6 +2674,51 @@ class LyricsViewerOverlay(QWidget):
         shadow.setColor(QColor(0, 0, 0, 180))
         self._image_label.setGraphicsEffect(shadow)
         cover_col.addWidget(self._image_label, 0, Qt.AlignmentFlag.AlignHCenter)
+
+        transport_row = QHBoxLayout()
+        transport_row.setContentsMargins(0, 0, 0, 0)
+        transport_row.setSpacing(14)
+        transport_row.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        transport_btn_style = (
+            "QPushButton { background: rgba(255,255,255,0.08); border: none; border-radius: 16px; "
+            "color: #FFFFFF; font: 600 12pt 'Segoe UI'; }"
+            "QPushButton:hover { background: rgba(255,255,255,0.18); }"
+        )
+        play_btn_style = (
+            "QPushButton { background: #FFFFFF; border: none; border-radius: 21px; "
+            "color: #000000; font: 700 13pt 'Segoe UI'; }"
+            "QPushButton:hover { background: rgba(255,255,255,0.86); }"
+        )
+
+        self._prev_btn = QPushButton("◀◀")
+        self._prev_btn.setFixedSize(34, 34)
+        self._prev_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._prev_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._prev_btn.setToolTip("Предыдущий трек")
+        self._prev_btn.setStyleSheet(transport_btn_style)
+        self._prev_btn.clicked.connect(self.prev_clicked.emit)
+        transport_row.addWidget(self._prev_btn)
+
+        self._play_btn = QPushButton("▶")
+        self._play_btn.setFixedSize(42, 42)
+        self._play_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._play_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._play_btn.setToolTip("Пауза / Воспроизведение")
+        self._play_btn.setStyleSheet(play_btn_style)
+        self._play_btn.clicked.connect(self.play_clicked.emit)
+        transport_row.addWidget(self._play_btn)
+
+        self._next_btn = QPushButton("▶▶")
+        self._next_btn.setFixedSize(34, 34)
+        self._next_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._next_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._next_btn.setToolTip("Следующий трек")
+        self._next_btn.setStyleSheet(transport_btn_style)
+        self._next_btn.clicked.connect(self.next_clicked.emit)
+        transport_row.addWidget(self._next_btn)
+
+        cover_col.addLayout(transport_row)
 
         self._caption_label = QLabel()
         self._caption_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -2763,7 +2812,14 @@ class LyricsViewerOverlay(QWidget):
         _stop_runners(self._runners)
         self.hide()
 
+    def set_playing(self, is_playing: bool):
+        self._is_playing = bool(is_playing)
+        if hasattr(self, "_play_btn"):
+            self._play_btn.setText("Ⅱ" if self._is_playing else "▶")
+            self._play_btn.setToolTip("Пауза" if self._is_playing else "Воспроизведение")
+
     def show_for(self, title: str, artist_name: str, cover_rel: str):
+        already_visible = self.isVisible()
         self._caption_label.setText(f"{title} • {artist_name}" if artist_name else title)
         self._full_pixmap = None
         self._resize_cover_pixmap()
@@ -2771,9 +2827,18 @@ class LyricsViewerOverlay(QWidget):
 
         if self.parent():
             self.setGeometry(self.parent().rect())
-            snapshot = self.parent().grab()
-            self._backdrop_pixmap = _blurred_backdrop(snapshot)
+            if not already_visible:
+                snapshot = self.parent().grab()
+                self._backdrop_pixmap = _blurred_backdrop(snapshot)
         self._close_btn.move(self.width() - self.MARGIN // 2 - 36, 20)
+
+        if already_visible:
+            self.raise_()
+            self.show()
+            self.setFocus()
+            self._apply_resting_geometry()
+            self.update()
+            return
 
         cover_rect, text_rect = self._resting_rects()
         start_cover = QRect(-cover_rect.width(), cover_rect.y(), cover_rect.width(), cover_rect.height())
@@ -2805,7 +2870,7 @@ class LyricsViewerOverlay(QWidget):
             self._image_label.setFixedSize(1, 1)
             self._image_label.setPixmap(QPixmap())
             return
-        side = max(160, min(440, self._cover_container.width() - 20, self._cover_container.height() - 100))
+        side = max(160, min(440, self._cover_container.width() - 20, self._cover_container.height() - 150))
         self._image_label.setFixedSize(side, side)
         scaled = self._full_pixmap.scaled(
             side, side, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
@@ -2855,10 +2920,12 @@ class LyricsViewerOverlay(QWidget):
             "color: rgba(255,255,255,0.6); font: italic 11pt 'Segoe UI'; background: transparent;"
         )
         self._plain_label.setText("Загрузка текста…")
+        self._scroll.verticalScrollBar().setValue(0)
 
     def set_lyrics_data(self, plain: str, synced: list[tuple[int, str]]):
         self._synced_lines = list(synced or [])
         self._clear_lines()
+        self._scroll.verticalScrollBar().setValue(0)
 
         if self._synced_lines:
             self._plain_label.setVisible(False)
@@ -7814,6 +7881,9 @@ class MusicApp(QWidget):
         self._controls.cover_clicked.connect(self._open_now_playing_disc)
         self._controls.lyrics_clicked.connect(self._on_lyrics_button_clicked)
         self._lyrics_viewer.line_clicked.connect(self._on_lyrics_seek)
+        self._lyrics_viewer.prev_clicked.connect(self.player.play_prev)
+        self._lyrics_viewer.play_clicked.connect(self.player.toggle_playback)
+        self._lyrics_viewer.next_clicked.connect(self.player.play_next)
         self._controls.play_btn.clicked.connect(self.player.toggle_playback)
         self._controls.prev_btn.clicked.connect(self.player.play_prev)
         self._controls.next_btn.clicked.connect(self.player.play_next)
@@ -9658,24 +9728,65 @@ class MusicApp(QWidget):
     def _on_now_playing_panel_toggled(self, expanded: bool):
         self._save_ui_state(now_playing_panel_open=expanded)
 
-    def _on_lyrics_button_clicked(self):
-        # current_artist_name/track_title mirror _on_now_playing_album_clicked's
-        # reasoning — populated by PlaybackControls.update_track_info on
-        # every real track change AND on session resume (_apply_last_played_
-        # display), unlike self._playing_track which resume never sets.
-        title = self._controls.track_title.text()
-        if not title or title == "Нет трека":
-            return
-        artist_name = clean_artist_name(self._controls.current_artist_name or "")
-        cache_key = (artist_name.lower(), title.lower())
+    def _current_lyrics_context(self) -> dict | None:
+        album = self.player.current_playing_album
+        artist = self.player.current_playing_artist
+        if not album or self.player.current_track_idx is None:
+            return None
+        try:
+            track = album["tracks"][self.player.current_track_idx]
+        except (IndexError, KeyError, TypeError):
+            return None
+        title = clean_title((track or {}).get("title", ""))
+        if not title:
+            return None
+        raw_artist_name = (track or {}).get("artist_name") or (artist or {}).get("artist", "") or ""
+        artist_name = clean_artist_name(raw_artist_name)
+        is_virtual = bool(album.get("_is_liked_album") or album.get("_is_playlist"))
+        album_title = (
+            (track or {}).get("_real_album_title", "")
+            if is_virtual else album.get("title", "")
+        )
+        return {
+            "track": track,
+            "title": title,
+            "raw_artist_name": raw_artist_name,
+            "artist_name": artist_name,
+            "album_title": clean_title(album_title or ""),
+            "cover_rel": self._resolve_track_cover_rel(album, track),
+            "cache_key": (artist_name.lower(), title.lower()) if artist_name else None,
+        }
+
+    def _show_current_lyrics_in_viewer(self, start_fetch: bool = True) -> bool:
+        ctx = self._current_lyrics_context()
+        if not ctx:
+            return False
+        self._lyrics_viewer.show_for(ctx["title"], ctx["artist_name"], ctx["cover_rel"])
+        self._lyrics_viewer.set_playing(self.player.is_playing())
+
+        cache_key = ctx.get("cache_key")
+        if not cache_key:
+            self._lyrics_request_id += 1
+            self._lyrics_viewer_key = None
+            self._lyrics_viewer.set_lyrics_data("", [])
+            return True
+
         self._lyrics_viewer_key = cache_key
-        cover_rel = self._resolve_playing_cover_rel(self.player.current_playing_album)
-        self._lyrics_viewer.show_for(title, artist_name, cover_rel)
         cached = self._lyrics_cache.get(cache_key)
         if cached:
             self._lyrics_viewer.set_lyrics_data(cached["plain"], cached["synced"])
-        else:
-            self._lyrics_viewer.set_lyrics_loading()
+            self._lyrics_viewer.set_position(self.player.get_current_position())
+            return True
+
+        self._lyrics_viewer.set_lyrics_loading()
+        if start_fetch:
+            self._refresh_now_playing_lyrics(
+                ctx["track"], ctx["title"], ctx["raw_artist_name"], ctx["album_title"]
+            )
+        return True
+
+    def _on_lyrics_button_clicked(self):
+        self._show_current_lyrics_in_viewer(start_fetch=True)
 
     # ── Playback ──────────────────────────────────────────────────────────────
 
@@ -10861,7 +10972,12 @@ class MusicApp(QWidget):
 
         self._refresh_now_playing_bio(clean_artist)
         self._refresh_now_playing_queue()
-        self._refresh_now_playing_lyrics(track, title, artist_name)
+        album = self.player.current_playing_album or {}
+        is_virtual = bool(album.get("_is_liked_album") or album.get("_is_playlist"))
+        album_title = track.get("_real_album_title", "") if is_virtual else album.get("title", "")
+        self._refresh_now_playing_lyrics(track, title, artist_name, album_title)
+        if self._lyrics_viewer.isVisible():
+            self._show_current_lyrics_in_viewer(start_fetch=False)
 
     def _refresh_now_playing_bio(self, clean_artist: str):
         """Fetches the "Об исполнителе" bio for the artist just shown in
@@ -10880,7 +10996,7 @@ class MusicApp(QWidget):
 
         _lookup_artist_bio(clean_artist, on_result, self._now_playing_bio_runners)
 
-    def _refresh_now_playing_lyrics(self, track: dict, title: str, artist_name: str):
+    def _refresh_now_playing_lyrics(self, track: dict, title: str, artist_name: str, album_title: str = ""):
         """Pre-fetches lyrics (plain + synced, when lrclib has an LRC
         version) for the track that just started, cached in memory per
         (artist, title) for the rest of the session — so by the time the
@@ -10891,15 +11007,23 @@ class MusicApp(QWidget):
         artist_name is not."""
         clean_artist = clean_artist_name(artist_name) if artist_name else ""
         if not title or not clean_artist:
+            if self._lyrics_viewer.isVisible():
+                self._lyrics_request_id += 1
+                self._lyrics_viewer_key = None
+                self._lyrics_viewer.set_lyrics_data("", [])
             return
 
         cache_key = (clean_artist.lower(), title.lower())
         if cache_key in self._lyrics_cache:
+            if self._lyrics_viewer.isVisible() and self._lyrics_viewer_key == cache_key:
+                cached = self._lyrics_cache[cache_key]
+                self._lyrics_viewer.set_lyrics_data(cached["plain"], cached["synced"])
+                self._lyrics_viewer.set_position(self.player.get_current_position())
             return
 
         self._lyrics_request_id += 1
         request_id = self._lyrics_request_id
-        album_title = clean_title(track.get("_real_album_title", "")) if track.get("_real_album_title") else ""
+        album_title = clean_title(album_title or track.get("_real_album_title", ""))
         duration_sec = int((track.get("duration") or 0) / 1000)
 
         def on_finished(plain: str, synced: list, _rid=request_id, _key=cache_key):
@@ -10911,6 +11035,7 @@ class MusicApp(QWidget):
             # its own (see _on_lyrics_button_clicked).
             if self._lyrics_viewer.isVisible() and self._lyrics_viewer_key == _key:
                 self._lyrics_viewer.set_lyrics_data(plain, synced)
+                self._lyrics_viewer.set_position(self.player.get_current_position())
 
         _start_lyrics_worker(clean_artist, title, album_title, duration_sec, on_finished, self._lyrics_runners)
 
@@ -11029,6 +11154,7 @@ class MusicApp(QWidget):
     def _on_playback_state_changed(self, is_playing: bool):
         self._controls.set_playing(is_playing)
         self._disc_overlay.set_playing(is_playing)
+        self._lyrics_viewer.set_playing(is_playing)
         self._album_page.set_paused(not is_playing)
         self._artist_page.set_random_tracks_paused(not is_playing)
         self._sync_play_all_button(is_playing)
