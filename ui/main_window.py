@@ -345,34 +345,23 @@ def _track_identity_url(track: dict) -> str:
 def _track_like_keys(track: dict, url: str = "") -> set:
     """Keys identifying a track for like/playing-state matching.
 
-    A URL is authoritative whenever one is available — it points at one
-    specific file, so two tracks with different URLs are never "the same
-    track" for like/now-playing purposes, no matter what else matches.
-    Previously an album_id + normalized-title key was always added
-    alongside it (to let a like on one artist's copy of a shared/duplicated
-    album also match the other artist's identical copy) — but a title alone
-    doesn't actually identify a track: an album can genuinely contain two
-    different tracks that happen to share a title (e.g. two different
-    bonus-edition masters of one song), and that fallback key made them
-    collide — liking or playing one lit up both. The fallback is now only
-    used when a track has no URL at all to go on.
+    An album ID plus normalized title is authoritative for library tracks:
+    folder URLs change on rename, but album_id.txt does not. URLs remain a
+    fallback for legacy entries and YouTube tracks without an album ID.
     """
     keys = set()
+    album_id = str((track or {}).get("album_id") or "").strip()
+    title = (track or {}).get("title", "") or (track or {}).get("track_title", "") or ""
+    if album_id and title:
+        keys.add(f"id:{album_id}::{clean_title(title).strip().lower()}")
+        return keys
     u = url or (track or {}).get("url", "") or ""
     if u:
         keys.add(u)
         if u.startswith("http"):
             keys.add(re.sub(r'^https?://[^/]+', '', u))
         elif not u.startswith("file://"):
-            # file:// (local-library track) is already an absolute,
-            # unique identifier on its own — no server-relative form to
-            # add an alternate key for.
             keys.add(SERVER_URL + u)
-        return keys
-    album_id = str((track or {}).get("album_id") or "").strip()
-    title = (track or {}).get("title", "") or (track or {}).get("track_title", "") or ""
-    if album_id and title:
-        keys.add(f"id:{album_id}::{clean_title(title).strip().lower()}")
     return keys
 
 
@@ -7452,7 +7441,7 @@ class MusicApp(QWidget):
         # here too so the sidebar row can render without a network round trip.
         self._playlist_subscriptions: list = []
         self._subscriptions: list = []       # list of artist names
-        self._album_subscriptions: list = [] # list of "artist||album" strings
+        self._album_subscriptions: list = [] # stable album_id strings (legacy name keys are migrated by server)
         # User's custom sidebar order — "artist::Name" / "album::Artist||Title"
         # keys, letting artists and albums be freely interleaved instead of
         # always grouped as all-artists-then-all-albums.
@@ -8578,6 +8567,15 @@ class MusicApp(QWidget):
         }
 
         def resolve_album(album_key: str):
+            # New records use album_id directly; this keeps the sidebar valid
+            # after a folder/artist/album rename. The name form below is only
+            # for account data saved by older clients.
+            by_id = str(album_key or "").strip()
+            if by_id and "||" not in by_id:
+                for artist_obj in library:
+                    for al in artist_obj.get("albums", []):
+                        if str(al.get("album_id") or "").strip() == by_id:
+                            return (al, artist_obj)
             parts = album_key.split("||", 1)
             if len(parts) != 2:
                 return None
@@ -9146,7 +9144,7 @@ class MusicApp(QWidget):
             playing_track=self._playing_track, is_paused=not self.player.is_playing(),
         )
         self._album_page._album_like_btn.setVisible(True)
-        album_key = self._album_key(artist.get("artist", ""), album.get("title", ""))
+        album_key = self._album_key(artist.get("artist", ""), album.get("title", ""), album.get("album_id", ""))
         self._album_page.set_album_liked(album_key in self._album_subscriptions)
         self._album_page.refresh_track_likes(self._all_collection_keys())
         self._sync_play_all_button()
@@ -9248,6 +9246,8 @@ class MusicApp(QWidget):
     def _resolve_liked_track(self, lt: dict, library: list) -> dict:
         """Return the real track dict from library if found; otherwise construct one from stored fields."""
         url = lt.get("url", "")
+        album_id = str(lt.get("album_id") or "").strip()
+        track_title = lt.get("track_title") or lt.get("title", "")
         artist_name = lt.get("artist_name", "")
         album_title = lt.get("album_title", "")
         if lt.get("_is_youtube"):
@@ -9269,15 +9269,21 @@ class MusicApp(QWidget):
             if not isinstance(artist, dict):
                 continue
             a_name = clean_artist_name(artist.get("artist", ""))
-            if artist_name and a_name != clean_artist_name(artist_name):
+            # album_id survives artist-folder renames too; only legacy refs
+            # without it need their saved artist name as a lookup constraint.
+            if not album_id and artist_name and a_name != clean_artist_name(artist_name):
                 continue
             for album in artist.get("albums", []):
-                if album_title and clean_title(album.get("title", "")) != clean_title(album_title):
+                if album_id and str(album.get("album_id") or "").strip() != album_id:
+                    continue
+                if not album_id and album_title and clean_title(album.get("title", "")) != clean_title(album_title):
                     continue
                 for track in album.get("tracks", []):
+                    if album_id and track_title and clean_title(track.get("title", "")) != clean_title(track_title):
+                        continue
                     t_url = track.get("url", "")
                     full_url = resolve_media_url(t_url)
-                    if url in (t_url, full_url):
+                    if album_id or url in (t_url, full_url):
                         result = dict(track)
                         result.setdefault("artist_name", artist.get("artist", ""))
                         result["_real_album_title"] = album.get("title", "")
@@ -9577,8 +9583,9 @@ class MusicApp(QWidget):
         return keys
 
     @staticmethod
-    def _album_key(artist_name: str, album_title: str) -> str:
-        return f"{(artist_name or '').strip()}||{(album_title or '').strip()}"
+    def _album_key(artist_name: str, album_title: str, album_id: str = "") -> str:
+        """Stable key for saved albums; legacy name keys remain readable."""
+        return str(album_id or "").strip() or f"{(artist_name or '').strip()}||{(album_title or '').strip()}"
 
     def _is_same_playing_target(self, album: dict, artist: dict) -> bool:
         """Is `album` (with `artist`) the exact same album/playlist/liked-
@@ -9600,8 +9607,8 @@ class MusicApp(QWidget):
         if is_liked or playing_is_liked:
             return is_liked and playing_is_liked
         playing_artist = self.player.current_playing_artist or {}
-        this_key = self._album_key((artist or {}).get("artist", ""), album.get("title", ""))
-        playing_key = self._album_key(playing_artist.get("artist", ""), playing_album.get("title", ""))
+        this_key = self._album_key((artist or {}).get("artist", ""), album.get("title", ""), album.get("album_id", ""))
+        playing_key = self._album_key(playing_artist.get("artist", ""), playing_album.get("title", ""), playing_album.get("album_id", ""))
         return this_key == playing_key
 
     def _sync_play_all_button(self, is_playing: bool | None = None):
@@ -10085,7 +10092,7 @@ class MusicApp(QWidget):
             return
         artist_name = (self._current_artist or {}).get("artist", "")
         album_title = self._current_album.get("title", "")
-        key = self._album_key(artist_name, album_title)
+        key = self._album_key(artist_name, album_title, self._current_album.get("album_id", ""))
         order_key = f"album::{key}"
         if key in self._album_subscriptions:
             self._album_subscriptions.remove(key)
@@ -10553,10 +10560,10 @@ class MusicApp(QWidget):
         it, capped so it doesn't grow forever."""
         if not album_title:
             return list(self._settings.get("album_history") or [])
-        key = self._album_key(artist_name, album_title)
+        key = self._album_key(artist_name, album_title, album_id)
         history = [
             h for h in (self._settings.get("album_history") or [])
-            if isinstance(h, dict) and self._album_key(h.get("artist_name", ""), h.get("album_title", "")) != key
+            if isinstance(h, dict) and self._album_key(h.get("artist_name", ""), h.get("album_title", ""), h.get("album_id", "")) != key
         ]
         history.insert(0, {
             "artist_name": artist_name,

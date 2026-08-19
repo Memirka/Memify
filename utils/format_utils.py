@@ -40,6 +40,7 @@ def clean_title(title):
     title = re.sub(r'^\d{1,3}\s*[-.]\s*', '', title)
 
     replacements = {
+        '7c1': '.',
         '7c2': '/',
         '7c3': '"',
         '7c4': '?',
@@ -89,7 +90,7 @@ def normalize_cyr(s: str) -> str:
     s = unicodedata.normalize("NFKC", s)
     s = s.replace("ё", "е")
 
-    s = s.replace("7c2", "/").replace("7c3", '"').replace("7c4", "?").replace("7c5", "*").replace("7c6", ":") \
+    s = s.replace("7c1", ".").replace("7c2", "/").replace("7c3", '"').replace("7c4", "?").replace("7c5", "*").replace("7c6", ":") \
          .replace("7c7", "\\").replace("7c8", "|").replace("7c9", "<").replace("7c10", ">")
     s = s.translate(_PUNCT_TABLE)
     s = _SPACE_RE.sub(" ", s).strip()
