@@ -342,6 +342,32 @@ def _track_identity_url(track: dict) -> str:
     return track.get("_permanent_url") or track.get("url", "")
 
 
+def _is_local_collection_item(track: dict | None = None, album: dict | None = None, artist: dict | None = None) -> bool:
+    """True for local-library media that must stay out of account-level
+    collections. Local tracks are machine-specific paths, so saving them to
+    liked_tracks/playlists/subscriptions would break on other devices and in
+    the web client."""
+    for obj in (track, album, artist):
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("local"):
+            return True
+        if str(obj.get("album_id") or "").startswith("local::"):
+            return True
+        for key in ("url", "_permanent_url"):
+            if str(obj.get(key) or "").startswith("file://"):
+                return True
+    return False
+
+
+def _collection_ref_is_local(ref) -> bool:
+    if isinstance(ref, dict):
+        return _is_local_collection_item(track=ref)
+    if isinstance(ref, str):
+        return ref.startswith("file://")
+    return False
+
+
 def _track_like_keys(track: dict, url: str = "") -> set:
     """Keys identifying a track for like/playing-state matching.
 
@@ -1378,6 +1404,11 @@ class ArtistPage(QWidget):
             row.set_paused(is_paused)
 
     def set_liked(self, liked: bool):
+        if _is_local_collection_item(artist=self._current_artist):
+            self._is_liked = False
+            self._artist_like_btn.setVisible(False)
+            return
+        self._artist_like_btn.setVisible(True)
         self._is_liked = liked
         c = COLORS
         if liked:
@@ -1526,6 +1557,7 @@ class TrackRow(QWidget):
         self._display_number = display_number if display_number is not None else index + 1
         self._liked = False
         self._hovered = False
+        self._collection_enabled = not _is_local_collection_item(track=track)
         self._is_playing_state = False  # this row is the current track (playing or paused)
         self._is_paused_state = False   # only meaningful while _is_playing_state is True
         self.setObjectName("trackRow")
@@ -1602,8 +1634,14 @@ class TrackRow(QWidget):
         self._like_btn = QPushButton("+")
         self._like_btn.setFixedSize(26, 26)
         self._like_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._like_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._like_btn.setToolTip("Добавить в плейлист")
+        self._like_btn.setCursor(
+            Qt.CursorShape.PointingHandCursor if self._collection_enabled else Qt.CursorShape.ArrowCursor
+        )
+        self._like_btn.setEnabled(self._collection_enabled)
+        self._like_btn.setToolTip(
+            "Добавить в плейлист" if self._collection_enabled
+            else "Локальные треки нельзя добавлять в аккаунт"
+        )
         self._like_btn.clicked.connect(lambda: self.like_clicked.emit(self._index))
         row.addWidget(self._like_btn)
         # Always occupies its 26x26 slot (never setVisible(False)) — hiding/showing
@@ -1633,7 +1671,9 @@ class TrackRow(QWidget):
 
     def _apply_add_button_style(self):
         c = COLORS
-        if self._liked:
+        if not self._collection_enabled:
+            color = hover = "transparent"
+        elif self._liked:
             color, hover = c['PRIMARY'], c['PRIMARY_HOVER']
         elif self._hovered:
             color, hover = c['TEXT_SECONDARY'], c['TEXT_PRIMARY']
@@ -1645,13 +1685,14 @@ class TrackRow(QWidget):
             f"QPushButton {{ background: transparent; border: 1.5px solid {color}; border-radius: 13px; "
             f"color: {color}; font-size: 13px; font-weight: 600; }}"
             f"QPushButton:hover {{ color: {hover}; border-color: {hover}; }}"
+            "QPushButton:disabled { background: transparent; color: transparent; border-color: transparent; }"
         )
 
     def set_liked(self, liked: bool):
         """Despite the name, this now means "belongs to at least one
         collection (liked tracks or a playlist)" — accent-colored and always
         shown when true, invisible-until-hovered otherwise."""
-        self._liked = liked
+        self._liked = bool(liked) and self._collection_enabled
         self._apply_add_button_style()
 
     def enterEvent(self, event):
@@ -1733,7 +1774,7 @@ class TrackRow(QWidget):
         super().mouseDoubleClickEvent(event)
 
     def contextMenuEvent(self, event):
-        if self._track.get("local"):
+        if _is_local_collection_item(track=self._track):
             # Already a local file — nothing to download.
             return
         menu = QMenu(self)
@@ -2038,8 +2079,9 @@ class AlbumPage(QWidget):
         album_name = clean_title(album.get("title", "")) or "Неизвестно"
         artist_name = clean_artist_name(artist.get("artist", "")) or ""
         tracks = album.get("tracks", []) or []
+        is_local_album = _is_local_collection_item(album=album, artist=artist)
 
-        self._dl_btn.setVisible(not album.get("local"))
+        self._dl_btn.setVisible(not is_local_album)
 
         self._album_name_label.setText(album_name)
 
@@ -2323,7 +2365,10 @@ class AlbumPage(QWidget):
 
     def refresh_track_likes(self, liked_keys: set):
         for row in self._track_rows:
-            row.set_liked(bool(row.track_identity_keys() & liked_keys))
+            row.set_liked(
+                not _is_local_collection_item(track=row._track)
+                and bool(row.track_identity_keys() & liked_keys)
+            )
 
     def apply_accent(self):
         c = COLORS
@@ -8131,15 +8176,33 @@ class MusicApp(QWidget):
             if not self._closing:
                 QTimer.singleShot(5000, self._fetch_player_data)
             return
-        self._liked_tracks = data.get("liked_tracks", []) or []
-        self._playlists = [p for p in (data.get("playlists", []) or []) if isinstance(p, dict)]
+        self._liked_tracks = [
+            ref for ref in (data.get("liked_tracks", []) or [])
+            if not _collection_ref_is_local(ref)
+        ]
+        self._playlists = []
+        for playlist in (data.get("playlists", []) or []):
+            if not isinstance(playlist, dict):
+                continue
+            clean_playlist = dict(playlist)
+            clean_playlist["tracks"] = [
+                ref for ref in (playlist.get("tracks", []) or [])
+                if not _collection_ref_is_local(ref)
+            ]
+            self._playlists.append(clean_playlist)
         self._playlist_subscriptions = [
             s for s in (data.get("playlist_subscriptions", []) or [])
             if isinstance(s, dict) and s.get("owner_login") and s.get("playlist_id")
         ]
         self._subscriptions = data.get("subscriptions", []) or []
-        self._album_subscriptions = data.get("album_subscriptions", []) or []
-        self._follow_order = data.get("follow_order", []) or []
+        self._album_subscriptions = [
+            key for key in (data.get("album_subscriptions", []) or [])
+            if not str(key or "").startswith("local::")
+        ]
+        self._follow_order = [
+            key for key in (data.get("follow_order", []) or [])
+            if not str(key or "").startswith("album::local::")
+        ]
         # Max-per-day merge, not overwrite: this fires once for the local
         # cache and again for the network fetch, and either can be behind
         # today's not-yet-flushed local accumulation (see
@@ -8207,6 +8270,10 @@ class MusicApp(QWidget):
         (avatar/display name/playlists) — UI is already updated
         optimistically, and /player/save only writes whatever keys are
         present, so this never touches liked_tracks/subscriptions/etc."""
+        if "playlists" in updates:
+            self._sanitize_account_collections()
+            updates = dict(updates)
+            updates["playlists"] = self._playlists
         self._enqueue_player_data_save(updates)
 
     def _enqueue_player_data_save(self, payload: dict):
@@ -8715,6 +8782,34 @@ class MusicApp(QWidget):
         except Exception:
             pass
 
+    def _sanitize_account_collections(self):
+        """Keep machine-local tracks out of account-synced collections."""
+        self._liked_tracks = [
+            ref for ref in (self._liked_tracks or [])
+            if not _collection_ref_is_local(ref)
+        ]
+
+        clean_playlists = []
+        for playlist in (self._playlists or []):
+            if not isinstance(playlist, dict):
+                continue
+            clean_playlist = dict(playlist)
+            clean_playlist["tracks"] = [
+                ref for ref in (playlist.get("tracks", []) or [])
+                if not _collection_ref_is_local(ref)
+            ]
+            clean_playlists.append(clean_playlist)
+        self._playlists = clean_playlists
+
+        self._album_subscriptions = [
+            key for key in (self._album_subscriptions or [])
+            if not str(key or "").startswith("local::")
+        ]
+        self._follow_order = [
+            key for key in (self._follow_order or [])
+            if not str(key or "").startswith("album::local::")
+        ]
+
     def _save_player_data_async(self, updates: dict):
         if not self._account_manager:
             return
@@ -8731,6 +8826,7 @@ class MusicApp(QWidget):
             # by nothing. _on_player_data_loaded flips the guard and retries
             # this once real data is in, so nothing here is lost for good.
             return
+        self._sanitize_account_collections()
         # Always send full current state to avoid partial overwrites on server.
         # "playlists" belongs here too, not just in explicit playlist-mutation
         # calls — _write_local_player_data below *replaces* the whole local
@@ -8757,6 +8853,29 @@ class MusicApp(QWidget):
             "listen_stats": self._listen_stats,
         }
         full.update(updates)
+        full["liked_tracks"] = [
+            ref for ref in (full.get("liked_tracks") or [])
+            if not _collection_ref_is_local(ref)
+        ]
+        clean_playlists = []
+        for playlist in (full.get("playlists") or []):
+            if not isinstance(playlist, dict):
+                continue
+            clean_playlist = dict(playlist)
+            clean_playlist["tracks"] = [
+                ref for ref in (playlist.get("tracks", []) or [])
+                if not _collection_ref_is_local(ref)
+            ]
+            clean_playlists.append(clean_playlist)
+        full["playlists"] = clean_playlists
+        full["album_subscriptions"] = [
+            key for key in (full.get("album_subscriptions") or [])
+            if not str(key or "").startswith("local::")
+        ]
+        full["follow_order"] = [
+            key for key in (full.get("follow_order") or [])
+            if not str(key or "").startswith("album::local::")
+        ]
         # Write to local cache immediately so next startup sees it right away
         self._write_local_player_data(full)
         self._enqueue_player_data_save(full)
@@ -9168,7 +9287,10 @@ class MusicApp(QWidget):
         self._artist_page.mark_random_tracks_playing(self._playing_url, self._playing_track)
         self._artist_page.set_random_tracks_paused(not self.player.is_playing())
         artist_name = (artist.get("artist") or "").strip()
-        self._artist_page.set_liked(artist_name in self._subscriptions)
+        self._artist_page.set_liked(
+            not _is_local_collection_item(artist=artist)
+            and artist_name in self._subscriptions
+        )
         self._save_ui_state(
             last_view_page="artist",
             last_view_artist=artist_name,
@@ -9189,9 +9311,10 @@ class MusicApp(QWidget):
             album, artist, playing_url=self._playing_url, display_artist_names=display_artist_names,
             playing_track=self._playing_track, is_paused=not self.player.is_playing(),
         )
-        self._album_page._album_like_btn.setVisible(True)
+        is_local_album = _is_local_collection_item(album=album, artist=artist)
+        self._album_page._album_like_btn.setVisible(not is_local_album)
         album_key = self._album_key(artist.get("artist", ""), album.get("title", ""), album.get("album_id", ""))
-        self._album_page.set_album_liked(album_key in self._album_subscriptions)
+        self._album_page.set_album_liked(not is_local_album and album_key in self._album_subscriptions)
         self._album_page.refresh_track_likes(self._all_collection_keys())
         self._sync_play_all_button()
         self._page_stack.setCurrentWidget(self._album_page)
@@ -9348,6 +9471,8 @@ class MusicApp(QWidget):
         library = self.library_manager.get_library()
         tracks = []
         for lt in self._liked_tracks:
+            if _collection_ref_is_local(lt):
+                continue
             if isinstance(lt, dict):
                 tracks.append(self._resolve_liked_track(lt, library))
             elif isinstance(lt, str):
@@ -9580,6 +9705,8 @@ class MusicApp(QWidget):
             track_obj = album["tracks"][self.player.current_track_idx]
         except (IndexError, KeyError, TypeError):
             return
+        if _is_local_collection_item(track=track_obj, album=album, artist=artist):
+            return
         self._show_add_to_collections_menu(track_obj, album, artist, self._controls.like_btn)
 
     def _sync_like_button(self):
@@ -9595,6 +9722,9 @@ class MusicApp(QWidget):
         except (IndexError, KeyError, TypeError):
             self._controls.set_like_state(False, enabled=False)
             return
+        if _is_local_collection_item(track=track_obj, album=album, artist=self.player.current_playing_artist):
+            self._controls.set_like_state(False, enabled=False)
+            return
         in_collection = bool(_track_like_keys(track_obj, _track_identity_url(track_obj)) & self._all_collection_keys())
         self._controls.set_like_state(in_collection, enabled=True)
 
@@ -9606,6 +9736,8 @@ class MusicApp(QWidget):
         album also match the other artist's identical copy."""
         keys = set()
         for lt in self._liked_tracks:
+            if _collection_ref_is_local(lt):
+                continue
             if isinstance(lt, dict):
                 keys |= _track_like_keys(lt, lt.get("url", ""))
             elif isinstance(lt, str) and lt:
@@ -9615,6 +9747,8 @@ class MusicApp(QWidget):
     def _playlist_track_keys(self, playlist: dict) -> set:
         keys = set()
         for ref in (playlist or {}).get("tracks", []) or []:
+            if _collection_ref_is_local(ref):
+                continue
             if isinstance(ref, dict):
                 keys |= _track_like_keys(ref, ref.get("url", ""))
         return keys
@@ -9717,6 +9851,8 @@ class MusicApp(QWidget):
     def _show_add_to_collections_menu(self, track: dict, album: dict, artist: dict | None, anchor: QWidget):
         if not self._account_manager:
             return
+        if _is_local_collection_item(track=track, album=album, artist=artist):
+            return
         my_keys = _track_like_keys(track, _track_identity_url(track))
 
         menu = QMenu(anchor)
@@ -9744,6 +9880,8 @@ class MusicApp(QWidget):
         menu.exec(QCursor.pos())
 
     def _toggle_track_liked(self, track: dict, album: dict, artist: dict | None, liked: bool):
+        if _is_local_collection_item(track=track, album=album, artist=artist):
+            return
         my_keys = _track_like_keys(track, _track_identity_url(track))
         already = bool(my_keys & self._liked_urls_set())
         if liked == already:
@@ -9757,6 +9895,8 @@ class MusicApp(QWidget):
         self._after_track_collections_changed()
 
     def _toggle_track_in_playlist(self, track: dict, album: dict, artist: dict | None, playlist_id: str, add: bool):
+        if _is_local_collection_item(track=track, album=album, artist=artist):
+            return
         pl = next((p for p in self._playlists if p.get("id") == playlist_id), None)
         if pl is None:
             return
@@ -9775,6 +9915,8 @@ class MusicApp(QWidget):
 
     def _create_playlist_with_track(self, track: dict, album: dict, artist: dict | None):
         if not self._account_manager:
+            return
+        if _is_local_collection_item(track=track, album=album, artist=artist):
             return
         name, ok = QInputDialog.getText(self, "Новый плейлист", "Название плейлиста:")
         name = (name or "").strip()
@@ -9825,7 +9967,7 @@ class MusicApp(QWidget):
         tracks = [
             self._resolve_liked_track(ref, library)
             for ref in (playlist.get("tracks", []) or [])
-            if isinstance(ref, dict)
+            if isinstance(ref, dict) and not _collection_ref_is_local(ref)
         ]
         return {
             "title": playlist.get("name") or "Плейлист",
@@ -10123,15 +10265,21 @@ class MusicApp(QWidget):
     def _on_album_track_add_clicked(self, track: dict):
         if not self._account_manager:
             return
+        if _is_local_collection_item(track=track, album=self._current_album or {}, artist=self._current_artist):
+            return
         self._show_add_to_collections_menu(track, self._current_album or {}, self._current_artist, self._album_page)
 
     def _on_artist_random_track_add_clicked(self, track: dict, album: dict, artist: dict):
         if not self._account_manager:
             return
+        if _is_local_collection_item(track=track, album=album, artist=artist):
+            return
         self._show_add_to_collections_menu(track, album, artist, self._artist_page)
 
     def _on_album_like_clicked(self):
         if not self._account_manager or not self._current_album:
+            return
+        if _is_local_collection_item(album=self._current_album, artist=self._current_artist):
             return
         if self._current_album.get("_is_playlist"):
             self._on_playlist_subscribe_clicked()
@@ -10156,6 +10304,8 @@ class MusicApp(QWidget):
 
     def _on_artist_like_clicked(self):
         if not self._account_manager or not self._current_artist:
+            return
+        if _is_local_collection_item(artist=self._current_artist):
             return
         artist_name = (self._current_artist.get("artist") or "").strip()
         if not artist_name:
@@ -10182,6 +10332,16 @@ class MusicApp(QWidget):
         # artist (see PlaybackControls.update_track_info), which can be a
         # different one entirely.
         if not self._account_manager:
+            return
+        album = self.player.current_playing_album or {}
+        artist = self.player.current_playing_artist or {}
+        track_obj = None
+        if album and self.player.current_track_idx is not None:
+            try:
+                track_obj = album["tracks"][self.player.current_track_idx]
+            except (IndexError, KeyError, TypeError):
+                track_obj = None
+        if _is_local_collection_item(track=track_obj, album=album, artist=artist):
             return
         artist_name = (self._controls.current_artist_name or "").strip()
         if not artist_name:
@@ -10681,9 +10841,19 @@ class MusicApp(QWidget):
 
         real_artist = self._find_artist_any(artist_name) if artist_name else None
         clean_artist = clean_artist_name(artist_name) if artist_name else ""
-        panel.set_about_artist(clean_artist, subscribable=bool(real_artist))
-        if artist_name:
+        is_local_now = _is_local_collection_item(
+            track=track,
+            album=self.player.current_playing_album,
+            artist=self.player.current_playing_artist,
+        )
+        panel.set_about_artist(
+            clean_artist,
+            subscribable=bool(real_artist) and not is_local_now and not _is_local_collection_item(artist=real_artist),
+        )
+        if artist_name and not is_local_now:
             panel.set_subscribed(artist_name in self._subscriptions)
+        else:
+            panel.set_subscribed(False)
         if real_artist and real_artist.get("cover"):
             self._load_now_playing_artist_avatar(resolve_media_url(real_artist["cover"]))
         else:
