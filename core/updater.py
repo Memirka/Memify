@@ -137,23 +137,18 @@ def _apply_update_windows(target: str, new_file_path: str) -> tuple[bool, str]:
     # Windows keeps the running .exe's file locked. The helper retries the
     # replacement itself; relying on tasklist/PID polling can wait forever
     # after a process shutdown or a PID reuse.
-    bat_path = os.path.join(os.path.dirname(target), "memify_update.bat")
-    # Both files always live next to the helper. Resolving them from %~dp0 in
-    # the batch avoids cmd.exe mangling an absolute path with non-ASCII
-    # characters, spaces, or shell metacharacters.
-    update_name = os.path.basename(new_file_path)
-    target_name = os.path.basename(target)
-    backup_name = f"{target_name}.old"
+    exe_dir = os.path.dirname(target)
+    bat_path = os.path.join(exe_dir, "memify_update.bat")
+    backup_path = os.path.join(exe_dir, f"{os.path.basename(target)}.old")
+    helper_log_path = os.path.join(exe_dir, "memify_update.log")
     script = (
         "@echo off\n"
-        # attempt is both set and read within the same retry pass — without
-        # delayed expansion, %attempt% could resolve to a stale value read
-        # at block-parse time rather than the one just assigned to it.
-        "setlocal enabledelayedexpansion\n"
-        'set "UPDATE=%~dp0' + update_name + '"\n'
-        'set "TARGET=%~dp0' + target_name + '"\n'
-        'set "BACKUP=%~dp0' + backup_name + '"\n'
-        'set "LOG=%~dp0memify_update.log"\n'
+        "setlocal\n"
+        'set "UPDATE=%MEMIFY_UPDATE_FILE%"\n'
+        'set "TARGET=%MEMIFY_TARGET_FILE%"\n'
+        'set "BACKUP=%MEMIFY_BACKUP_FILE%"\n'
+        'set "LOG=%MEMIFY_UPDATE_LOG%"\n'
+        'set "HELPER=%MEMIFY_UPDATE_HELPER%"\n'
         'echo [%date% %time%] updater started >> "%LOG%"\n'
         'echo [%date% %time%] update="%UPDATE%" target="%TARGET%" >> "%LOG%"\n'
         'if not exist "%UPDATE%" echo [%date% %time%] update file missing before retry loop >> "%LOG%"\n'
@@ -166,7 +161,7 @@ def _apply_update_windows(target: str, new_file_path: str) -> tuple[bool, str]:
         "set attempt=0\n"
         ":move_retry\n"
         "set /a attempt+=1\n"
-        'if not exist "%UPDATE%" echo [%date% %time%] update file disappeared on attempt !attempt! >> "%LOG%"\n'
+        'if not exist "%UPDATE%" echo [%date% %time%] update file disappeared on attempt %attempt% >> "%LOG%"\n'
         'if not exist "%UPDATE%" goto done\n'
         'del /F /Q "%BACKUP%" >NUL 2>&1\n'
         'if not exist "%TARGET%" goto install_update\n'
@@ -179,13 +174,13 @@ def _apply_update_windows(target: str, new_file_path: str) -> tuple[bool, str]:
         'echo [%date% %time%] update applied >> "%LOG%"\n'
         "goto done\n"
         ":target_locked\n"
-        'echo [%date% %time%] replace attempt !attempt! failed: target is still locked >> "%LOG%"\n'
+        'echo [%date% %time%] replace attempt %attempt% failed: target is still locked >> "%LOG%"\n'
         "goto retry_wait\n"
         ":install_failed\n"
-        'echo [%date% %time%] replace attempt !attempt! failed: could not move update into place >> "%LOG%"\n'
+        'echo [%date% %time%] replace attempt %attempt% failed: could not move update into place >> "%LOG%"\n'
         'if exist "%BACKUP%" move /Y "%BACKUP%" "%TARGET%" >NUL 2>&1\n'
         ":retry_wait\n"
-        "if !attempt! geq 180 goto failed\n"
+        "if %attempt% geq 180 goto failed\n"
         "ping 127.0.0.1 -n 2 >NUL\n"
         "goto move_retry\n"
         ":failed\n"
@@ -193,11 +188,22 @@ def _apply_update_windows(target: str, new_file_path: str) -> tuple[bool, str]:
         'if exist "%TARGET%" del /F /Q "%UPDATE%" >NUL 2>&1\n'
         'if exist "%TARGET%" del /F /Q "%BACKUP%" >NUL 2>&1\n'
         ":done\n"
+        'if defined HELPER del /F /Q "%HELPER%" >NUL 2>&1\n'
         'del /F /Q "%~f0" >NUL 2>&1\n'
     )
     try:
-        with open(bat_path, "w", encoding="utf-8") as f:
+        with open(bat_path, "w", encoding="ascii") as f:
             f.write(script)
+        helper_env = os.environ.copy()
+        helper_env.update(
+            {
+                "MEMIFY_UPDATE_FILE": os.path.abspath(new_file_path),
+                "MEMIFY_TARGET_FILE": os.path.abspath(target),
+                "MEMIFY_BACKUP_FILE": os.path.abspath(backup_path),
+                "MEMIFY_UPDATE_LOG": os.path.abspath(helper_log_path),
+                "MEMIFY_UPDATE_HELPER": os.path.abspath(bat_path),
+            }
+        )
         # The PyInstaller parent/child process arrangement can terminate a
         # normal child cmd.exe as the app exits. Put the helper in its own
         # detached process group so it survives long enough to copy the new
@@ -211,12 +217,14 @@ def _apply_update_windows(target: str, new_file_path: str) -> tuple[bool, str]:
         )
         try:
             subprocess.Popen(
-                ["cmd.exe", "/d", "/c", bat_path],
+                ["cmd.exe", "/d", "/c", "call", os.path.basename(bat_path)],
                 creationflags=creationflags,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 close_fds=True,
+                cwd=exe_dir,
+                env=helper_env,
             )
         except OSError:
             # Some launchers put the app into a Windows job that does not
@@ -224,12 +232,14 @@ def _apply_update_windows(target: str, new_file_path: str) -> tuple[bool, str]:
             # failing the whole update.
             creationflags &= ~getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
             subprocess.Popen(
-                ["cmd.exe", "/d", "/c", bat_path],
+                ["cmd.exe", "/d", "/c", "call", os.path.basename(bat_path)],
                 creationflags=creationflags,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 close_fds=True,
+                cwd=exe_dir,
+                env=helper_env,
             )
         log(f"apply_update_and_exit: windows helper launched ({bat_path})")
         return True, ""
