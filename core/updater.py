@@ -143,6 +143,7 @@ def _apply_update_windows(target: str, new_file_path: str) -> tuple[bool, str]:
     # characters, spaces, or shell metacharacters.
     update_name = os.path.basename(new_file_path)
     target_name = os.path.basename(target)
+    backup_name = f"{target_name}.old"
     script = (
         "@echo off\n"
         # attempt is both set and read within the same retry pass — without
@@ -151,41 +152,48 @@ def _apply_update_windows(target: str, new_file_path: str) -> tuple[bool, str]:
         "setlocal enabledelayedexpansion\n"
         'set "UPDATE=%~dp0' + update_name + '"\n'
         'set "TARGET=%~dp0' + target_name + '"\n'
+        'set "BACKUP=%~dp0' + backup_name + '"\n'
         'set "LOG=%~dp0memify_update.log"\n'
         'echo [%date% %time%] updater started >> "%LOG%"\n'
-        # Give QApplication a moment to exit, then let copy.exe's file-lock
-        # result decide when the replacement is safe. ping works without a
-        # console, unlike timeout in a detached cmd.exe process.
+        'echo [%date% %time%] update="%UPDATE%" target="%TARGET%" >> "%LOG%"\n'
+        'if not exist "%UPDATE%" echo [%date% %time%] update file missing before retry loop >> "%LOG%"\n'
+        'if not exist "%UPDATE%" goto done\n'
+        'for %%A in ("%UPDATE%") do echo [%date% %time%] update size=%%~zA >> "%LOG%"\n'
+        # Give QApplication and the PyInstaller parent process a moment to
+        # exit, then let file operations decide when the replacement is safe.
+        # ping works without a console, unlike timeout in a detached process.
         "ping 127.0.0.1 -n 3 >NUL\n"
-        # The exe is no longer running by this point, but `move` can still
-        # fail transiently right after a fresh download — most commonly
-        # Windows Defender (or another AV) doing an on-access scan of the
-        # newly-written .update file, which holds its own lock on it for a
-        # while independent of our process. Observed in the wild taking
-        # several launch-and-quit cycles (a few minutes) to clear before
-        # this retry loop was added, since an even earlier version had no
-        # error check here at all and just deleted itself unconditionally
-        # after one failed attempt.
         "set attempt=0\n"
         ":move_retry\n"
         "set /a attempt+=1\n"
-        # Copying to an existing file is more reliable than move.exe for a
-        # just-unlocked executable on Windows; only remove the downloaded
-        # file after a successful copy.
-        'copy /B /Y "%UPDATE%" "%TARGET%" >NUL 2>&1\n'
-        "if errorlevel 1 goto move_failed\n"
-        'del /F /Q "%UPDATE%" >NUL 2>&1\n'
+        'if not exist "%UPDATE%" echo [%date% %time%] update file disappeared on attempt !attempt! >> "%LOG%"\n'
+        'if not exist "%UPDATE%" goto done\n'
+        'del /F /Q "%BACKUP%" >NUL 2>&1\n'
+        'if not exist "%TARGET%" goto install_update\n'
+        'move /Y "%TARGET%" "%BACKUP%" >NUL 2>&1\n'
+        "if errorlevel 1 goto target_locked\n"
+        ":install_update\n"
+        'move /Y "%UPDATE%" "%TARGET%" >NUL 2>&1\n'
+        "if errorlevel 1 goto install_failed\n"
+        'del /F /Q "%BACKUP%" >NUL 2>&1\n'
         'echo [%date% %time%] update applied >> "%LOG%"\n'
         "goto done\n"
-        ":move_failed\n"
-        'echo [%date% %time%] copy attempt !attempt! failed >> "%LOG%"\n'
-        "if !attempt! geq 30 goto failed\n"
+        ":target_locked\n"
+        'echo [%date% %time%] replace attempt !attempt! failed: target is still locked >> "%LOG%"\n'
+        "goto retry_wait\n"
+        ":install_failed\n"
+        'echo [%date% %time%] replace attempt !attempt! failed: could not move update into place >> "%LOG%"\n'
+        'if exist "%BACKUP%" move /Y "%BACKUP%" "%TARGET%" >NUL 2>&1\n'
+        ":retry_wait\n"
+        "if !attempt! geq 180 goto failed\n"
         "ping 127.0.0.1 -n 2 >NUL\n"
         "goto move_retry\n"
         ":failed\n"
-        'echo [%date% %time%] update failed; keeping "%UPDATE%" >> "%LOG%"\n'
+        'echo [%date% %time%] update failed; cleaning temporary update files if target still exists >> "%LOG%"\n'
+        'if exist "%TARGET%" del /F /Q "%UPDATE%" >NUL 2>&1\n'
+        'if exist "%TARGET%" del /F /Q "%BACKUP%" >NUL 2>&1\n'
         ":done\n"
-        'del "%~f0"\n'
+        'del /F /Q "%~f0" >NUL 2>&1\n'
     )
     try:
         with open(bat_path, "w", encoding="utf-8") as f:
@@ -199,15 +207,30 @@ def _apply_update_windows(target: str, new_file_path: str) -> tuple[bool, str]:
             getattr(subprocess, "CREATE_NO_WINDOW", 0)
             | getattr(subprocess, "DETACHED_PROCESS", 0)
             | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
         )
-        subprocess.Popen(
-            ["cmd.exe", "/d", "/c", bat_path],
-            creationflags=creationflags,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            close_fds=True,
-        )
+        try:
+            subprocess.Popen(
+                ["cmd.exe", "/d", "/c", bat_path],
+                creationflags=creationflags,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+            )
+        except OSError:
+            # Some launchers put the app into a Windows job that does not
+            # allow breakaway. Fall back to a detached helper rather than
+            # failing the whole update.
+            creationflags &= ~getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
+            subprocess.Popen(
+                ["cmd.exe", "/d", "/c", bat_path],
+                creationflags=creationflags,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+            )
         log(f"apply_update_and_exit: windows helper launched ({bat_path})")
         return True, ""
     except Exception as e:

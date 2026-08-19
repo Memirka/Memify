@@ -228,7 +228,12 @@ class AppWindow(QWidget):
 
         ok, err = apply_update_and_exit(file_path)
         if ok:
-            QApplication.instance().quit()
+            app = QApplication.instance()
+            if app is not None:
+                app.quit()
+            # Do not let VLC/Qt worker shutdown delays keep Memify.exe locked
+            # while the external Windows updater is trying to replace it.
+            os._exit(0)
         else:
             self._show_update_error(f"Не удалось применить обновление: {err}\n\nЛог: {_log_path()}")
             self._after_update_check()
