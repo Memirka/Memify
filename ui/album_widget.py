@@ -8,6 +8,28 @@ from .shimmer_placeholder import ShimmerLabel
 from .styles import COLORS, get_album_widget_style
 
 
+def release_type_label(album: dict) -> str:
+    tracks = album.get("tracks") if isinstance(album, dict) else None
+    if not isinstance(tracks, list) or not tracks:
+        return ""
+
+    count = len(tracks)
+    total_ms = 0
+    for track in tracks:
+        if not isinstance(track, dict):
+            continue
+        try:
+            total_ms += max(0, int(track.get("duration") or 0))
+        except (TypeError, ValueError):
+            pass
+
+    if count >= 7 or total_ms > 30 * 60 * 1000:
+        return "Альбом"
+    if count >= 4:
+        return "Мини-альбом"
+    return "Сингл"
+
+
 class AlbumWidget(QWidget):
     clicked = pyqtSignal(dict)
 
@@ -56,6 +78,16 @@ class AlbumWidget(QWidget):
         self.title_label.setMaximumHeight(fm.height() * 2 + 4)
         self.title_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         root.addWidget(self.title_label)
+
+        release_type = release_type_label(self.album)
+        if release_type:
+            self.release_type_label = QLabel(release_type)
+            self.release_type_label.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
+            self.release_type_label.setWordWrap(False)
+            self.release_type_label.setFont(QFont("Segoe UI", 8))
+            self.release_type_label.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']}; background: transparent;")
+            self.release_type_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            root.addWidget(self.release_type_label)
 
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
 

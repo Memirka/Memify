@@ -478,6 +478,7 @@ class _LyricsButton(QPushButton):
 
 
 class PlaybackControls(QWidget):
+    track_clicked = pyqtSignal()
     artist_clicked = pyqtSignal(str)
     album_clicked = pyqtSignal(str, str)
     like_clicked = pyqtSignal()
@@ -556,7 +557,7 @@ class PlaybackControls(QWidget):
 
         self.track_title = MarqueeLabel("Нет трека", primary=True)
         self.track_title.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
-        self.track_title.clicked.connect(self._on_album_clicked)
+        self.track_title.clicked.connect(self.track_clicked.emit)
         text_layout.addWidget(self.track_title)
 
         self.artist_row = QWidget()
@@ -804,6 +805,13 @@ class PlaybackControls(QWidget):
             try:
                 self.progress_slider.blockSignals(True)
                 self.progress_slider.setValue(int(position_ms / duration_ms * 1000))
+            finally:
+                self.progress_slider.blockSignals(False)
+        else:
+            self.duration_label.setText("0:00")
+            try:
+                self.progress_slider.blockSignals(True)
+                self.progress_slider.setValue(0)
             finally:
                 self.progress_slider.blockSignals(False)
 

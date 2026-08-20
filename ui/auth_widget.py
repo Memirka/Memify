@@ -10,6 +10,7 @@ from PyQt6.QtWidgets import (
 )
 
 from core.account import AccountManager
+from ui.styles import COLORS, get_theme
 
 
 class _AuthWorker(QThread):
@@ -44,95 +45,45 @@ class AuthWidget(QWidget):
         self._mode = "register"
         self._worker: _AuthWorker | None = None
         self._build_ui()
+        self.apply_theme()
         self._update_mode_text()
 
     def _build_ui(self):
-        self.setStyleSheet("""
-            QWidget {
-                background-color: qlineargradient(
-                    spread:pad, x1:0, y1:0, x2:1, y2:1,
-                    stop:0 #0f1116, stop:1 #161b22
-                );
-                color: #e9edf2;
-            }
-            #Card {
-                background: rgba(19, 23, 31, 0.9);
-                border: 1px solid #1f2937;
-                border-radius: 16px;
-                padding: 24px;
-                /* Qt stylesheets не поддерживают box-shadow, имитируем отступами */
-            }
-            QLineEdit {
-                padding: 12px;
-                border: 1px solid #2c3747;
-                border-radius: 12px;
-                background: #0f141d;
-                color: #ffffff;
-                font-size: 14px;
-            }
-            QLineEdit:focus {
-                border-color: #35d27c;
-                outline: 2px solid rgba(53,210,124,0.18);
-            }
-            QPushButton {
-                padding: 12px;
-                border-radius: 12px;
-                background: qlineargradient(spread:pad, x1:0, y1:0, x2:1, y2:1,
-                    stop:0 #35d27c, stop:1 #2bb36c);
-                color: #0b0f15;
-                font-weight: 700;
-                letter-spacing: 0.3px;
-            }
-            QPushButton#linkButton {
-                background: transparent;
-                color: #9ea4aa;
-                padding: 8px 4px;
-                text-decoration: underline;
-            }
-            QPushButton#linkButton:hover {
-                color: #cfd4dc;
-            }
-            QLabel#errorLabel {
-                color: #ff7a7a;
-            }
-            QLabel#hintLabel {
-                color: #9ea4aa;
-            }
-        """)
+        self.setObjectName("AuthWidget")
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(32, 32, 32, 32)
         layout.setSpacing(12)
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        card = QWidget(self)
-        card.setObjectName("Card")
-        card_layout = QVBoxLayout(card)
+        self.card = QWidget(self)
+        self.card.setObjectName("Card")
+        card_layout = QVBoxLayout(self.card)
         card_layout.setSpacing(12)
         card_layout.setContentsMargins(12, 12, 12, 12)
 
-        self.title_label = QLabel(card)
-        self.title_label.setStyleSheet("font-size: 20px; font-weight: 700;")
+        self.title_label = QLabel(self.card)
+        self.title_label.setObjectName("titleLabel")
 
-        self.hint_label = QLabel(card)
+        self.hint_label = QLabel(self.card)
         self.hint_label.setObjectName("hintLabel")
         self.hint_label.setWordWrap(True)
 
-        self.login_input = QLineEdit(card)
+        self.login_input = QLineEdit(self.card)
         self.login_input.setPlaceholderText("Логин")
 
-        self.password_input = QLineEdit(card)
+        self.password_input = QLineEdit(self.card)
         self.password_input.setPlaceholderText("Пароль")
         self.password_input.setEchoMode(QLineEdit.EchoMode.Password)
 
-        self.error_label = QLabel(card)
+        self.error_label = QLabel(self.card)
         self.error_label.setObjectName("errorLabel")
         self.error_label.hide()
 
-        self.submit_button = QPushButton(card)
+        self.submit_button = QPushButton(self.card)
         self.submit_button.clicked.connect(self._on_submit)
 
-        self.toggle_button = QPushButton("Войти, если уже есть аккаунт", card)
+        self.toggle_button = QPushButton("Войти, если уже есть аккаунт", self.card)
         self.toggle_button.setObjectName("linkButton")
         self.toggle_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.toggle_button.clicked.connect(self._toggle_mode)
@@ -149,8 +100,95 @@ class AuthWidget(QWidget):
         card_layout.addWidget(self.toggle_button, alignment=Qt.AlignmentFlag.AlignCenter)
 
         layout.addStretch(1)
-        layout.addWidget(card, alignment=Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.card, alignment=Qt.AlignmentFlag.AlignCenter)
         layout.addStretch(2)
+
+    def apply_theme(self):
+        c = COLORS
+        if get_theme() == "light":
+            page_bg = c["BACKGROUND"]
+            card_bg = c["SURFACE"]
+            input_bg = c["SURFACE_LIGHT"]
+            text = c["TEXT_PRIMARY"]
+            secondary = c["TEXT_SECONDARY"]
+            border = c["BORDER"]
+            error = "#D93025"
+        else:
+            page_bg = (
+                "qlineargradient(spread:pad, x1:0, y1:0, x2:1, y2:1, "
+                "stop:0 #0f1116, stop:1 #161b22)"
+            )
+            card_bg = "rgba(19, 23, 31, 0.9)"
+            input_bg = "#0f141d"
+            text = "#e9edf2"
+            secondary = "#9ea4aa"
+            border = "#2c3747"
+            error = "#ff7a7a"
+
+        self.setStyleSheet(f"""
+            QWidget#AuthWidget {{
+                background: {page_bg};
+                color: {text};
+            }}
+            QWidget#Card {{
+                background: {card_bg};
+                border: 1px solid {border};
+                border-radius: 16px;
+                padding: 24px;
+            }}
+            QLabel {{
+                background: transparent;
+                color: {text};
+            }}
+            QLabel#titleLabel {{
+                font-size: 20px;
+                font-weight: 700;
+            }}
+            QLabel#hintLabel {{
+                color: {secondary};
+            }}
+            QLabel#errorLabel {{
+                color: {error};
+            }}
+            QLineEdit {{
+                padding: 12px;
+                border: 1px solid {border};
+                border-radius: 12px;
+                background: {input_bg};
+                color: {text};
+                font-size: 14px;
+                selection-background-color: {c['PRIMARY']};
+                selection-color: #0b0f15;
+            }}
+            QLineEdit:focus {{
+                border-color: {c['PRIMARY']};
+            }}
+            QPushButton {{
+                padding: 12px;
+                border: none;
+                border-radius: 12px;
+                background: {c['PRIMARY_GRADIENT']};
+                color: #0b0f15;
+                font-weight: 700;
+                letter-spacing: 0.3px;
+            }}
+            QPushButton:hover {{
+                background: {c['PRIMARY_HOVER']};
+            }}
+            QPushButton:disabled {{
+                color: rgba(11, 15, 21, 0.55);
+            }}
+            QPushButton#linkButton {{
+                background: transparent;
+                color: {secondary};
+                padding: 8px 4px;
+                text-decoration: underline;
+            }}
+            QPushButton#linkButton:hover {{
+                color: {text};
+                background: transparent;
+            }}
+        """)
 
     def _toggle_mode(self):
         self._mode = "login" if self._mode == "register" else "register"

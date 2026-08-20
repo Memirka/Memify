@@ -24,6 +24,18 @@ def _load_saved_ui_scale() -> float:
     return 1.0
 
 
+def _load_saved_appearance() -> dict:
+    try:
+        if os.path.exists(APP_SETTINGS_FILE):
+            with open(APP_SETTINGS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
 _saved_scale = _load_saved_ui_scale()
 if _saved_scale != 1.0:
     os.environ["QT_SCALE_FACTOR"] = str(_saved_scale)
@@ -50,7 +62,13 @@ from ui.splash_screen import SplashScreen
 import ui.styles as styles_module
 
 
-def _apply_dark_palette(app: QApplication):
+def _apply_saved_appearance(app: QApplication):
+    settings = _load_saved_appearance()
+    styles_module.set_accent_color(
+        settings.get("accent_color") or styles_module.COLORS["PRIMARY"],
+        settings.get("accent_color2") or None,
+    )
+    styles_module.set_theme(settings.get("theme", "dark"))
     styles_module.apply_palette(app)
 
 
@@ -328,6 +346,7 @@ class AppWindow(QWidget):
         try:
             self._auth_widget.login_input.clear()
             self._auth_widget.password_input.clear()
+            self._auth_widget.apply_theme()
         except Exception:
             pass
 
@@ -352,7 +371,7 @@ def main():
     if os.path.exists(APP_ICON):
         app.setWindowIcon(QIcon(APP_ICON))
 
-    _apply_dark_palette(app)
+    _apply_saved_appearance(app)
 
     account_manager = AccountManager()
     window = AppWindow(account_manager)

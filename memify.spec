@@ -134,6 +134,14 @@ qt_binaries = [b for b in qt_binaries if _keep_qt_entry(b)]
 datas += qt_datas
 binaries += qt_binaries
 
+try:
+    yt_dlp_datas, yt_dlp_binaries, yt_dlp_hiddenimports = collect_all("yt_dlp")
+except Exception as ex:
+    print(f"!! memify.spec: yt-dlp collect_all failed — YouTube playback may be unavailable: {ex}")
+    yt_dlp_datas, yt_dlp_binaries, yt_dlp_hiddenimports = [], [], []
+datas += yt_dlp_datas
+binaries += yt_dlp_binaries
+
 # Extra safety net: explicitly keep PyQt6's unused submodules out even if some
 # hook chain tries to pull one back in transitively.
 _UNUSED_QT_MODULES = [
@@ -154,7 +162,7 @@ a = Analysis(
     pathex=[],
     binaries=binaries,
     datas=datas,
-    hiddenimports=[],
+    hiddenimports=yt_dlp_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

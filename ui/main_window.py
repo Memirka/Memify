@@ -15,6 +15,7 @@ import queue
 import random
 import base64
 import threading
+import urllib.parse
 from functools import partial
 
 from PyQt6.QtWidgets import (
@@ -28,7 +29,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import (
     Qt, QTimer, QThread, QUrl, QSize, QRect, QRectF, pyqtSignal, pyqtSlot, QObject, QPoint, QPointF,
-    QPropertyAnimation, pyqtProperty, QEasingCurve, QBuffer,
+    QPropertyAnimation, QParallelAnimationGroup, pyqtProperty, QEasingCurve, QBuffer,
 )
 from datetime import date, timedelta
 from PyQt6.QtGui import QFont, QColor, QPalette, QIcon, QPixmap, QImage, QFontMetrics, QCursor, QPainter, QPainterPath, QPen, QBrush, QLinearGradient, QDesktopServices
@@ -42,11 +43,11 @@ try:
 except ImportError:
     _AccountManager = None
 try:
-    from core.youtube import search_youtube as _search_youtube, resolve_stream_url as _resolve_youtube_stream
+    from core.youtube import search_youtube as _search_youtube, resolve_channel_avatar_url as _resolve_youtube_channel_avatar
 except ImportError:
     _search_youtube = None
-    _resolve_youtube_stream = None
-from ui.playback_controls import PlaybackControls, ClickableLabel
+    _resolve_youtube_channel_avatar = None
+from ui.playback_controls import PlaybackControls, ClickableLabel, _CircleButton, _GlyphButton
 from ui.album_widget import AlbumWidget
 from ui.changelog_data import CHANGELOG
 from ui.shimmer_placeholder import ShimmerLabel
@@ -333,13 +334,39 @@ def _make_youtube_icon_pixmap(size: int) -> QPixmap:
 
 def _track_identity_url(track: dict) -> str:
     """The URL that identifies a track for like/collection matching. For a
-    YouTube track this must be the permanent youtube.com/watch link, not
-    track["url"] — once played, that's overwritten in-memory with a
-    resolved googlevideo.com stream (see MusicApp._resolve_track_url_for_player),
-    which is different on every play and would never match what's actually
-    stored in liked_tracks/playlists (see MusicApp._build_track_ref)."""
+    YouTube track this must be the permanent youtube.com/watch link. Resolved
+    googlevideo.com streams are deliberately kept out of track["url"] because
+    they expire and differ on every play (see MusicApp._resolve_track_url_for_player)."""
     track = track or {}
     return track.get("_permanent_url") or track.get("url", "")
+
+
+def _youtube_stream_proxy_url(webpage_url: str) -> str:
+    return (
+        f"{SERVER_URL.rstrip('/')}/youtube/stream?webpage_url="
+        f"{urllib.parse.quote(webpage_url or '', safe='')}"
+    )
+
+
+def _track_url_keys(track: dict | None = None, url: str = "") -> set:
+    """URL-only identity keys for exact current-track matching.
+
+    Unlike _track_like_keys, this deliberately does not use album_id+title:
+    two different tracks inside one album can have the same displayed title,
+    but their URLs still point at the concrete file/video that is playing.
+    """
+    u = url or _track_identity_url(track or {})
+    if not u:
+        return set()
+    keys = {u}
+    normalized = normalize_track_url(u)
+    if normalized:
+        keys.add(normalized)
+    if u.startswith("http"):
+        keys.add(re.sub(r'^https?://[^/]+', '', u).lstrip("/"))
+    elif not u.startswith("file://"):
+        keys.add(SERVER_URL + u)
+    return {k for k in keys if k}
 
 
 def _is_local_collection_item(track: dict | None = None, album: dict | None = None, artist: dict | None = None) -> bool:
@@ -1186,8 +1213,12 @@ class ArtistPage(QWidget):
             # the next track change even if it happens to be the track
             # already playing (e.g. right after load_artist(), or after
             # "Ещё" reveals rows 6-10 mid-playback).
+            url_keys = _track_url_keys(self._last_playing_track or {}, self._last_playing_url)
             keys = _track_like_keys(self._last_playing_track or {}, self._last_playing_url)
-            is_playing = bool(keys) and bool(row.track_identity_keys() & keys)
+            is_playing = (
+                bool(row.track_url_keys() & url_keys) if url_keys
+                else bool(keys) and bool(row.track_identity_keys() & keys)
+            )
             row.set_playing(is_playing)
             if is_playing:
                 row.set_paused(self._last_paused)
@@ -1394,9 +1425,14 @@ class ArtistPage(QWidget):
         instead of a single album's own tracklist."""
         self._last_playing_url = url
         self._last_playing_track = track
+        url_keys = _track_url_keys(track or {}, url)
         keys = _track_like_keys(track or {}, url)
         for row in self._random_track_rows:
-            row.set_playing(bool(keys) and bool(row.track_identity_keys() & keys))
+            is_playing = (
+                bool(row.track_url_keys() & url_keys) if url_keys
+                else bool(keys) and bool(row.track_identity_keys() & keys)
+            )
+            row.set_playing(is_playing)
 
     def set_random_tracks_paused(self, is_paused: bool):
         self._last_paused = is_paused
@@ -1569,6 +1605,9 @@ class TrackRow(QWidget):
         self._build_ui()
 
     def _build_ui(self):
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
         row = QHBoxLayout(self)
         row.setContentsMargins(8, 6, 8, 6)
         row.setSpacing(8)
@@ -1605,7 +1644,8 @@ class TrackRow(QWidget):
         self._title_label = _AccentGradientLabel(title)
         self._title_label.set_accent_active(False)  # plain TEXT_PRIMARY until this row is the playing track
         self._title_label.setStyleSheet(f"color: {COLORS['TEXT_PRIMARY']}; font: 10pt 'Segoe UI';")
-        self._title_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self._title_label.setMinimumWidth(0)
+        self._title_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         title_col.addWidget(self._title_label)
 
         # Below the title (not inline) — mainly relevant for playlist tracks,
@@ -1614,7 +1654,8 @@ class TrackRow(QWidget):
         if artist_name:
             self._artist_label = QLabel(clean_artist_name(artist_name))
             self._artist_label.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']}; font: 8.5pt 'Segoe UI';")
-            self._artist_label.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+            self._artist_label.setMinimumWidth(0)
+            self._artist_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
             if self._track.get("_is_youtube"):
                 artist_row = QHBoxLayout()
                 artist_row.setContentsMargins(0, 0, 0, 0)
@@ -1655,6 +1696,11 @@ class TrackRow(QWidget):
         self._dur_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self._dur_label.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']}; font: 9pt 'Segoe UI';")
         row.addWidget(self._dur_label)
+
+    def minimumSizeHint(self):
+        hint = super().minimumSizeHint()
+        hint.setWidth(0)
+        return hint
 
     def show_cover(self, show: bool):
         self._cover_label.setVisible(show)
@@ -1710,16 +1756,12 @@ class TrackRow(QWidget):
         return url
 
     def track_identity_keys(self) -> set:
-        # Playlists (unlike the liked-tracks page) hand this row the *live*
-        # track dict, not a display-only copy — once played, a YouTube
-        # track's url field gets overwritten in place with a resolved
-        # stream (see MusicApp._resolve_track_url_for_player), which
-        # differs every time. _track_identity_url prefers _permanent_url
-        # when present so this keeps matching _playing_url either way,
-        # whether this row's dict got mutated (playlists) or never does
-        # (the liked-tracks page's own copy, which is why this bug didn't
-        # show up there — its url simply never changes).
+        # Keep YouTube matching on the permanent watch link, not on the
+        # short-lived stream URL returned for one playback attempt.
         return _track_like_keys(self._track, _track_identity_url(self._track))
+
+    def track_url_keys(self) -> set:
+        return _track_url_keys(self._track, _track_identity_url(self._track))
 
     def set_playing(self, is_playing: bool):
         """Marks this row as the current track (playing OR paused) — call
@@ -1805,6 +1847,9 @@ class AlbumPage(QWidget):
     _PLAY_ALL_TEXT_PLAYING = "Играет"
     _PLAY_ALL_ICON_SIZE = 18
     _PLAY_ALL_ICON_LEFT_INSET = 14
+    _DOWNLOAD_ALBUM_TEXT = "↓ Скачать альбом"
+    _DOWNLOAD_ALBUM_COMPACT_TEXT = "↓"
+    _ACTION_BUTTON_SPACING = 8
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1819,6 +1864,9 @@ class AlbumPage(QWidget):
         self._build_ui()
 
     def _build_ui(self):
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 16, 20, 0)
         layout.setSpacing(0)
@@ -1937,31 +1985,54 @@ class AlbumPage(QWidget):
             self._PLAY_ALL_ICON_LEFT_INSET, icon_y, self._PLAY_ALL_ICON_SIZE, self._PLAY_ALL_ICON_SIZE
         )
 
-        btn_row = QHBoxLayout()
-        btn_row.setContentsMargins(0, 8, 0, 0)
-        btn_row.setSpacing(8)
-        btn_row.addWidget(self._play_all_btn)
-
-        self._dl_btn = dl_btn = QPushButton("↓ Скачать альбом")
+        self._dl_btn = dl_btn = QPushButton(self._DOWNLOAD_ALBUM_TEXT)
         dl_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         dl_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         dl_btn.setFixedHeight(36)
+        dl_btn.setMinimumWidth(0)
+        dl_btn.setToolTip("Скачать альбом")
         dl_btn.clicked.connect(self._on_download_album)
         dl_btn.setStyleSheet(
             f"QPushButton {{ background: transparent; border: 1px solid {c['BORDER']}; border-radius: 18px; "
             f"color: {c['TEXT_PRIMARY']}; font: 10pt 'Segoe UI'; padding: 0 16px; }}"
             f"QPushButton:hover {{ border-color: {c['TEXT_PRIMARY']}; }}"
         )
-        btn_row.addWidget(dl_btn)
-        btn_row.addStretch(1)
 
-        # Stretch goes *before* btn_row (not after) so it's the one absorbing
+        # Stretch goes before the album action buttons so it's the one absorbing
         # the gap between the meta text and the buttons — pushes "Слушать"/
         # "Скачать альбом" all the way down to sit flush with the cover's
         # bottom edge, matching the web client's .page-actions (margin-top:
         # auto in style.css), instead of just trailing right under the text.
         info_col.addStretch(1)
-        info_col.addLayout(btn_row)
+        self._album_actions_wrap = QWidget()
+        self._album_actions_wrap.setMinimumWidth(0)
+        self._album_actions_wrap.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        actions_col = QVBoxLayout(self._album_actions_wrap)
+        actions_col.setContentsMargins(0, 8, 0, 0)
+        actions_col.setSpacing(self._ACTION_BUTTON_SPACING)
+
+        self._album_actions_top = QWidget()
+        self._album_actions_top.setMinimumWidth(0)
+        self._album_actions_top_row = QHBoxLayout(self._album_actions_top)
+        self._album_actions_top_row.setContentsMargins(0, 0, 0, 0)
+        self._album_actions_top_row.setSpacing(self._ACTION_BUTTON_SPACING)
+        self._album_actions_top_row.addWidget(self._play_all_btn)
+        self._album_actions_top_row.addWidget(dl_btn)
+        self._album_actions_top_row.addStretch(1)
+        actions_col.addWidget(self._album_actions_top)
+
+        self._album_actions_bottom = QWidget()
+        self._album_actions_bottom.setMinimumWidth(0)
+        self._album_actions_bottom_row = QHBoxLayout(self._album_actions_bottom)
+        self._album_actions_bottom_row.setContentsMargins(0, 0, 0, 0)
+        self._album_actions_bottom_row.setSpacing(0)
+        self._album_actions_bottom_row.addStretch(1)
+        self._album_actions_bottom.setVisible(False)
+        actions_col.addWidget(self._album_actions_bottom)
+
+        self._download_button_wrapped = False
+        self._download_button_compact = False
+        info_col.addWidget(self._album_actions_wrap)
         header_row.addLayout(info_col, 1)
         layout.addWidget(header, 0)
 
@@ -1982,6 +2053,8 @@ class AlbumPage(QWidget):
         num_hdr.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']}; font: 9pt 'Segoe UI';")
         col_hdr.addWidget(num_hdr)
         title_hdr = QLabel("Название")
+        title_hdr.setMinimumWidth(0)
+        title_hdr.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         title_hdr.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']}; font: 9pt 'Segoe UI';")
         col_hdr.addWidget(title_hdr, 1)
         like_hdr = QLabel()
@@ -1996,12 +2069,16 @@ class AlbumPage(QWidget):
 
         # Track list scroll area
         self._scroll = QScrollArea()
+        self._scroll.setMinimumWidth(0)
+        self._scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._scroll.setWidgetResizable(True)
         self._scroll.setFrameShape(QFrame.Shape.NoFrame)
         self._scroll.setStyleSheet(get_scrollbar_style())
         self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
         self._tracks_container = QWidget()
+        self._tracks_container.setMinimumWidth(0)
+        self._tracks_container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self._tracks_layout = QVBoxLayout(self._tracks_container)
         self._tracks_layout.setContentsMargins(0, 4, 0, 16)
         self._tracks_layout.setSpacing(2)
@@ -2009,6 +2086,65 @@ class AlbumPage(QWidget):
 
         self._scroll.setWidget(self._tracks_container)
         layout.addWidget(self._scroll, 1)
+
+    def minimumSizeHint(self):
+        hint = super().minimumSizeHint()
+        hint.setWidth(0)
+        return hint
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_album_actions_layout()
+
+    def _set_download_button_wrapped(self, wrapped: bool):
+        wrapped = bool(wrapped)
+        if self._download_button_wrapped == wrapped:
+            return
+        if wrapped:
+            self._album_actions_top_row.removeWidget(self._dl_btn)
+            self._album_actions_bottom_row.insertWidget(0, self._dl_btn)
+            self._album_actions_bottom.setVisible(True)
+        else:
+            self._album_actions_bottom_row.removeWidget(self._dl_btn)
+            self._album_actions_top_row.insertWidget(1, self._dl_btn)
+            self._album_actions_bottom.setVisible(False)
+        self._download_button_wrapped = wrapped
+
+    def _set_download_button_compact(self, compact: bool):
+        compact = bool(compact)
+        if self._download_button_compact == compact:
+            return
+        self._download_button_compact = compact
+        if compact:
+            self._dl_btn.setText(self._DOWNLOAD_ALBUM_COMPACT_TEXT)
+            self._dl_btn.setFixedWidth(42)
+            return
+        self._dl_btn.setText(self._DOWNLOAD_ALBUM_TEXT)
+        self._dl_btn.setMinimumWidth(0)
+        self._dl_btn.setMaximumWidth(16777215)
+
+    def _update_album_actions_layout(self):
+        if not hasattr(self, "_album_actions_wrap"):
+            return
+        if self._dl_btn.isHidden():
+            self._set_download_button_wrapped(False)
+            self._set_download_button_compact(False)
+            return
+
+        available = self._album_actions_wrap.width()
+        if available <= 0:
+            return
+
+        self._set_download_button_compact(False)
+        full_download_width = self._dl_btn.sizeHint().width()
+        required_inline_width = (
+            self._play_all_btn.width()
+            + self._ACTION_BUTTON_SPACING
+            + full_download_width
+        )
+        should_wrap = available < required_inline_width
+        self._set_download_button_wrapped(should_wrap)
+        self._set_download_button_compact(should_wrap and available < full_download_width)
 
     def _set_artist_names(self, names: list):
         """Render one separately-clickable button per artist, comma-separated."""
@@ -2065,8 +2201,47 @@ class AlbumPage(QWidget):
         self._play_all_icon.setPixmap(_make_play_pause_icon(playing_now, self._PLAY_ALL_ICON_SIZE, "#000"))
         self._play_all_btn.setText(self._PLAY_ALL_TEXT_PLAYING if playing_now else self._PLAY_ALL_TEXT_IDLE)
 
+    @staticmethod
+    def _track_count_text(count: int) -> str:
+        return (
+            f"{count} трек" if count == 1 else
+            f"{count} трека" if 2 <= count <= 4 else
+            f"{count} треков"
+        )
+
+    @staticmethod
+    def _track_duration_ms(track: dict) -> int:
+        if not isinstance(track, dict):
+            return 0
+        try:
+            return max(0, int(track.get("duration") or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _album_duration_text(total_ms: int) -> str:
+        if total_ms <= 0:
+            return ""
+        total_minutes = max(1, int((total_ms + 30_000) // 60_000))
+        hours, minutes = divmod(total_minutes, 60)
+        if hours and minutes:
+            return f"{hours} ч {minutes} мин"
+        if hours:
+            return f"{hours} ч"
+        return f"{minutes} мин"
+
+    def _update_track_count_meta(self):
+        tracks = self._current_album.get("tracks", []) or []
+        count_text = self._track_count_text(len(tracks))
+        total_ms = sum(self._track_duration_ms(track) for track in tracks)
+        duration_text = self._album_duration_text(total_ms)
+        self._track_count_label.setText(
+            f"{count_text} ≈ {duration_text}" if duration_text else count_text
+        )
+
     def load_album(self, album: dict, artist: dict, playing_url: str = "", display_artist_names: list | None = None,
-                    playing_track: dict | None = None, is_paused: bool = False):
+                    playing_track: dict | None = None, playing_track_idx: int | None = None,
+                    is_paused: bool = False):
         """Update this page for a different album."""
         self._current_album = album
         self._current_artist = artist
@@ -2082,6 +2257,7 @@ class AlbumPage(QWidget):
         is_local_album = _is_local_collection_item(album=album, artist=artist)
 
         self._dl_btn.setVisible(not is_local_album)
+        QTimer.singleShot(0, self._update_album_actions_layout)
 
         self._album_name_label.setText(album_name)
 
@@ -2116,12 +2292,7 @@ class AlbumPage(QWidget):
             )
             self._cover_label.setToolTip("" if is_liked_album else "Открыть обложку")
 
-        count = len(tracks)
-        self._track_count_label.setText(
-            f"{count} трек" if count == 1 else
-            f"{count} трека" if 2 <= count <= 4 else
-            f"{count} треков"
-        )
+        self._update_track_count_meta()
 
         # Album cover
         cover_rel = album.get("cover", "")
@@ -2187,17 +2358,37 @@ class AlbumPage(QWidget):
         if urls_needing_duration:
             self._start_duration_loader([(i, u) for i, u in urls_needing_duration])
 
-        if playing_url or playing_track:
-            self.mark_playing_url(playing_url, playing_track)
+        if playing_url or playing_track or playing_track_idx is not None:
+            self.mark_playing_url(playing_url, playing_track, playing_track_idx)
         self.set_paused(is_paused)
 
     def mark_playing(self, track_idx: int):
         for i, row in enumerate(self._track_rows):
             row.set_playing(i == track_idx)
 
-    def mark_playing_url(self, url: str, track: dict | None = None):
-        """Highlight the row whose track matches url — or, for albums shared
-        across artists, the same album_id + normalized title; clear all others."""
+    def mark_playing_url(self, url: str, track: dict | None = None, track_idx: int | None = None):
+        """Highlight the concrete playing row.
+
+        Prefer the player's real track index when this page is the active
+        queue, then exact URL matching. Falling back to album_id+title keeps
+        legacy/shared-album behavior, but no longer makes duplicate titles in
+        one album light up together while the exact row is known.
+        """
+        if track_idx is not None:
+            for i, row in enumerate(self._track_rows):
+                row.set_playing(i == track_idx)
+            return
+
+        url_keys = _track_url_keys(track, url)
+        if url_keys:
+            matched = False
+            for row in self._track_rows:
+                is_match = bool(row.track_url_keys() & url_keys)
+                matched = matched or is_match
+                row.set_playing(is_match)
+            if matched:
+                return
+
         keys = _track_like_keys(track or {}, url)
         for row in self._track_rows:
             row.set_playing(bool(keys) and bool(row.track_identity_keys() & keys))
@@ -2299,6 +2490,7 @@ class AlbumPage(QWidget):
                     tracks = self._current_album.get("tracks", [])
                     if 0 <= idx < len(tracks) and not tracks[idx].get("duration"):
                         tracks[idx]["duration"] = ms
+                    self._update_track_count_meta()
             except Exception:
                 pass
 
@@ -2680,41 +2872,25 @@ class LyricsViewerOverlay(QWidget):
         transport_row.setSpacing(14)
         transport_row.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        transport_btn_style = (
-            "QPushButton { background: rgba(255,255,255,0.08); border: none; border-radius: 16px; "
-            "color: #FFFFFF; font: 600 12pt 'Segoe UI'; }"
-            "QPushButton:hover { background: rgba(255,255,255,0.18); }"
-        )
-        play_btn_style = (
-            "QPushButton { background: #FFFFFF; border: none; border-radius: 21px; "
-            "color: #000000; font: 700 13pt 'Segoe UI'; }"
-            "QPushButton:hover { background: rgba(255,255,255,0.86); }"
-        )
+        icon_font = QFont("Segoe UI", 13)
 
-        self._prev_btn = QPushButton("◀◀")
-        self._prev_btn.setFixedSize(34, 34)
-        self._prev_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._prev_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._prev_btn = _GlyphButton("◀◀")
+        self._prev_btn.setFont(icon_font)
+        self._prev_btn.setFixedSize(32, 32)
         self._prev_btn.setToolTip("Предыдущий трек")
-        self._prev_btn.setStyleSheet(transport_btn_style)
         self._prev_btn.clicked.connect(self.prev_clicked.emit)
         transport_row.addWidget(self._prev_btn)
 
-        self._play_btn = QPushButton("▶")
-        self._play_btn.setFixedSize(42, 42)
-        self._play_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._play_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._play_btn = _CircleButton()
+        self._play_btn.setFixedSize(40, 40)
         self._play_btn.setToolTip("Пауза / Воспроизведение")
-        self._play_btn.setStyleSheet(play_btn_style)
         self._play_btn.clicked.connect(self.play_clicked.emit)
         transport_row.addWidget(self._play_btn)
 
-        self._next_btn = QPushButton("▶▶")
-        self._next_btn.setFixedSize(34, 34)
-        self._next_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._next_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._next_btn = _GlyphButton("▶▶")
+        self._next_btn.setFont(icon_font)
+        self._next_btn.setFixedSize(32, 32)
         self._next_btn.setToolTip("Следующий трек")
-        self._next_btn.setStyleSheet(transport_btn_style)
         self._next_btn.clicked.connect(self.next_clicked.emit)
         transport_row.addWidget(self._next_btn)
 
@@ -2815,8 +2991,13 @@ class LyricsViewerOverlay(QWidget):
     def set_playing(self, is_playing: bool):
         self._is_playing = bool(is_playing)
         if hasattr(self, "_play_btn"):
-            self._play_btn.setText("Ⅱ" if self._is_playing else "▶")
+            self._play_btn.set_playing(self._is_playing)
             self._play_btn.setToolTip("Пауза" if self._is_playing else "Воспроизведение")
+
+    def apply_accent(self):
+        self._scroll.setStyleSheet(get_scrollbar_style() + "QScrollArea { background: transparent; }")
+        for btn in (self._prev_btn, self._play_btn, self._next_btn):
+            btn.update()
 
     def show_for(self, title: str, artist_name: str, cover_rel: str):
         already_visible = self.isVisible()
@@ -3659,12 +3840,14 @@ class SearchPage(QWidget):
             _insert(self._make_grid_section("Треки", [self._make_track_row(r) for r in tracks]))
 
         if youtube:
-            _insert(self._make_grid_section("YouTube", [self._make_youtube_row(r) for r in youtube]))
+            _insert(self._make_grid_section("YouTube", [self._make_youtube_row(r) for r in youtube], columns=1))
 
-    def _make_grid_section(self, title: str, row_widgets: list) -> QWidget:
-        """Section header + rows laid out two-per-row (row-major), so N
-        results end up as N/2 on the left column and N/2 on the right."""
+    def _make_grid_section(self, title: str, row_widgets: list, columns: int = 2) -> QWidget:
+        """Section header + row-major result grid."""
+        columns = max(1, int(columns or 1))
         container = QWidget()
+        container.setMinimumWidth(0)
+        container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         v = QVBoxLayout(container)
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(0)
@@ -3674,10 +3857,10 @@ class SearchPage(QWidget):
         grid.setContentsMargins(0, 0, 0, 0)
         grid.setHorizontalSpacing(8)
         grid.setVerticalSpacing(4)
-        grid.setColumnStretch(0, 1)
-        grid.setColumnStretch(1, 1)
+        for col in range(columns):
+            grid.setColumnStretch(col, 1)
         for i, w in enumerate(row_widgets):
-            grid.addWidget(w, i // 2, i % 2)
+            grid.addWidget(w, i // columns, i % columns)
         v.addLayout(grid)
         return container
 
@@ -3810,8 +3993,9 @@ class SearchPage(QWidget):
         txt.addWidget(sub_lbl)
         lay.addLayout(txt, 1)
 
+        row_url_keys = _track_url_keys(result.track_obj or {}, _track_identity_url(result.track_obj or {}))
         row_keys = _track_like_keys(result.track_obj or {})
-        self._track_title_labels.append((title_lbl, row_keys))
+        self._track_title_labels.append((title_lbl, row_keys, row_url_keys))
 
         def on_click(event, r=result):
             if event.button() == Qt.MouseButton.LeftButton:
@@ -3860,6 +4044,8 @@ class SearchPage(QWidget):
 
     def _make_youtube_row(self, result: SearchResult) -> QWidget:
         row = QWidget()
+        row.setMinimumWidth(0)
+        row.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         row.setCursor(Qt.CursorShape.PointingHandCursor)
         row.setObjectName("srRow")
         row.setStyleSheet(
@@ -3885,10 +4071,14 @@ class SearchPage(QWidget):
         title_lbl = QLabel(yt.get("title") or "")
         title_lbl.setStyleSheet(f"color: {COLORS['TEXT_PRIMARY']}; font: 10pt 'Segoe UI';")
         title_lbl.setWordWrap(False)
+        title_lbl.setMinimumWidth(0)
+        title_lbl.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         txt.addWidget(title_lbl)
         duration_txt = format_duration(int(yt.get("duration") or 0) * 1000)
         sub_lbl = QLabel(f"{yt.get('uploader') or 'YouTube'} • {duration_txt}")
         sub_lbl.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']}; font: 9pt 'Segoe UI';")
+        sub_lbl.setMinimumWidth(0)
+        sub_lbl.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         txt.addWidget(sub_lbl)
         lay.addLayout(txt, 1)
 
@@ -3911,11 +4101,15 @@ class SearchPage(QWidget):
 
     def refresh_playing(self, url: str, track: dict | None = None):
         """Highlight track rows that match the currently playing track (by URL,
-        or — for albums shared across artists — by album_id + normalized title)."""
+        or — when no exact URL is available — by album_id + normalized title)."""
         accent = COLORS["PRIMARY"]
+        url_keys = _track_url_keys(track or {}, url)
         keys = _track_like_keys(track or {}, url)
-        for title_lbl, row_keys in self._track_title_labels:
-            is_playing = bool(keys) and bool(row_keys & keys)
+        for title_lbl, row_keys, row_url_keys in self._track_title_labels:
+            is_playing = (
+                bool(row_url_keys & url_keys) if url_keys
+                else bool(keys) and bool(row_keys & keys)
+            )
             title_lbl.set_accent_active(is_playing)
             title_lbl.setStyleSheet(
                 f"color: {accent}; font: 10pt 'Segoe UI';" if is_playing
@@ -4659,12 +4853,24 @@ class _SidebarItemDelegate(QStyledItemDelegate):
     drag-and-drop receive the events it needs to actually work.
     """
 
-    ROW_HEIGHT = 54
+    ROW_HEIGHT = 52
     COVER_SIZE = 40
 
     def sizeHint(self, option, index):
         width = option.rect.width() if option.rect.width() > 0 else 240
         return QSize(width, self.ROW_HEIGHT)
+
+    @staticmethod
+    def _plate_colors(c: dict, active: bool) -> tuple[QColor, QColor]:
+        if get_theme() == "light":
+            return (
+                QColor("#F8F8F8" if not active else "#F0F0F0"),
+                QColor("#E6E6E6" if not active else "#D8D8D8"),
+            )
+        return (
+            QColor(c["SURFACE_LIGHT"] if not active else c["SURFACE_HOVER"]),
+            QColor(c["SURFACE_HOVER"] if not active else c["BORDER"]),
+        )
 
     def paint(self, painter, option, index):
         painter.save()
@@ -4673,16 +4879,19 @@ class _SidebarItemDelegate(QStyledItemDelegate):
         rect = option.rect
         hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        active = hovered or selected
 
-        if hovered or selected:
-            bg_path = QPainterPath()
-            bg_path.addRoundedRect(QRectF(rect.adjusted(4, 1, -4, -1)), 8, 8)
-            painter.fillPath(bg_path, QColor(c["SURFACE_LIGHT"]))
+        bg_path = QPainterPath()
+        bg_path.addRoundedRect(QRectF(rect.adjusted(3, 1, -3, -1)), 8, 8)
+        fill, border = self._plate_colors(c, active)
+        painter.fillPath(bg_path, fill)
+        painter.setPen(QPen(border, 1))
+        painter.drawPath(bg_path)
 
         radius = index.data(_SR_RADIUS) or 6
         cover_size = self.COVER_SIZE
         cover_rect = QRectF(
-            rect.x() + 10, rect.y() + (rect.height() - cover_size) / 2, cover_size, cover_size
+            rect.x() + 12, rect.y() + (rect.height() - cover_size) / 2, cover_size, cover_size
         )
         cover_path = QPainterPath()
         cover_path.addRoundedRect(cover_rect, radius, radius)
@@ -4701,13 +4910,13 @@ class _SidebarItemDelegate(QStyledItemDelegate):
                 painter.setFont(QFont("Segoe UI", 12))
                 painter.drawText(cover_rect, Qt.AlignmentFlag.AlignCenter, fallback)
 
-        text_x = cover_rect.right() + 10
-        text_w = max(10.0, rect.right() - text_x - 8)
+        text_x = cover_rect.right() + 12
+        text_w = max(10.0, rect.right() - text_x - 12)
         name = index.data(Qt.ItemDataRole.DisplayRole) or ""
         subtitle = index.data(_SR_SUBTITLE) or ""
 
         name_font = QFont("Segoe UI", 10)
-        painter.setPen(QColor(c["TEXT_PRIMARY"] if (hovered or selected) else c["TEXT_SECONDARY"]))
+        painter.setPen(QColor(c["TEXT_PRIMARY"] if active else c["TEXT_SECONDARY"]))
         painter.setFont(name_font)
         fm = QFontMetrics(name_font)
         elided_name = fm.elidedText(name, Qt.TextElideMode.ElideRight, int(text_w))
@@ -4882,33 +5091,57 @@ class _ChevronButton(QPushButton):
 
     def __init__(self, parent=None):
         super().__init__("", parent)
+        self._turn = 1.0  # 0.0 -> collapsed/right, 1.0 -> expanded/down
+        self._turn_anim = QPropertyAnimation(self, b"turn", self)
+        self._turn_anim.setDuration(170)
+        self._turn_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         self.setCheckable(True)
         self.setChecked(True)  # expanded by default
         self.setFixedSize(20, 20)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setStyleSheet("background: transparent; border: none;")
+        self.toggled.connect(lambda expanded: self._animate_turn(1.0 if expanded else 0.0))
 
-    def setExpanded(self, expanded: bool):
-        self.setChecked(bool(expanded))
+    def _get_turn(self):
+        return self._turn
+
+    def _set_turn(self, value):
+        self._turn = max(0.0, min(1.0, float(value)))
+        self.update()
+
+    turn = pyqtProperty(float, fget=_get_turn, fset=_set_turn)
+
+    def setExpanded(self, expanded: bool, animate: bool = True):
+        expanded = bool(expanded)
+        if not animate:
+            old = self.blockSignals(True)
+            self.setChecked(expanded)
+            self.blockSignals(old)
+            self._turn_anim.stop()
+            self._set_turn(1.0 if expanded else 0.0)
+            return
+        self.setChecked(expanded)
+
+    def _animate_turn(self, target: float):
+        self._turn_anim.stop()
+        self._turn_anim.setStartValue(self._turn)
+        self._turn_anim.setEndValue(float(target))
+        self._turn_anim.start()
 
     def paintEvent(self, _event):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         rf = QRectF(self.rect())
         cx, cy = rf.center().x(), rf.center().y()
+        p.translate(cx, cy)
+        p.rotate(-90.0 + 90.0 * self._turn)
+        p.translate(-cx, -cy)
         s = 4.5
         path = QPainterPath()
-        if self.isChecked():
-            # Expanded — pointing down.
-            path.moveTo(cx - s, cy - s * 0.55)
-            path.lineTo(cx + s, cy - s * 0.55)
-            path.lineTo(cx, cy + s * 0.65)
-        else:
-            # Collapsed — pointing right.
-            path.moveTo(cx - s * 0.55, cy - s)
-            path.lineTo(cx - s * 0.55, cy + s)
-            path.lineTo(cx + s * 0.65, cy)
+        path.moveTo(cx - s, cy - s * 0.55)
+        path.lineTo(cx + s, cy - s * 0.55)
+        path.lineTo(cx, cy + s * 0.65)
         path.closeSubpath()
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QColor(COLORS["TEXT_SECONDARY"]))
@@ -4974,11 +5207,14 @@ class Sidebar(QWidget):
         # "move" as far as the model is concerned), which would otherwise
         # be misread as a user drag and echo a bogus order_changed.
         self._rebuilding = False
+        self._section_bodies: dict[str, QWidget] = {}
+        self._section_opacity_effects: dict[str, QGraphicsOpacityEffect] = {}
+        self._section_anims: dict[str, QParallelAnimationGroup] = {}
         self._build_ui()
 
     def _build_section(self, title: str, section: str):
         """Builds one collapsible section (header + chevron + list) and
-        returns (container_widget, list_widget, chevron_button)."""
+        returns (container_widget, body_widget, list_widget, chevron_button)."""
         container = QWidget()
         section_layout = QVBoxLayout(container)
         section_layout.setContentsMargins(0, 0, 0, 0)
@@ -4995,6 +5231,17 @@ class Sidebar(QWidget):
         header_row.addWidget(chevron)
         section_layout.addLayout(header_row)
 
+        body = QWidget()
+        body.setMinimumHeight(0)
+        body.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(0, 0, 0, 0)
+        body_layout.setSpacing(6)
+        opacity = QGraphicsOpacityEffect(body)
+        opacity.setOpacity(1.0)
+        body.setGraphicsEffect(opacity)
+        self._section_bodies[section] = body
+        self._section_opacity_effects[section] = opacity
 
         # Reorderable artist/album list. Rows are owner-drawn (see
         # _SidebarItemDelegate) rather than embedded widgets — a widget set
@@ -5022,21 +5269,22 @@ class Sidebar(QWidget):
         list_widget.setDragEnabled(True)
         list_widget.setAcceptDrops(True)
         list_widget.setDropIndicatorShown(True)
-        list_widget.setSpacing(2)
+        list_widget.setSpacing(1)
         list_widget.setStyleSheet(
             get_scrollbar_style() +
             "QListWidget#sidebarList { background: transparent; border: none; }"
         )
         list_widget.itemClicked.connect(self._on_item_clicked)
-        section_layout.addWidget(list_widget)
+        body_layout.addWidget(list_widget)
+        section_layout.addWidget(body)
 
-        def _on_chevron_toggled(expanded, lw=list_widget):
-            lw.setVisible(expanded)
+        def _on_chevron_toggled(expanded):
+            self._set_section_expanded(section, expanded, animate=not self._applying_saved_collapse)
             if not self._applying_saved_collapse:
                 self.section_collapsed_changed.emit(section, not expanded)
         chevron.toggled.connect(_on_chevron_toggled)
 
-        return container, list_widget, chevron
+        return container, body, list_widget, chevron
 
     def _build_ui(self):
         root = QVBoxLayout(self)
@@ -5072,13 +5320,13 @@ class Sidebar(QWidget):
         self._user_row.addStretch(1)
         layout.addLayout(self._user_row)
 
-        self._server_container, self._list_server, self._chevron_server = self._build_section(
+        self._server_container, self._server_body, self._list_server, self._chevron_server = self._build_section(
             "Библиотека", "server"
         )
         layout.addWidget(self._server_container)
         self._list_server.model().rowsMoved.connect(lambda *_: self._on_rows_moved("server"))
 
-        self._local_container, self._list_local, self._chevron_local = self._build_section(
+        self._local_container, self._local_body, self._list_local, self._chevron_local = self._build_section(
             "Локальная библиотека", "local"
         )
         layout.addWidget(self._local_container)
@@ -5129,10 +5377,91 @@ class Sidebar(QWidget):
         hint_open_btn.clicked.connect(self.open_local_folder_requested.emit)
         hint_layout.addWidget(hint_open_btn, 0, Qt.AlignmentFlag.AlignLeft)
 
-        self._local_container.layout().addWidget(self._local_hint)
+        self._local_body.layout().addWidget(self._local_hint)
         self._local_hint.setVisible(False)  # toggled in load_local_content()
 
         layout.addStretch(1)
+
+    def _section_body_height(self, section: str) -> int:
+        body = self._section_bodies.get(section)
+        if not body:
+            return 0
+        return max(0, int(body.sizeHint().height()))
+
+    def _set_section_expanded(self, section: str, expanded: bool, animate: bool = True):
+        body = self._section_bodies.get(section)
+        effect = self._section_opacity_effects.get(section)
+        if not body or not effect:
+            return
+
+        old_anim = self._section_anims.pop(section, None)
+        if old_anim is not None:
+            old_anim.stop()
+            old_anim.deleteLater()
+
+        target_h = self._section_body_height(section) if expanded else 0
+        if not animate:
+            body.setVisible(True)
+            body.setMaximumHeight(target_h)
+            effect.setOpacity(1.0 if expanded else 0.0)
+            return
+
+        if expanded:
+            start_h = body.height()
+            if body.maximumHeight() == 0:
+                start_h = 0
+            body.setVisible(True)
+            body.setMaximumHeight(max(0, min(start_h, target_h)))
+            effect.setOpacity(max(0.0, min(1.0, effect.opacity())))
+        else:
+            start_h = max(body.height(), self._section_body_height(section))
+            body.setVisible(True)
+            body.setMaximumHeight(start_h)
+
+        group = QParallelAnimationGroup(self)
+        height_anim = QPropertyAnimation(body, b"maximumHeight", group)
+        height_anim.setDuration(230)
+        height_anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        height_anim.setStartValue(max(0, int(body.maximumHeight())))
+        height_anim.setEndValue(target_h)
+        group.addAnimation(height_anim)
+
+        opacity_anim = QPropertyAnimation(effect, b"opacity", group)
+        opacity_anim.setDuration(170)
+        opacity_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        opacity_anim.setStartValue(effect.opacity())
+        opacity_anim.setEndValue(1.0 if expanded else 0.0)
+        group.addAnimation(opacity_anim)
+
+        def _finish(section=section, body=body, effect=effect, expanded=expanded, group=group):
+            if self._section_anims.get(section) is group:
+                self._section_anims.pop(section, None)
+            if expanded:
+                body.setVisible(True)
+                body.setMaximumHeight(self._section_body_height(section))
+                effect.setOpacity(1.0)
+            else:
+                body.setMaximumHeight(0)
+                body.setVisible(True)
+                effect.setOpacity(0.0)
+            group.deleteLater()
+
+        group.finished.connect(_finish)
+        self._section_anims[section] = group
+        group.start()
+
+    def _sync_section_body_height(self, section: str):
+        if section in self._section_anims:
+            return
+        body = self._section_bodies.get(section)
+        effect = self._section_opacity_effects.get(section)
+        chevron = self._chevron_server if section == "server" else self._chevron_local
+        if not body or not effect:
+            return
+        expanded = chevron.isChecked()
+        body.setVisible(True)
+        body.setMaximumHeight(self._section_body_height(section) if expanded else 0)
+        effect.setOpacity(1.0 if expanded else 0.0)
 
     def set_username(self, login: str):
         self._user_label.setText(login or "")
@@ -5157,14 +5486,18 @@ class Sidebar(QWidget):
         # value, and schedule a pointless settings sync, on every launch).
         self._applying_saved_collapse = True
         try:
-            self._chevron_server.setExpanded(not collapsed)
+            expanded = not collapsed
+            self._chevron_server.setExpanded(expanded, animate=False)
+            self._set_section_expanded("server", expanded, animate=False)
         finally:
             self._applying_saved_collapse = False
 
     def set_local_collapsed(self, collapsed: bool):
         self._applying_saved_collapse = True
         try:
-            self._chevron_local.setExpanded(not collapsed)
+            expanded = not collapsed
+            self._chevron_local.setExpanded(expanded, animate=False)
+            self._set_section_expanded("local", expanded, animate=False)
         finally:
             self._applying_saved_collapse = False
 
@@ -5205,12 +5538,14 @@ class Sidebar(QWidget):
         finally:
             self._rebuilding = False
         self._resize_list_to_content(self._list_server)
+        self._sync_section_body_height("server")
 
     def load_local_content(self, entries: list | None = None):
         """Same shape as load_account_content's entries, for the local
         library section — no "liked"/playlists concept there."""
         self._fill_list(self._list_local, entries)
         self._local_hint.setVisible(not entries)
+        self._sync_section_body_height("local")
 
     def _fill_list(self, list_widget: QListWidget, entries: list | None):
         self._rebuilding = True
@@ -6367,8 +6702,8 @@ class _YoutubeSearchSignal(QObject):
     finished = pyqtSignal(int, list, str)  # (generation, results, error message — "" on success)
 
 
-class _YoutubeStreamSignal(QObject):
-    finished = pyqtSignal(str, str, str)  # (webpage_url, resolved_stream_url, error message)
+class _YoutubeChannelAvatarSignal(QObject):
+    finished = pyqtSignal(int, str, str)  # (request_id, channel_url, avatar_url)
 
 
 class _UserProfileSignal(QObject):
@@ -7475,12 +7810,19 @@ class _AnimatedStackedWidget(QStackedWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         # id(widget) -> QPropertyAnimation. PyQt drops an animation as soon
         # as nothing in Python still references it, even mid-flight — this
         # keeps it alive for its whole duration, one slot per widget so
         # switching to two different pages in quick succession doesn't have
         # one's cleanup drop the other's still-running animation.
         self._anims: dict[int, QPropertyAnimation] = {}
+
+    def minimumSizeHint(self):
+        hint = super().minimumSizeHint()
+        hint.setWidth(0)
+        return hint
 
     def setCurrentWidget(self, widget):
         self._switch(widget)
@@ -7583,6 +7925,8 @@ class MusicApp(QWidget):
         self._lyrics_viewer_key: tuple[str, str] | None = None   # (artist, title) LyricsViewerOverlay is showing
         self._now_playing_bio_runners: list = []   # [thread, worker] entries from _start_artist_bio_worker
         self._now_playing_bio_request_id = 0   # staleness guard — see _refresh_now_playing_bio
+        self._now_playing_avatar_request_id = 0   # staleness guard for artist/channel avatar loads
+        self._youtube_channel_avatar_cache: dict[str, str] = {}
         self._prev_page_before_search: QWidget | None = None
         self._loading = False
         self._closing = False  # set once closeEvent starts, so scheduled/async
@@ -7620,13 +7964,7 @@ class MusicApp(QWidget):
         self._user_search_signals: list = []
         self._user_profile_signals: list = []
         self._youtube_search_signals: list = []
-        self._youtube_stream_signals: list = []
-        # id(track) -> [continue_playback, ...] queued while a resolve for
-        # that exact track is already in flight — de-dupes the network call
-        # when play_track lands on the same still-unresolved YouTube track
-        # twice in quick succession (e.g. a manual click racing an
-        # auto-advance onto it), see _resolve_track_url_for_player.
-        self._youtube_resolve_pending: dict = {}
+        self._youtube_channel_avatar_signals: list = []
         # Player-data *saves* (likes, playlists, follow_order, settings...)
         # all funnel through one queue processed by a single worker thread —
         # serialized, so two saves fired close together can never complete
@@ -7876,6 +8214,7 @@ class MusicApp(QWidget):
 
         # Playback controls
         self._controls = PlaybackControls(self)
+        self._controls.track_clicked.connect(self._on_controls_track_clicked)
         self._controls.artist_clicked.connect(self._on_controls_artist_clicked)
         self._controls.album_clicked.connect(self._on_controls_album_clicked)
         self._controls.cover_clicked.connect(self._open_now_playing_disc)
@@ -8547,7 +8886,12 @@ class MusicApp(QWidget):
         if last_played.get("_is_youtube"):
             track["_is_youtube"] = True
             track["_youtube_channel_url"] = last_played.get("_youtube_channel_url", "")
+            track["_youtube_channel_avatar"] = last_played.get("_youtube_channel_avatar", "")
         artist = {"artist": last_played.get("artist_name", "")}
+        if last_played.get("_is_youtube"):
+            artist["_is_youtube"] = True
+            artist["_youtube_channel_url"] = last_played.get("_youtube_channel_url", "")
+            artist["_youtube_channel_avatar"] = last_played.get("_youtube_channel_avatar", "")
         album = {
             "title": last_played.get("album_title", ""),
             "cover": last_played.get("album_cover", ""),
@@ -8579,6 +8923,7 @@ class MusicApp(QWidget):
         page = self._settings.get("last_view_page", "")
         artist_name = self._settings.get("last_view_artist", "")
         album_title = self._settings.get("last_view_album", "")
+        album_id = self._settings.get("last_view_album_id", "")
 
         if page == "liked":
             self._on_liked_tracks_selected()
@@ -8596,11 +8941,8 @@ class MusicApp(QWidget):
 
         self._navigate_to_artist(artist)
 
-        if page == "album" and album_title:
-            for al in artist.get("albums", []):
-                if clean_title(al.get("title", "")) == clean_title(album_title):
-                    self._navigate_to_album(al, artist)
-                    break
+        if page == "album":
+            self._restore_album_view(artist, album_title, album_id)
         self._nav_restored = True
 
     def _prime_player_for_resume(self, last_played: dict):
@@ -8628,7 +8970,10 @@ class MusicApp(QWidget):
                 login = (self._account_manager.active_login if self._account_manager else "") or ""
                 creator_name = self._display_name or login
                 virtual_album = self._build_playlist_virtual_album(pl, creator_name, True, login)
-                if self._prime_from_virtual_album(virtual_album, {"artist": ""}, track_title):
+                if self._prime_from_virtual_album(
+                    virtual_album, {"artist": ""}, track_title,
+                    last_played.get("track_index"), last_played.get("track_url", ""),
+                ):
                     return
             # Playlist deleted/renamed since, or the track's gone from it —
             # fall through to the real-album resume below instead of
@@ -8636,7 +8981,10 @@ class MusicApp(QWidget):
 
         if last_played.get("_is_liked_album"):
             virtual_album, virtual_artist = self._build_liked_virtual_album()
-            if self._prime_from_virtual_album(virtual_album, virtual_artist, track_title):
+            if self._prime_from_virtual_album(
+                virtual_album, virtual_artist, track_title,
+                last_played.get("track_index"), last_played.get("track_url", ""),
+            ):
                 return
 
         artist_name = last_played.get("artist_name", "")
@@ -8649,21 +8997,56 @@ class MusicApp(QWidget):
             return
 
         album = None
-        for al in artist.get("albums", []):
-            if clean_title(al.get("title", "")) == clean_title(album_title):
-                album = al
-                break
+        album_id = str(last_played.get("album_id") or "").strip()
+        albums = artist.get("albums", [])
+        if album_id:
+            for al in albums:
+                if str(al.get("album_id") or "").strip() == album_id:
+                    album = al
+                    break
+        if not album:
+            for al in albums:
+                if (al.get("title") or "").strip() == (album_title or "").strip():
+                    album = al
+                    break
+        if not album:
+            for al in albums:
+                if clean_title(al.get("title", "")) == clean_title(album_title):
+                    album = al
+                    break
         if not album:
             return
 
-        self._prime_from_virtual_album(album, artist, track_title)
+        self._prime_from_virtual_album(
+            album, artist, track_title, last_played.get("track_index"), last_played.get("track_url", "")
+        )
 
-    def _prime_from_virtual_album(self, album: dict, artist: dict, track_title: str) -> bool:
+    def _prime_from_virtual_album(
+        self, album: dict, artist: dict, track_title: str,
+        track_index: int | str | None = None, track_url: str = "",
+    ) -> bool:
+        tracks = album.get("tracks", [])
         idx = None
-        for i, t in enumerate(album.get("tracks", [])):
-            if clean_title(t.get("title", "")) == clean_title(track_title):
-                idx = i
-                break
+        url_keys = _track_url_keys({}, track_url)
+        if url_keys:
+            for i, t in enumerate(tracks):
+                if _track_url_keys(t, _track_identity_url(t)) & url_keys:
+                    idx = i
+                    break
+        if idx is None and track_index is not None:
+            try:
+                saved_idx = int(track_index)
+            except (TypeError, ValueError):
+                saved_idx = -1
+            if 0 <= saved_idx < len(tracks):
+                candidate = tracks[saved_idx]
+                if clean_title(candidate.get("title", "")) == clean_title(track_title):
+                    idx = saved_idx
+        if idx is None:
+            for i, t in enumerate(tracks):
+                if clean_title(t.get("title", "")) == clean_title(track_title):
+                    idx = i
+                    break
         if idx is None:
             return False
 
@@ -8689,12 +9072,17 @@ class MusicApp(QWidget):
             return
         artist_name = last_played.get("artist_name", "") or "YouTube"
         channel_url = last_played.get("_youtube_channel_url", "")
+        channel_avatar = last_played.get("_youtube_channel_avatar", "")
         track = {
             "title": track_title, "url": webpage_url, "artist_name": artist_name,
             "_is_youtube": True, "_youtube_channel_url": channel_url,
+            "_youtube_channel_avatar": channel_avatar,
             "_youtube_thumbnail": last_played.get("album_cover", ""),
         }
-        artist = {"artist": artist_name, "_is_youtube": True, "_youtube_channel_url": channel_url}
+        artist = {
+            "artist": artist_name, "_is_youtube": True,
+            "_youtube_channel_url": channel_url, "_youtube_channel_avatar": channel_avatar,
+        }
         album = {
             "title": last_played.get("album_title", "") or track_title,
             "cover": last_played.get("album_cover", ""),
@@ -8719,6 +9107,7 @@ class MusicApp(QWidget):
         page = self._settings.get("last_view_page", "")
         artist_name = self._settings.get("last_view_artist", "")
         album_title = self._settings.get("last_view_album", "")
+        album_id = self._settings.get("last_view_album_id", "")
 
         if page == "liked":
             self._on_liked_tracks_selected()
@@ -8734,12 +9123,43 @@ class MusicApp(QWidget):
             return
 
         self._navigate_to_artist(artist)
-        if page == "album" and album_title:
-            for al in artist.get("albums", []):
-                if clean_title(al.get("title", "")) == clean_title(album_title):
-                    self._navigate_to_album(al, artist)
-                    break
+        if page == "album":
+            self._restore_album_view(artist, album_title, album_id)
         self._nav_restored = True
+
+    def _restore_album_view(self, artist: dict, album_title: str, album_id: str) -> bool:
+        albums = artist.get("albums", []) if isinstance(artist, dict) else []
+        saved_album_id = str(album_id or "").strip()
+        if not saved_album_id:
+            last_played = self._settings.get("last_played_track")
+            if isinstance(last_played, dict):
+                played_artist = clean_artist_name(last_played.get("artist_name", ""))
+                played_album_title = (last_played.get("album_title") or "").strip()
+                if (
+                    played_artist == clean_artist_name(artist.get("artist", ""))
+                    and played_album_title == (album_title or "").strip()
+                ):
+                    saved_album_id = str(last_played.get("album_id") or "").strip()
+        if saved_album_id:
+            for al in albums:
+                if str(al.get("album_id") or "").strip() == saved_album_id:
+                    self._navigate_to_album(al, artist)
+                    return True
+
+        raw_title = (album_title or "").strip()
+        if raw_title:
+            for al in albums:
+                if (al.get("title") or "").strip() == raw_title:
+                    self._navigate_to_album(al, artist)
+                    return True
+
+        saved_title = clean_title(album_title or "")
+        if saved_title:
+            for al in albums:
+                if clean_title(al.get("title", "")) == saved_title:
+                    self._navigate_to_album(al, artist)
+                    return True
+        return False
 
     def _update_sidebar_from_account(self):
         library = self.library_manager.get_library()
@@ -9211,10 +9631,12 @@ class MusicApp(QWidget):
         saved (see _build_track_ref); _play_track below is what actually
         resolves a fresh stream right before playback."""
         channel_url = yt.get("channel_url", "")
+        channel_avatar = yt.get("channel_avatar", "")
         track = {
             "title": yt.get("title", ""), "url": yt.get("webpage_url", ""),
             "artist_name": yt.get("uploader", ""), "_is_youtube": True,
             "_youtube_thumbnail": yt.get("thumbnail", ""), "_youtube_channel_url": channel_url,
+            "_youtube_channel_avatar": channel_avatar,
             # yt-dlp already gave us this at search time — TrackRow shows it
             # straight away and, just as importantly, skips queuing an async
             # probe for it (see AlbumPage.load_album's "if not
@@ -9223,7 +9645,12 @@ class MusicApp(QWidget):
             # so that probe could only ever silently fail.
             "duration": int(yt.get("duration") or 0) * 1000,
         }
-        artist = {"artist": yt.get("uploader", "") or "YouTube", "_is_youtube": True, "_youtube_channel_url": channel_url}
+        artist = {
+            "artist": yt.get("uploader", "") or "YouTube",
+            "_is_youtube": True,
+            "_youtube_channel_url": channel_url,
+            "_youtube_channel_avatar": channel_avatar,
+        }
         album = {
             "title": yt.get("title", ""), "cover": yt.get("thumbnail", ""),
             "tracks": [track], "_is_youtube": True,
@@ -9238,72 +9665,26 @@ class MusicApp(QWidget):
         makes a YouTube track mixed in with regular ones "just work" instead
         of only working when clicked directly.
 
-        Non-YouTube tracks (the overwhelming majority of calls) and already-
-        resolved YouTube tracks continue synchronously with no extra delay.
-        A YouTube track still holding its permanent watch link gets resolved
-        to a stream URL in the background and mutated in place (url,
-        _permanent_url, _resolved_stream) — same dict instance the player's
-        album/tracks list already holds, so no album/track-list rebuilding
-        is needed and sibling tracks are untouched."""
-        if not track.get("_is_youtube") or track.get("_resolved_stream"):
+        Non-YouTube tracks (the overwhelming majority of calls) continue
+        synchronously with no extra delay. YouTube playback goes through the
+        server's /youtube/stream endpoint instead of handing libVLC a direct
+        googlevideo.com URL; the server resolves the fresh upstream stream
+        and forwards Range requests with consistent headers."""
+        if not track.get("_is_youtube"):
             continue_playback(track.get("url", ""))
             return
-        webpage_url = track.get("url", "")
-        if not webpage_url or not _resolve_youtube_stream:
+
+        webpage_url = _track_identity_url(track)
+        if not webpage_url:
             continue_playback("")
             return
 
-        # De-dupe: play_track can land on this exact still-unresolved track
-        # twice before the first resolve finishes (a manual click racing an
-        # auto-advance, or rapid skip-skip-back) — queue onto the resolve
-        # already in flight instead of firing a second redundant one.
-        key = id(track)
-        pending = self._youtube_resolve_pending.get(key)
-        if pending is not None:
-            pending.append(continue_playback)
-            return
-        self._youtube_resolve_pending[key] = [continue_playback]
-
-        self.setCursor(Qt.CursorShape.BusyCursor)
-
-        signal = _YoutubeStreamSignal(self)
-        self._youtube_stream_signals.append(signal)
-
-        def _cleanup(s=signal):
-            try:
-                self._youtube_stream_signals.remove(s)
-            except ValueError:
-                pass
-
-        def _on_resolved(_url, stream_url, error):
-            self.unsetCursor()
-            callbacks = self._youtube_resolve_pending.pop(key, [continue_playback])
-            if not stream_url:
-                detail = f"\n\n{error}" if error else ""
-                QMessageBox.warning(self, "YouTube", f"Не удалось получить поток для этого видео.{detail}")
-                for cb in callbacks:
-                    cb("")
-                return
-            track["url"] = stream_url
-            track["_permanent_url"] = webpage_url
-            track["_resolved_stream"] = True
-            for cb in callbacks:
-                cb(stream_url)
-
-        signal.finished.connect(_on_resolved)
-        signal.finished.connect(_cleanup)
-
-        def _worker():
-            stream_url = ""
-            error = ""
-            try:
-                stream_url = _resolve_youtube_stream(webpage_url) or ""
-            except Exception as ex:
-                error = str(ex) or ex.__class__.__name__
-                print(f"YouTube stream resolve failed: {ex}")
-            signal.finished.emit(webpage_url, stream_url, error)
-
-        threading.Thread(target=_worker, daemon=True).start()
+        stream_url = _youtube_stream_proxy_url(webpage_url)
+        track["_permanent_url"] = webpage_url
+        track["_last_resolved_stream"] = stream_url
+        track["_last_resolved_at"] = int(time.time())
+        track.pop("_resolved_stream", None)
+        continue_playback(stream_url)
 
     # ── Navigation ────────────────────────────────────────────────────────────
 
@@ -9365,6 +9746,7 @@ class MusicApp(QWidget):
             last_view_page="artist",
             last_view_artist=artist_name,
             last_view_album="",
+            last_view_album_id="",
         )
 
     def _show_all_albums_for_artist(self, artist: dict):
@@ -9377,9 +9759,11 @@ class MusicApp(QWidget):
         self._current_album = album
         self._current_artist = artist
         display_artist_names = self._display_artist_names(album.get("album_id"), artist.get("artist", ""))
+        playing_track_idx = self.player.current_track_idx if self._is_same_playing_target(album, artist) else None
         self._album_page.load_album(
             album, artist, playing_url=self._playing_url, display_artist_names=display_artist_names,
-            playing_track=self._playing_track, is_paused=not self.player.is_playing(),
+            playing_track=self._playing_track, playing_track_idx=playing_track_idx,
+            is_paused=not self.player.is_playing(),
         )
         is_local_album = _is_local_collection_item(album=album, artist=artist)
         self._album_page._album_like_btn.setVisible(not is_local_album)
@@ -9392,6 +9776,7 @@ class MusicApp(QWidget):
             last_view_page="album",
             last_view_artist=(artist.get("artist") or "").strip(),
             last_view_album=(album.get("title") or "").strip(),
+            last_view_album_id=str(album.get("album_id") or "").strip(),
         )
 
     def _on_artist_selected(self, artist: dict):
@@ -9500,6 +9885,7 @@ class MusicApp(QWidget):
                 "_is_youtube": True,
                 "_youtube_thumbnail": lt.get("_youtube_thumbnail", ""),
                 "_youtube_channel_url": lt.get("_youtube_channel_url", ""),
+                "_youtube_channel_avatar": lt.get("_youtube_channel_avatar", ""),
                 "_real_album_title": album_title,
                 "_real_album_cover": lt.get("_youtube_thumbnail") or lt.get("album_cover", ""),
                 "duration": lt.get("duration") or 0,
@@ -9517,6 +9903,15 @@ class MusicApp(QWidget):
                     continue
                 if not album_id and album_title and clean_title(album.get("title", "")) != clean_title(album_title):
                     continue
+                url_keys = _track_url_keys({}, url)
+                if url_keys:
+                    for track in album.get("tracks", []):
+                        if _track_url_keys(track, track.get("url", "")) & url_keys:
+                            result = dict(track)
+                            result.setdefault("artist_name", artist.get("artist", ""))
+                            result["_real_album_title"] = album.get("title", "")
+                            result["_real_album_cover"] = album.get("cover", "")
+                            return result
                 for track in album.get("tracks", []):
                     if album_id and track_title and clean_title(track.get("title", "")) != clean_title(track_title):
                         continue
@@ -9564,15 +9959,24 @@ class MusicApp(QWidget):
         virtual_album, virtual_artist = self._build_liked_virtual_album()
         self._current_album = virtual_album
         self._current_artist = virtual_artist
+        playing_track_idx = (
+            self.player.current_track_idx if self._is_same_playing_target(virtual_album, virtual_artist) else None
+        )
         self._album_page.load_album(
             virtual_album, virtual_artist, playing_url=self._playing_url, playing_track=self._playing_track,
+            playing_track_idx=playing_track_idx,
             is_paused=not self.player.is_playing(),
         )
         self._album_page._album_like_btn.setVisible(False)
         self._album_page.refresh_track_likes(self._all_collection_keys())
         self._sync_play_all_button()
         self._page_stack.setCurrentWidget(self._album_page)
-        self._save_ui_state(last_view_page="liked", last_view_artist="", last_view_album="")
+        self._save_ui_state(
+            last_view_page="liked",
+            last_view_artist="",
+            last_view_album="",
+            last_view_album_id="",
+        )
 
     def _on_logout(self):
         if self._account_manager:
@@ -9580,7 +9984,7 @@ class MusicApp(QWidget):
         self.player.stop()
         # Clear saved navigation so fresh login starts at welcome page
         self._save_ui_state(
-            last_view_page="", last_view_artist="", last_view_album="",
+            last_view_page="", last_view_artist="", last_view_album="", last_view_album_id="",
             last_played_track={},
         )
         self.logout_requested.emit()
@@ -9639,6 +10043,14 @@ class MusicApp(QWidget):
         if artist:
             self._navigate_to_artist(artist)
 
+    def _on_controls_track_clicked(self):
+        playing_album = self.player.current_playing_album
+        playing_artist = self.player.current_playing_artist or {"artist": ""}
+        if playing_album and playing_album.get("_is_playlist"):
+            self._display_playlist_virtual_album(playing_album, playing_artist)
+            return
+        self._on_controls_album_clicked(self._controls.current_album_title, self._controls.current_artist_name)
+
     def _on_controls_album_clicked(self, album_title: str, artist_name: str):
         # Prefer the exact album object that's actually loaded in the player —
         # matching by title text alone can land on the wrong album when two
@@ -9646,10 +10058,8 @@ class MusicApp(QWidget):
         playing_album = self.player.current_playing_album
         playing_artist = self.player.current_playing_artist
 
-        # Track title and album label both land here (see PlaybackControls)
-        # — a YouTube track has no real album to navigate to, just the
-        # single-track virtual one it was wrapped in to play; open the
-        # actual video instead of that fake album page.
+        # YouTube tracks have no real album to navigate to; open the actual
+        # video instead of the fake single-track album page.
         if playing_album and self.player.current_track_idx is not None:
             try:
                 current_track = playing_album["tracks"][self.player.current_track_idx]
@@ -9661,20 +10071,16 @@ class MusicApp(QWidget):
                     QDesktopServices.openUrl(QUrl(video_url))
                 return
 
-        if playing_album and playing_artist and not playing_album.get("_is_liked_album"):
-            if playing_album.get("_is_playlist"):
-                # Same virtual-album object built by _show_playlist_album/
-                # _build_playlist_virtual_album when the playlist started
-                # playing — reuse it as-is instead of routing through
-                # _navigate_to_album, which has no concept of playlists and
-                # would show the "+"/subscribe button even for your own.
-                self._display_playlist_virtual_album(playing_album, playing_artist)
-                return
+        if (
+            playing_album and playing_artist
+            and not playing_album.get("_is_liked_album")
+            and not playing_album.get("_is_playlist")
+        ):
             self._navigate_to_album(playing_album, playing_artist)
             return
 
-        # Playing from a virtual album (e.g. liked tracks) — resolve the real
-        # album via its album_id when possible (exact), falling back to title text.
+        # Playing from a virtual album (liked tracks or a playlist) — resolve
+        # the real album via album_id when possible, falling back to title.
         album_id = ""
         if playing_album and self.player.current_track_idx is not None:
             try:
@@ -9705,12 +10111,10 @@ class MusicApp(QWidget):
         return None
 
     def _on_now_playing_album_clicked(self):
-        # Same title/artist text PlaybackControls already tracks for its
-        # own cover/title clicks (see PlaybackControls.update_track_info)
-        # — reused so cover/title in the side panel land on exactly the
-        # same album (or open the same YouTube video) as clicking the
-        # bottom bar would.
-        self._on_controls_album_clicked(self._controls.current_album_title, self._controls.current_artist_name)
+        # The side panel label is the track title, so it follows the bottom
+        # bar's track-title route: playlist context first, real album/video
+        # fallback otherwise.
+        self._on_controls_track_clicked()
 
     def _on_now_playing_artist_clicked(self):
         self._on_controls_artist_clicked(self._controls.current_artist_name)
@@ -9927,10 +10331,8 @@ class MusicApp(QWidget):
         against the real library later (see _resolve_liked_track).
 
         For a YouTube track, "url" here is the *permanent* watch link
-        (_track_identity_url), never track["url"] as-is — once playing, that
-        field holds a resolved googlevideo.com stream that expires in a few
-        hours (see _resolve_track_url_for_player), which would leave a liked track or
-        playlist entry silently dead after that."""
+        (_track_identity_url), never a resolved googlevideo.com stream from
+        one playback attempt, because those stream links expire quickly."""
         album = album or {}
         is_youtube = bool(track.get("_is_youtube"))
         rel_url = _track_identity_url(track) if is_youtube else track.get("url", "")
@@ -9954,6 +10356,9 @@ class MusicApp(QWidget):
             channel_url = track.get("_youtube_channel_url", "")
             if channel_url:
                 ref["_youtube_channel_url"] = channel_url
+            channel_avatar = track.get("_youtube_channel_avatar") or (artist or {}).get("_youtube_channel_avatar", "")
+            if channel_avatar:
+                ref["_youtube_channel_avatar"] = channel_avatar
             duration = track.get("duration") or 0
             if duration:
                 ref["duration"] = duration
@@ -10105,7 +10510,7 @@ class MusicApp(QWidget):
 
     def _display_playlist_virtual_album(self, virtual_album: dict, virtual_artist: dict):
         """Shared tail of _show_playlist_album — also used by
-        _on_controls_album_clicked when the bottom bar's track title is
+        _on_controls_track_clicked when the bottom bar's track title is
         clicked while a playlist is playing, so it re-shows that same
         playlist (own or subscribed) instead of falling through to
         _navigate_to_album's generic artist/album logic, which doesn't know
@@ -10115,8 +10520,12 @@ class MusicApp(QWidget):
         owner_login = virtual_album.get("_playlist_owner_login", "")
         self._current_album = virtual_album
         self._current_artist = virtual_artist
+        playing_track_idx = (
+            self.player.current_track_idx if self._is_same_playing_target(virtual_album, virtual_artist) else None
+        )
         self._album_page.load_album(
             virtual_album, virtual_artist, playing_url=self._playing_url, playing_track=self._playing_track,
+            playing_track_idx=playing_track_idx,
             is_paused=not self.player.is_playing(),
         )
         if editable:
@@ -10497,6 +10906,7 @@ class MusicApp(QWidget):
         self._avatar_btn.apply_accent()
         self._profile_page.apply_accent()
         self._now_playing_panel.apply_accent()
+        self._lyrics_viewer.apply_accent()
         c = COLORS
         # The search field's pill border lives on _search_wrapper, not on the
         # QLineEdit itself (which stays borderless) — just refresh it for the
@@ -10801,17 +11211,16 @@ class MusicApp(QWidget):
         self._schedule_discord_presence_refresh(90)
         self._schedule_discord_presence_refresh(650)
         # Highlight playing track everywhere. For a YouTube track this must
-        # be the permanent link (_track_identity_url), not track["url"] —
-        # AlbumPage.load_album takes a *copy* of each track for the liked-
-        # tracks virtual album specifically (to strip artist_name), so the
-        # in-place url/_permanent_url/_resolved_stream mutation this track
-        # dict just got (see _resolve_track_url_for_player) never reaches
-        # that row's copy; matching on the permanent link instead works
-        # regardless, since _resolve_liked_track never had anything but the
-        # permanent link to give that copy in the first place.
+        # be the permanent link (_track_identity_url), not the one-shot
+        # stream URL just returned for playback.
         self._playing_url = _track_identity_url(track) or ""
         self._playing_track = track
-        self._album_page.mark_playing_url(self._playing_url, track)
+        album_page_track_idx = (
+            self.player.current_track_idx
+            if self._is_same_playing_target(self._album_page._current_album, self._album_page._current_artist)
+            else None
+        )
+        self._album_page.mark_playing_url(self._playing_url, track, album_page_track_idx)
         self._album_page.set_paused(False)  # a freshly-started track is always playing, never paused
         self._artist_page.mark_random_tracks_playing(self._playing_url, track)
         self._artist_page.set_random_tracks_paused(False)
@@ -10837,6 +11246,8 @@ class MusicApp(QWidget):
             "album_title": album_title,
             "album_cover": cover,
             "album_id": album_id,
+            "track_url": self._playing_url,
+            "track_index": self.player.current_track_idx,
         }
         is_youtube = bool(track.get("_is_youtube"))
         if is_youtube:
@@ -10848,6 +11259,9 @@ class MusicApp(QWidget):
             channel_url = track.get("_youtube_channel_url", "")
             if channel_url:
                 last_played_payload["_youtube_channel_url"] = channel_url
+            channel_avatar = track.get("_youtube_channel_avatar") or (self.player.current_playing_artist or {}).get("_youtube_channel_avatar", "")
+            if channel_avatar:
+                last_played_payload["_youtube_channel_avatar"] = channel_avatar
         elif album and album.get("_is_playlist"):
             # album_title/album_id above are already the track's *real*
             # album (see _resolve_playing_cover_rel's comment) — that's
@@ -10950,7 +11364,10 @@ class MusicApp(QWidget):
         panel.set_track(title, clean_artist_name(artist_name) if artist_name else "")
         self._load_now_playing_cover(cover_rel)
 
-        real_artist = self._find_artist_any(artist_name) if artist_name else None
+        self._now_playing_avatar_request_id += 1
+        avatar_request_id = self._now_playing_avatar_request_id
+        is_youtube = bool(track.get("_is_youtube"))
+        real_artist = self._find_artist_any(artist_name) if artist_name and not is_youtube else None
         clean_artist = clean_artist_name(artist_name) if artist_name else ""
         is_local_now = _is_local_collection_item(
             track=track,
@@ -10961,12 +11378,22 @@ class MusicApp(QWidget):
             clean_artist,
             subscribable=bool(real_artist) and not is_local_now and not _is_local_collection_item(artist=real_artist),
         )
-        if artist_name and not is_local_now:
+        if artist_name and not is_local_now and not is_youtube:
             panel.set_subscribed(artist_name in self._subscriptions)
         else:
             panel.set_subscribed(False)
-        if real_artist and real_artist.get("cover"):
-            self._load_now_playing_artist_avatar(resolve_media_url(real_artist["cover"]))
+        if is_youtube:
+            avatar_url = (
+                track.get("_youtube_channel_avatar")
+                or (self.player.current_playing_artist or {}).get("_youtube_channel_avatar", "")
+            )
+            if avatar_url:
+                self._load_now_playing_artist_avatar(avatar_url, avatar_request_id)
+            else:
+                panel.set_artist_avatar_pixmap(None)
+                self._resolve_now_playing_youtube_avatar(track, avatar_request_id)
+        elif real_artist and real_artist.get("cover"):
+            self._load_now_playing_artist_avatar(resolve_media_url(real_artist["cover"]), avatar_request_id)
         else:
             panel.set_artist_avatar_pixmap(None)
 
@@ -11043,10 +11470,7 @@ class MusicApp(QWidget):
         """(track, album) that will start once the current one ends, given
         the live shuffle/repeat state — mirrors PlayerController.play_next's
         own branching (core/player_vlc.py) without actually advancing
-        anything. Crossing into the *next album* (the on_album_finished
-        hand-off) isn't resolved here — that hand-off picks the next
-        artist/album via a whole separate lookup or a random pick keyed off
-        subscriptions, not a simple queue peek, so it isn't shown."""
+        anything."""
         p = self.player
         album = p.current_playing_album
         if not album or p.current_track is None or not p.shuffled_indices:
@@ -11061,6 +11485,10 @@ class MusicApp(QWidget):
             elif p.repeat_mode == "album":
                 idx = p.shuffled_indices[0]
             else:
+                next_album, _artist = self._next_album_after(album, p.current_playing_artist)
+                next_tracks = (next_album or {}).get("tracks", []) or []
+                if next_tracks:
+                    return next_tracks[0], next_album
                 idx = None
         if idx is None:
             return None, None
@@ -11102,15 +11530,99 @@ class MusicApp(QWidget):
 
         _start_image_loader([cover_url], 180, 8, on_loaded, self._img_runners)
 
-    def _load_now_playing_artist_avatar(self, url: str):
+    def _resolve_now_playing_youtube_avatar(self, track: dict, request_id: int):
+        if not _resolve_youtube_channel_avatar or self._closing:
+            return
+        channel_url = (
+            track.get("_youtube_channel_url")
+            or (self.player.current_playing_artist or {}).get("_youtube_channel_url", "")
+        )
+        if not channel_url:
+            return
+        cached_url = self._youtube_channel_avatar_cache.get(channel_url)
+        if cached_url:
+            self._apply_now_playing_youtube_avatar(track, cached_url, request_id)
+            return
+
+        signal = _YoutubeChannelAvatarSignal(self)
+        self._youtube_channel_avatar_signals.append(signal)
+
+        def _cleanup(_request_id, _channel_url, _avatar_url, s=signal):
+            try:
+                self._youtube_channel_avatar_signals.remove(s)
+            except ValueError:
+                pass
+
+        def _on_finished(done_request_id: int, done_channel_url: str, avatar_url: str):
+            if avatar_url:
+                self._youtube_channel_avatar_cache[done_channel_url] = avatar_url
+                self._apply_now_playing_youtube_avatar(track, avatar_url, done_request_id)
+
+        signal.finished.connect(_on_finished)
+        signal.finished.connect(_cleanup)
+
+        def _worker():
+            avatar_url = ""
+            try:
+                avatar_url = _resolve_youtube_channel_avatar(channel_url) or ""
+            except Exception as ex:
+                print(f"YouTube channel avatar resolve failed: {ex}")
+            signal.finished.emit(request_id, channel_url, avatar_url)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _apply_now_playing_youtube_avatar(self, track: dict, avatar_url: str, request_id: int):
+        if request_id != self._now_playing_avatar_request_id:
+            return
+        track["_youtube_channel_avatar"] = avatar_url
+        current_track = None
+        album = self.player.current_playing_album or {}
+        idx = self.player.current_track_idx
+        try:
+            if idx is not None:
+                current_track = (album.get("tracks") or [])[idx]
+        except Exception:
+            current_track = None
+        if current_track and current_track.get("_is_youtube"):
+            current_keys = _track_url_keys(current_track, _track_identity_url(current_track))
+            incoming_keys = _track_url_keys(track, _track_identity_url(track))
+            if not current_keys or not incoming_keys or current_keys & incoming_keys:
+                current_track["_youtube_channel_avatar"] = avatar_url
+        artist = self.player.current_playing_artist or {}
+        if artist.get("_is_youtube"):
+            artist["_youtube_channel_avatar"] = avatar_url
+        self._load_now_playing_artist_avatar(avatar_url, request_id)
+        self._save_current_youtube_avatar_to_state(track, avatar_url)
+
+    def _save_current_youtube_avatar_to_state(self, track: dict, avatar_url: str):
+        last_played = self._settings.get("last_played_track")
+        if not avatar_url or not isinstance(last_played, dict) or not last_played.get("_is_youtube"):
+            return
+        saved_keys = _track_url_keys({}, last_played.get("youtube_url") or last_played.get("track_url", ""))
+        track_keys = _track_url_keys(track, _track_identity_url(track))
+        if saved_keys and track_keys and not (saved_keys & track_keys):
+            return
+        if last_played.get("_youtube_channel_avatar") == avatar_url:
+            return
+        updated = dict(last_played)
+        updated["_youtube_channel_avatar"] = avatar_url
+        self._save_ui_state(last_played_track=updated)
+
+    def _load_now_playing_artist_avatar(self, url: str, request_id: int | None = None):
+        def _is_current_request() -> bool:
+            return request_id is None or request_id == self._now_playing_avatar_request_id
+
         key = cache_key(url, 72, 36)
         cached = cover_cache.get(key)
         if cached and not cached.isNull():
-            self._now_playing_panel.set_artist_avatar_pixmap(cached)
+            if _is_current_request():
+                self._now_playing_panel.set_artist_avatar_pixmap(cached)
             return
 
         def on_loaded(loaded_url, img, size, radius):
             try:
+                if not _is_current_request():
+                    return
                 pm = QPixmap.fromImage(img) if img else QPixmap()
                 if not pm.isNull():
                     cover_cache.set(cache_key(loaded_url, size, radius), pm)
@@ -11165,7 +11677,7 @@ class MusicApp(QWidget):
 
     def _on_position_changed(self):
         pos = self.player.get_current_position()
-        dur = self.player.get_duration()
+        dur = self._player_duration_or_track_hint()
         self._controls.update_position(pos, dur)
         if self._mpris_service:
             self._mpris_service.update_position(pos, dur)
@@ -11209,33 +11721,78 @@ class MusicApp(QWidget):
 
     def _on_duration_changed(self):
         pos = self.player.get_current_position()
-        dur = self.player.get_duration()
+        dur = self._player_duration_or_track_hint()
         self._controls.update_position(pos, dur)
+
+    def _player_duration_or_track_hint(self) -> int:
+        dur = self.player.get_duration()
+        if dur > 0:
+            return dur
+        album = self.player.current_playing_album
+        idx = self.player.current_track_idx
+        if not album or idx is None:
+            return 0
+        try:
+            track = album["tracks"][idx]
+            return max(0, int(track.get("duration") or 0))
+        except Exception:
+            return 0
 
     def _on_album_finished(self, artist: dict, album: dict) -> bool:
         """Repeat is off and the album just played through — instead of just
         stopping, move on to the artist's next album (wrapping back to their
         first once the last one finishes), so a whole artist keeps playing
         continuously rather than going silent after one album."""
-        if not artist or not album or album.get("_is_liked_album"):
+        next_album, full_artist = self._next_album_after(album, artist)
+        if not next_album or not full_artist:
             return False
+        self._play_track(0, next_album, full_artist)
+        return True
+
+    @staticmethod
+    def _album_index_in_list(albums: list, target_album: dict) -> int | None:
+        album_id = str((target_album or {}).get("album_id") or "").strip()
+        if album_id:
+            idx = next(
+                (i for i, al in enumerate(albums) if str((al or {}).get("album_id") or "").strip() == album_id),
+                None,
+            )
+            if idx is not None:
+                return idx
+
+        raw_title = ((target_album or {}).get("title") or "").strip()
+        if raw_title:
+            idx = next(
+                (i for i, al in enumerate(albums) if ((al or {}).get("title") or "").strip() == raw_title),
+                None,
+            )
+            if idx is not None:
+                return idx
+
+        current_title = clean_title((target_album or {}).get("title", ""))
+        return next(
+            (i for i, al in enumerate(albums) if clean_title((al or {}).get("title", "")) == current_title),
+            None,
+        )
+
+    def _next_album_after(self, album: dict, artist: dict) -> tuple[dict | None, dict | None]:
+        if not artist or not album or album.get("_is_liked_album"):
+            return None, None
         artist_name = (artist.get("artist") or "").strip()
         if not artist_name:
-            return False
+            return None, None
         full_artist = self.library_manager.get_artist_by_name(artist_name) or artist
         albums = full_artist.get("albums") or []
         if len(albums) < 1:
-            return False
-        current_title = clean_title(album.get("title", ""))
-        current_idx = next(
-            (i for i, al in enumerate(albums) if clean_title(al.get("title", "")) == current_title),
-            None,
-        )
+            return None, None
+        current_idx = self._album_index_in_list(albums, album)
+        if current_idx is None and full_artist is not artist:
+            full_artist = artist
+            albums = full_artist.get("albums") or []
+            current_idx = self._album_index_in_list(albums, album)
         if current_idx is None:
-            return False
-        next_album = albums[(current_idx + 1) % len(albums)]
-        self._play_track(0, next_album, full_artist)
-        return True
+            return None, None
+        return albums[(current_idx + 1) % len(albums)], full_artist
 
     def _on_album_previous(self, artist: dict, album: dict) -> bool:
         return False

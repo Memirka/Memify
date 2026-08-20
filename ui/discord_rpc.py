@@ -12,6 +12,7 @@ from pypresence import Presence
 from config import SERVER_URL
 
 DISCORD_CLIENT_ID = "1399441874250502297"
+APP_ICON_URL = SERVER_URL.rstrip("/") + "/assets/memify_logo.png"
 
 _DECODE_MAP = {
     "7c2": "/",
@@ -150,6 +151,8 @@ class DiscordRPC:
                     assets = act.get("assets") or {}
                     ts = act.get("timestamps") or {}
                     large_image = assets.get("large_image")
+                    small_image = assets.get("small_image")
+                    small_text = assets.get("small_text")
                     try:
                         if isinstance(large_image, str) and (large_image.startswith("http://") or large_image.startswith("https://")):
                             # If Discord rejects the URL, try our server short-cover endpoint.
@@ -166,6 +169,8 @@ class DiscordRPC:
                             start=ts.get("start"),
                             end=ts.get("end"),
                             large_image=large_image,
+                            small_image=small_image,
+                            small_text=small_text,
                             instance=bool(act.get("instance", True)),
                         )
             except Exception as e2:
@@ -189,11 +194,53 @@ class DiscordRPC:
                                 details=act.get("details"),
                                 start=ts.get("start"),
                                 end=ts.get("end"),
-                                large_image="memify_logo",
                                 instance=bool(act.get("instance", True)),
                             )
                 except Exception:
                     pass
+
+    def _read_rpc_output(self):
+        coro = None
+        try:
+            coro = self.rpc.read_output()
+            return self.rpc.loop.run_until_complete(coro)
+        except Exception:
+            # If the loop was already closed, run_until_complete never gets
+            # ownership of the coroutine. Close it explicitly so Python
+            # doesn't print "coroutine ... was never awaited" during cleanup.
+            if coro is not None:
+                try:
+                    coro.close()
+                except Exception:
+                    pass
+            raise
+
+    def _activity_assets(self, cover_url: str | None) -> dict:
+        assets = {}
+        cover_image = self._large_image_for_cover(cover_url)
+        app_icon = self._app_icon_for_rpc()
+
+        if cover_image:
+            assets["large_image"] = cover_image
+            if app_icon:
+                assets["small_image"] = app_icon
+                assets["small_text"] = "Memify"
+
+        return assets
+
+    def _app_icon_for_rpc(self) -> str | None:
+        try:
+            icon_url = self._sanitize_cover_url_for_rpc(APP_ICON_URL)
+            if not icon_url:
+                return None
+            return self._get_external_image_key(icon_url)
+        except Exception:
+            return None
+
+    def _add_assets(self, activity: dict, cover_url: str | None) -> None:
+        assets = self._activity_assets(cover_url)
+        if assets:
+            activity["assets"] = assets
 
     def _rpc_request(self, cmd: str, args: dict | None = None, *, timeout_s: float = 1.2) -> dict | None:
         if not self.connected or not self.rpc:
@@ -214,7 +261,7 @@ class DiscordRPC:
                     deadline = time.time() + max(0.2, float(timeout_s))
                     resp = None
                     while time.time() < deadline:
-                        r = self.rpc.loop.run_until_complete(self.rpc.read_output())
+                        r = self._read_rpc_output()
                         if not isinstance(r, dict):
                             continue
                         if r.get("nonce") == nonce:
@@ -442,21 +489,23 @@ class DiscordRPC:
         except Exception:
             return None
 
-    def _large_image_for_cover(self, cover_url: str | None) -> str:
+    def _large_image_for_cover(self, cover_url: str | None) -> str | None:
         """
         Pick a Discord-compatible `assets.large_image` value.
-        - Prefer a Discord `mp:external/...` key from GET_IMAGE for any cover URL.
-        - Use the short server endpoint `/rpc/c/<sha>.png` to keep URLs stable/short.
-        - Fallback to bundled app asset key.
+        Prefer a Discord-confirmed `mp:external/...` key, then fall back to a
+        public cover URL. Never guess a local application asset key (for
+        example `memify_logo`), because Discord renders a broken image when
+        that key does not exist in the developer portal.
         """
         try:
             raw = (cover_url or "").strip()
             if not raw:
-                return "memify_logo"
+                return None
 
-            # If the caller already provided an asset key or external key, keep it.
-            if not (raw.startswith("http://") or raw.startswith("https://") or raw.startswith("/")):
+            if raw.startswith("mp:external/"):
                 return raw
+            if not (raw.startswith("http://") or raw.startswith("https://") or raw.startswith("/")):
+                return None
 
             candidate = raw
             if raw.startswith("/"):
@@ -465,26 +514,23 @@ class DiscordRPC:
             short = self._rpc_short_cover_url(candidate)
             short_s = self._sanitize_cover_url_for_rpc(short) if short else None
             direct_s = self._sanitize_cover_url_for_rpc(candidate)
-            proxy_u = self._cover_url_for_discord_fetch(candidate)
 
-            # Prefer Discord external image keys (mp:external).
-            for fetch in (short_s, direct_s, proxy_u):
+            for fetch in (short_s, direct_s):
                 if not fetch:
                     continue
                 ext_key = self._get_external_image_key(fetch)
                 if ext_key:
                     return ext_key
 
-            # Fallback to raw URLs if external keys are unavailable.
-            for fallback in (short_s, direct_s, self._sanitize_cover_url_for_rpc(proxy_u)):
+            for fallback in (short_s, direct_s):
                 if fallback:
                     return fallback
         except Exception:
             pass
-        return "memify_logo"
+        return None
 
     @staticmethod
-    def _build_set_activity_payload(pid: int, activity: dict) -> dict:
+    def _build_set_activity_payload(pid: int, activity: dict | None) -> dict:
         return {
             "cmd": "SET_ACTIVITY",
             "args": {"pid": int(pid), "activity": activity},
@@ -516,8 +562,6 @@ class DiscordRPC:
         except Exception:
             self._last_duration_ms = 0
 
-        large_image = self._large_image_for_cover(self._last_cover_url)
-
         now = int(time.time())
         timestamps = {}
         try:
@@ -534,11 +578,9 @@ class DiscordRPC:
             "type": 2,  # Listening
             "details": ct,
             "state": ca,
-            "assets": {
-                "large_image": large_image,
-            },
             "instance": True,
         }
+        self._add_assets(activity, self._last_cover_url)
         if timestamps:
             activity["timestamps"] = timestamps
 
@@ -550,18 +592,15 @@ class DiscordRPC:
             return
 
         ct, ca, cal = self._last_tuple
-        large_image = self._large_image_for_cover(self._last_cover_url)
 
         activity = {
             "name": "Memify",
             "type": 2,  # Listening
             "details": ct,
             "state": ca,
-            "assets": {
-                "large_image": large_image,
-            },
             "instance": True,
         }
+        self._add_assets(activity, self._last_cover_url)
 
         self._safe_update(payload_override=self._build_set_activity_payload(os.getpid(), activity))
 
@@ -569,7 +608,7 @@ class DiscordRPC:
         """Очистка статуса"""
         if self.connected:
             try:
-                self.rpc.clear()
+                self._rpc_request("SET_ACTIVITY", {"pid": os.getpid(), "activity": None}, timeout_s=0.8)
                 print("[RPC] Очищен")
             except Exception:
                 pass

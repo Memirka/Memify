@@ -36,8 +36,9 @@ class SearchResult:
         self.playlist_owner_login = playlist_owner_login
         self.playlist_editable = playlist_editable
         self.playlist_cover_pixmap = playlist_cover_pixmap
-        # {id, title, uploader, duration, thumbnail, webpage_url} from
-        # core/youtube.py's search_youtube() — only set when type == "youtube".
+        # {id, title, uploader, duration, thumbnail, webpage_url, channel_url,
+        # channel_avatar} from core/youtube.py's search_youtube() — only set
+        # when type == "youtube".
         self.youtube_obj = youtube_obj or {}
 
     def artists_display(self) -> str:

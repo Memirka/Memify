@@ -391,10 +391,14 @@ class PlayerController(QObject):
             from utils.format_utils import resolve_media_url
             track_url = resolve_media_url(resolved_url or "")
             if not track_url:
+                self._abort_playback_start(index)
                 return
             media = self._vlc_instance.media_new(track_url)
             self.player.set_media(media)
-            self.player.play()
+            play_result = self.player.play()
+            if play_result == -1:
+                self._abort_playback_start(index)
+                return
             self.timer.start()
 
             if self.on_track_changed:
@@ -406,6 +410,33 @@ class PlayerController(QObject):
             self.currentUrlChanged.emit(track_url)
         except Exception as e:
             print(f"play_track error: {e}")
+            self._abort_playback_start(index)
+
+    def _abort_playback_start(self, index: int):
+        """Roll back a failed media switch.
+
+        YouTube resolution/playback can fail after play_track has already
+        selected a queue index. Leaving that index active makes the UI look
+        like a track is loaded even though libVLC has no playable media, so
+        reset the transient selection and publish a clean paused/zero-time
+        state.
+        """
+        if index != self.current_track:
+            return
+        self._manual_track_switch = False
+        self._ended_handled = True
+        self.current_track = None
+        self.current_track_idx = None
+        try:
+            self.player.stop()
+        except Exception:
+            pass
+        self.timer.stop()
+        if self.on_playback_state_changed:
+            self.on_playback_state_changed(False)
+        if self.on_position_changed:
+            self.on_position_changed()
+        self.currentUrlChanged.emit("")
 
     def toggle_playback(self):
         try:
