@@ -4,15 +4,19 @@ import re
 import uuid
 import threading
 import hashlib
+import json
+import base64
 import http.server
 import socketserver
 import urllib.request
 from urllib.parse import urlsplit, urlunsplit, unquote, quote
 from pypresence import Presence
+from pypresence.exceptions import ServerError
 from config import SERVER_URL
 
 DISCORD_CLIENT_ID = "1399441874250502297"
 APP_ICON_URL = SERVER_URL.rstrip("/") + "/assets/memify_logo.png"
+YOUTUBE_ICON_KEY = "youtube_logo"
 
 _DECODE_MAP = {
     "7c2": "/",
@@ -72,6 +76,8 @@ class DiscordRPC:
         self._last_started = None
         self._last_tuple = None
         self._last_cover_url = None
+        self._last_is_youtube = False
+        self._last_is_local = False
         self._last_position_ms = 0
         self._last_duration_ms = 0
         self._cover_proxy_server = None
@@ -83,6 +89,21 @@ class DiscordRPC:
         self._external_image_cache: dict[str, str] = {}
         self._external_image_fail_ts: dict[str, float] = {}
         self._external_image_fail_ttl_s = 60.0
+        self._local_cover_login = ""
+        self._local_cover_password = ""
+        self._local_cover_digest_cache: dict[str, str] = {}
+        self._local_cover_stat_cache: dict[str, str] = {}
+        self._local_cover_max_bytes = 5 * 1024 * 1024
+
+    def set_local_cover_credentials(self, login: str | None, password: str | None):
+        login = (login or "").strip()
+        password = (password or "").strip()
+        if login == self._local_cover_login and password == self._local_cover_password:
+            return
+        self._local_cover_login = login
+        self._local_cover_password = password
+        self._local_cover_digest_cache.clear()
+        self._local_cover_stat_cache.clear()
 
     def connect(self):
         try:
@@ -94,11 +115,49 @@ class DiscordRPC:
             print(f"[RPC] Не удалось подключиться: {e}")
             self.connected = False
 
-    def _safe_update(self, **kwargs):
+    def _safe_update(self, should_cancel=None, **kwargs):
         if not self.connected:
             return
+        if should_cancel and should_cancel():
+            return
+        payload = kwargs.get("payload_override") if isinstance(kwargs, dict) else None
+        if isinstance(payload, dict):
+            args = payload.get("args") or {}
+            resp = self._rpc_request(
+                str(payload.get("cmd") or "SET_ACTIVITY"),
+                args,
+                timeout_s=0.8,
+                should_cancel=should_cancel,
+            )
+            if should_cancel and should_cancel():
+                return
+            try:
+                if (
+                    isinstance(resp, dict)
+                    and resp.get("evt") == "ERROR"
+                    and isinstance(args, dict)
+                    and isinstance(args.get("activity"), dict)
+                    and args["activity"].get("assets")
+                ):
+                    activity = args["activity"]
+                    fallback_activity = dict(activity)
+                    fallback_activity.pop("assets", None)
+                    fallback_args = dict(args)
+                    fallback_args["activity"] = fallback_activity
+                    self._rpc_request(
+                        "SET_ACTIVITY",
+                        fallback_args,
+                        timeout_s=0.8,
+                        should_cancel=should_cancel,
+                    )
+            except Exception:
+                pass
+            return
+
         try:
             with self._rpc_lock:
+                if should_cancel and should_cancel():
+                    return
                 self.rpc.update(**kwargs)
         except Exception as e:
             # Keep console output actionable: show exception type + minimal payload summary.
@@ -215,40 +274,63 @@ class DiscordRPC:
                     pass
             raise
 
-    def _activity_assets(self, cover_url: str | None) -> dict:
+    def _activity_assets(
+        self,
+        cover_url: str | None,
+        is_youtube: bool = False,
+        is_local: bool = False,
+    ) -> dict:
         assets = {}
         cover_image = self._large_image_for_cover(cover_url)
-        app_icon = self._app_icon_for_rpc()
+        small_icon = self._youtube_icon_for_rpc() if is_youtube else self._app_icon_for_rpc()
+        small_text = "YouTube" if is_youtube else "Локальная библиотека" if is_local else "Memify"
 
         if cover_image:
             assets["large_image"] = cover_image
-            if app_icon:
-                assets["small_image"] = app_icon
-                assets["small_text"] = "Memify"
+            if small_icon:
+                assets["small_image"] = small_icon
+                assets["small_text"] = small_text
 
         return assets
 
     def _app_icon_for_rpc(self) -> str | None:
         try:
-            icon_url = self._sanitize_cover_url_for_rpc(APP_ICON_URL)
-            if not icon_url:
-                return None
-            return self._get_external_image_key(icon_url)
+            return self._sanitize_cover_url_for_rpc(APP_ICON_URL)
         except Exception:
             return None
 
-    def _add_assets(self, activity: dict, cover_url: str | None) -> None:
-        assets = self._activity_assets(cover_url)
+    def _youtube_icon_for_rpc(self) -> str:
+        return YOUTUBE_ICON_KEY
+
+    def _add_assets(
+        self,
+        activity: dict,
+        cover_url: str | None,
+        is_youtube: bool = False,
+        is_local: bool = False,
+    ) -> None:
+        assets = self._activity_assets(cover_url, is_youtube, is_local)
         if assets:
             activity["assets"] = assets
 
-    def _rpc_request(self, cmd: str, args: dict | None = None, *, timeout_s: float = 1.2) -> dict | None:
+    def _rpc_request(
+        self,
+        cmd: str,
+        args: dict | None = None,
+        *,
+        timeout_s: float = 1.2,
+        should_cancel=None,
+    ) -> dict | None:
         if not self.connected or not self.rpc:
             return None
         try:
+            if should_cancel and should_cancel():
+                return None
             nonce = uuid.uuid4().hex
             payload = {"cmd": cmd, "args": args or {}, "nonce": nonce}
             with self._rpc_lock:
+                if should_cancel and should_cancel():
+                    return None
                 prev_timeout = getattr(self.rpc, "response_timeout", None)
                 try:
                     if prev_timeout is not None:
@@ -261,6 +343,8 @@ class DiscordRPC:
                     deadline = time.time() + max(0.2, float(timeout_s))
                     resp = None
                     while time.time() < deadline:
+                        if should_cancel and should_cancel():
+                            return None
                         r = self._read_rpc_output()
                         if not isinstance(r, dict):
                             continue
@@ -279,6 +363,8 @@ class DiscordRPC:
                         pass
 
             return resp if isinstance(resp, dict) else None
+        except ServerError as e:
+            return {"evt": "ERROR", "data": {"message": str(e)}}
         except Exception:
             return None
 
@@ -489,13 +575,106 @@ class DiscordRPC:
         except Exception:
             return None
 
+    @staticmethod
+    def _local_path_from_file_url(file_url: str | None) -> str:
+        try:
+            parts = urlsplit((file_url or "").strip())
+            if parts.scheme != "file":
+                return ""
+            path = urllib.request.url2pathname(unquote(parts.path or ""))
+            if os.name == "nt" and re.fullmatch(r"/[A-Za-z]:/.*", path or ""):
+                path = path[1:]
+            return os.path.abspath(path)
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _local_cover_ext(data: bytes) -> str:
+        if data.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "png"
+        if data.startswith(b"\xff\xd8\xff"):
+            return "jpg"
+        if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            return "webp"
+        if data.startswith((b"GIF87a", b"GIF89a")):
+            return "gif"
+        return ""
+
+    def _upload_local_cover_for_rpc(self, file_url: str | None) -> str | None:
+        try:
+            if not self._local_cover_login or not self._local_cover_password:
+                return None
+            path = self._local_path_from_file_url(file_url)
+            if not path or not os.path.isfile(path):
+                return None
+            st = os.stat(path)
+            if st.st_size <= 0 or st.st_size > self._local_cover_max_bytes:
+                return None
+            stat_key = f"{path}|{int(st.st_mtime_ns)}|{int(st.st_size)}"
+            cached = self._local_cover_stat_cache.get(stat_key)
+            if cached:
+                return cached
+
+            with open(path, "rb") as f:
+                data = f.read(int(self._local_cover_max_bytes) + 1)
+            if len(data) > self._local_cover_max_bytes:
+                return None
+            ext = self._local_cover_ext(data)
+            if not ext:
+                return None
+            digest = hashlib.sha1(data).hexdigest()
+            cached = self._local_cover_digest_cache.get(digest)
+            if cached:
+                self._local_cover_stat_cache[stat_key] = cached
+                return cached
+
+            payload = json.dumps(
+                {
+                    "login": self._local_cover_login,
+                    "password": self._local_cover_password,
+                    "sha1": digest,
+                    "ext": ext,
+                    "image_data": base64.b64encode(data).decode("ascii"),
+                }
+            ).encode("utf-8")
+            req = urllib.request.Request(
+                SERVER_URL.rstrip("/") + "/rpc/local_cover/upload",
+                data=payload,
+                headers={"Content-Type": "application/json", "User-Agent": "Memify/DiscordRPC"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=4) as resp:
+                raw = resp.read(4096)
+            result = json.loads(raw.decode("utf-8", errors="ignore")) if raw else {}
+            if not isinstance(result, dict) or not result.get("ok"):
+                return None
+            url = (result.get("url") or "").strip()
+            if url.startswith("/"):
+                url = SERVER_URL.rstrip("/") + url
+            url = self._sanitize_cover_url_for_rpc(url)
+            if not url:
+                return None
+            self._local_cover_digest_cache[digest] = url
+            self._local_cover_stat_cache[stat_key] = url
+            if len(self._local_cover_digest_cache) > 128:
+                self._local_cover_digest_cache.pop(next(iter(self._local_cover_digest_cache)), None)
+            if len(self._local_cover_stat_cache) > 256:
+                self._local_cover_stat_cache.pop(next(iter(self._local_cover_stat_cache)), None)
+            return url
+        except Exception as e:
+            try:
+                print(f"[RPC] local cover upload failed: {type(e).__name__}: {e}")
+            except Exception:
+                pass
+            return None
+
     def _large_image_for_cover(self, cover_url: str | None) -> str | None:
         """
         Pick a Discord-compatible `assets.large_image` value.
-        Prefer a Discord-confirmed `mp:external/...` key, then fall back to a
-        public cover URL. Never guess a local application asset key (for
-        example `memify_logo`), because Discord renders a broken image when
-        that key does not exist in the developer portal.
+        Use a public URL directly so the viewing Discord client loads the
+        image itself. Avoid Discord GET_IMAGE here: doing that in Memify
+        made track switches wait on image preparation and briefly showed the
+        application icon instead of the track cover.
         """
         try:
             raw = (cover_url or "").strip()
@@ -504,6 +683,10 @@ class DiscordRPC:
 
             if raw.startswith("mp:external/"):
                 return raw
+            if raw.startswith("file://"):
+                raw = self._upload_local_cover_for_rpc(raw) or ""
+                if not raw:
+                    return None
             if not (raw.startswith("http://") or raw.startswith("https://") or raw.startswith("/")):
                 return None
 
@@ -515,16 +698,10 @@ class DiscordRPC:
             short_s = self._sanitize_cover_url_for_rpc(short) if short else None
             direct_s = self._sanitize_cover_url_for_rpc(candidate)
 
-            for fetch in (short_s, direct_s):
-                if not fetch:
-                    continue
-                ext_key = self._get_external_image_key(fetch)
-                if ext_key:
-                    return ext_key
-
-            for fallback in (short_s, direct_s):
-                if fallback:
-                    return fallback
+            if short_s:
+                return short_s
+            if direct_s:
+                return direct_s
         except Exception:
             pass
         return None
@@ -545,14 +722,21 @@ class DiscordRPC:
         cover_url: str | None = None,
         position_ms: int | None = None,
         duration_ms: int | None = None,
+        is_youtube: bool = False,
+        is_local: bool = False,
+        should_cancel=None,
     ):
         """Обновляет статус 'играет'"""
+        if should_cancel and should_cancel():
+            return
         self._last_started = time.time()
         ct = clean_track_title(title)
         ca = clean_artist_or_album(artist, "Неизвестный исполнитель")
         cal = clean_artist_or_album(album, "Неизвестный альбом")
         self._last_tuple = (ct, ca, cal)
         self._last_cover_url = (cover_url or "").strip() or None
+        self._last_is_youtube = bool(is_youtube)
+        self._last_is_local = bool(is_local)
         try:
             self._last_position_ms = int(position_ms or 0)
         except Exception:
@@ -580,14 +764,21 @@ class DiscordRPC:
             "state": ca,
             "instance": True,
         }
-        self._add_assets(activity, self._last_cover_url)
         if timestamps:
             activity["timestamps"] = timestamps
 
-        self._safe_update(payload_override=self._build_set_activity_payload(os.getpid(), activity))
+        self._add_assets(activity, self._last_cover_url, self._last_is_youtube, self._last_is_local)
+        if should_cancel and should_cancel():
+            return
+        self._safe_update(
+            payload_override=self._build_set_activity_payload(os.getpid(), activity),
+            should_cancel=should_cancel,
+        )
 
-    def set_pause(self):
+    def set_pause(self, should_cancel=None):
         """Обновляет статус 'пауза'"""
+        if should_cancel and should_cancel():
+            return
         if not self._last_tuple:
             return
 
@@ -600,15 +791,34 @@ class DiscordRPC:
             "state": ca,
             "instance": True,
         }
-        self._add_assets(activity, self._last_cover_url)
+        self._add_assets(activity, self._last_cover_url, self._last_is_youtube, self._last_is_local)
+        if should_cancel and should_cancel():
+            return
 
-        self._safe_update(payload_override=self._build_set_activity_payload(os.getpid(), activity))
+        self._safe_update(
+            payload_override=self._build_set_activity_payload(os.getpid(), activity),
+            should_cancel=should_cancel,
+        )
 
-    def clear(self):
+    def clear(self, should_cancel=None):
         """Очистка статуса"""
+        if should_cancel and should_cancel():
+            return
+        self._last_started = None
+        self._last_tuple = None
+        self._last_cover_url = None
+        self._last_is_youtube = False
+        self._last_is_local = False
+        self._last_position_ms = 0
+        self._last_duration_ms = 0
         if self.connected:
             try:
-                self._rpc_request("SET_ACTIVITY", {"pid": os.getpid(), "activity": None}, timeout_s=0.8)
+                self._rpc_request(
+                    "SET_ACTIVITY",
+                    {"pid": os.getpid(), "activity": None},
+                    timeout_s=0.8,
+                    should_cancel=should_cancel,
+                )
                 print("[RPC] Очищен")
             except Exception:
                 pass

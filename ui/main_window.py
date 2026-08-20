@@ -348,6 +348,45 @@ def _youtube_stream_proxy_url(webpage_url: str) -> str:
     )
 
 
+def _clean_artist_name_or_empty(name: str | None) -> str:
+    raw = str(name or "").strip()
+    if not raw:
+        return ""
+    cleaned = clean_artist_name(raw)
+    return "" if cleaned == "Неизвестно" else cleaned
+
+
+def _youtube_artist_label(track: dict | None, artist: dict | None = None) -> str:
+    track = track or {}
+    artist = artist or {}
+    fallback_label = ""
+    for value in (
+        track.get("artist_name"),
+        track.get("_youtube_channel_name"),
+        artist.get("artist"),
+    ):
+        raw = str(value or "").strip()
+        if not raw:
+            continue
+        label = _clean_artist_name_or_empty(raw)
+        if label:
+            if label.lower() == "youtube":
+                fallback_label = label
+                continue
+            return label
+
+    channel_url = (track.get("_youtube_channel_url") or artist.get("_youtube_channel_url") or "").strip()
+    try:
+        parts = [urllib.parse.unquote(p) for p in urllib.parse.urlsplit(channel_url).path.split("/") if p]
+        if parts:
+            tail = parts[-1].strip()
+            if tail and not tail.startswith("UC"):
+                return tail
+    except Exception:
+        pass
+    return fallback_label or "YouTube"
+
+
 def _track_url_keys(track: dict | None = None, url: str = "") -> set:
     """URL-only identity keys for exact current-track matching.
 
@@ -1013,7 +1052,7 @@ class ArtistPage(QWidget):
     def load_artist(self, artist: dict):
         """Update this page for a different artist. Called on every navigation."""
         self._current_artist = artist
-        name = clean_artist_name(artist.get("artist", "") or "")
+        name = _clean_artist_name_or_empty(artist.get("artist", ""))
         albums = artist.get("albums", []) or []
 
         self._name_label.setText(name)
@@ -1516,7 +1555,7 @@ class ArtistAllAlbumsPage(QWidget):
 
     def load_artist(self, artist: dict):
         self._current_artist = artist
-        name = clean_artist_name(artist.get("artist", "") or "")
+        name = _clean_artist_name_or_empty(artist.get("artist", ""))
         self._title_label.setText(f"Музыка — {name}" if name else "Музыка")
         self._album_grid.load_albums(artist.get("albums", []) or [], artist)
 
@@ -1650,9 +1689,13 @@ class TrackRow(QWidget):
 
         # Below the title (not inline) — mainly relevant for playlist tracks,
         # which can each come from a different artist/album.
-        artist_name = self._track.get("artist_name", "")
+        artist_name = (
+            _youtube_artist_label(self._track)
+            if self._track.get("_is_youtube")
+            else _clean_artist_name_or_empty(self._track.get("artist_name", ""))
+        )
         if artist_name:
-            self._artist_label = QLabel(clean_artist_name(artist_name))
+            self._artist_label = QLabel(artist_name)
             self._artist_label.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']}; font: 8.5pt 'Segoe UI';")
             self._artist_label.setMinimumWidth(0)
             self._artist_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
@@ -1660,12 +1703,12 @@ class TrackRow(QWidget):
                 artist_row = QHBoxLayout()
                 artist_row.setContentsMargins(0, 0, 0, 0)
                 artist_row.setSpacing(4)
-                yt_icon_lbl = QLabel()
-                yt_icon_lbl.setFixedSize(11, 11)
-                yt_icon_lbl.setPixmap(_make_youtube_icon_pixmap(11))
-                artist_row.addWidget(yt_icon_lbl)
-                artist_row.addWidget(self._artist_label)
-                artist_row.addStretch(1)
+                self._artist_icon_label = QLabel()
+                self._artist_icon_label.setFixedSize(11, 11)
+                self._artist_icon_label.setPixmap(_make_youtube_icon_pixmap(11))
+                self._artist_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+                artist_row.addWidget(self._artist_icon_label)
+                artist_row.addWidget(self._artist_label, 1)
                 title_col.addLayout(artist_row)
             else:
                 title_col.addWidget(self._artist_label)
@@ -1708,6 +1751,8 @@ class TrackRow(QWidget):
     def set_show_artist(self, show: bool):
         if hasattr(self, "_artist_label"):
             self._artist_label.setVisible(show)
+        if hasattr(self, "_artist_icon_label"):
+            self._artist_icon_label.setVisible(show)
 
     def set_cover_pixmap(self, pm: QPixmap):
         if pm and not pm.isNull():
@@ -2252,7 +2297,7 @@ class AlbumPage(QWidget):
         is_virtual = is_liked_album or is_playlist
 
         album_name = clean_title(album.get("title", "")) or "Неизвестно"
-        artist_name = clean_artist_name(artist.get("artist", "")) or ""
+        artist_name = _clean_artist_name_or_empty(artist.get("artist", ""))
         tracks = album.get("tracks", []) or []
         is_local_album = _is_local_collection_item(album=album, artist=artist)
 
@@ -2684,7 +2729,7 @@ class CoverViewerOverlay(QWidget):
         self._download_btn.setEnabled(False)
 
         album_title = clean_title(self._album.get("title", "")) or "Альбом"
-        artist_name = clean_artist_name(self._artist.get("artist", "")) or ""
+        artist_name = _clean_artist_name_or_empty(self._artist.get("artist", ""))
         self._caption_label.setText(f"{album_title} • {artist_name}" if artist_name else album_title)
 
         self._image_label.setPixmap(QPixmap())
@@ -2756,7 +2801,7 @@ class CoverViewerOverlay(QWidget):
         if not self._full_pixmap:
             return
         album_title = clean_title(self._album.get("title", "")) or "album"
-        artist_name = clean_artist_name(self._artist.get("artist", "")) or "artist"
+        artist_name = _clean_artist_name_or_empty(self._artist.get("artist", "")) or "artist"
         suggested = f"{_safe_filename(artist_name)} - {_safe_filename(album_title)}.png"
         file_path, _ = QFileDialog.getSaveFileName(
             self, "Сохранить обложку альбома", suggested,
@@ -5343,35 +5388,45 @@ class Sidebar(QWidget):
             f"border: 1px dashed {COLORS['BORDER']}; border-radius: 8px; }}"
         )
         hint_layout = QVBoxLayout(self._local_hint)
-        hint_layout.setContentsMargins(10, 10, 10, 10)
-        hint_layout.setSpacing(6)
+        hint_layout.setContentsMargins(8, 8, 8, 8)
+        hint_layout.setSpacing(4)
 
-        hint_title = QLabel("Как добавить музыку")
+        hint_title = QLabel("Папка music пуста")
+        hint_title.setMinimumWidth(0)
+        hint_title.setWordWrap(True)
         hint_title.setStyleSheet(f"color: {COLORS['TEXT_PRIMARY']}; font: bold 9.5pt 'Segoe UI';")
         hint_layout.addWidget(hint_title)
 
-        hint_text = QLabel(
-            "Разложите треки по папкам:\n"
-            "music / Исполнитель / Альбом / трек.mp3\n\n"
-            "Например:\n"
-            "music / Imagine Dragons / Evolve / 01 - Believer.mp3\n\n"
-            "Каждый исполнитель — отдельная папка, внутри неё — папка "
-            "каждого альбома, а треки (mp3, flac, m4a, ogg, wav, opus) — "
-            "прямо в папке альбома.\n\n"
-            "Обложка — необязательно: положите файл cover.png (или jpg/png/webp) "
-            "рядом, в папку исполнителя и/или альбома."
-        )
+        hint_text = QLabel("Добавьте треки так:")
+        hint_text.setMinimumWidth(0)
         hint_text.setWordWrap(True)
-        hint_text.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']}; font: 9pt 'Segoe UI';")
+        hint_text.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']}; font: 8.5pt 'Segoe UI';")
         hint_layout.addWidget(hint_text)
 
-        hint_open_btn = QPushButton("Открыть папку music")
+        hint_example = QLabel("music/\n  Исполнитель/\n    Альбом/\n      трек.mp3")
+        hint_example.setMinimumWidth(0)
+        hint_example.setWordWrap(False)
+        hint_example.setStyleSheet(
+            f"color: {COLORS['TEXT_PRIMARY']}; font: 8.5pt 'Consolas', 'Courier New', monospace;"
+        )
+        hint_layout.addWidget(hint_example)
+
+        hint_note = QLabel(
+            "mp3, flac, m4a, ogg, wav, opus\n"
+            "Обложка: cover.png/jpg/webp"
+        )
+        hint_note.setMinimumWidth(0)
+        hint_note.setWordWrap(True)
+        hint_note.setStyleSheet(f"color: {COLORS['TEXT_SECONDARY']}; font: 8.5pt 'Segoe UI';")
+        hint_layout.addWidget(hint_note)
+
+        hint_open_btn = QPushButton("Открыть music")
         hint_open_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         hint_open_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        hint_open_btn.setFixedHeight(28)
+        hint_open_btn.setFixedHeight(24)
         hint_open_btn.setStyleSheet(
             f"QPushButton {{ background: transparent; border: 1px solid {COLORS['BORDER']}; "
-            f"border-radius: 6px; color: {COLORS['TEXT_SECONDARY']}; font: 9pt 'Segoe UI'; padding: 0 10px; }}"
+            f"border-radius: 6px; color: {COLORS['TEXT_SECONDARY']}; font: 8.5pt 'Segoe UI'; padding: 0 8px; }}"
             f"QPushButton:hover {{ border-color: {COLORS['TEXT_PRIMARY']}; color: {COLORS['TEXT_PRIMARY']}; }}"
         )
         hint_open_btn.clicked.connect(self.open_local_folder_requested.emit)
@@ -7979,6 +8034,8 @@ class MusicApp(QWidget):
         self._discord_connecting = False
         self._discord_connect_signal = None
         self._discord_refresh_timer: QTimer | None = None
+        self._discord_playback_active = False
+        self._discord_pending_force_play = False
         # Bumped on every _refresh_discord_presence call — lets a background
         # send (see its own comment) started by an older call notice a
         # newer one has since superseded it and skip sending, same de-dupe
@@ -8632,6 +8689,7 @@ class MusicApp(QWidget):
         self._account_id = data.get("account_id") or ""
         self._apply_own_identity()
         self._apply_own_avatar(data.get("avatar_data"))
+        self._sync_discord_rpc_credentials()
         self._profile_page.set_playlists(self._playlists)
         self._profile_page.set_listen_stats(self._listen_stats)
         self._update_sidebar_from_account()
@@ -9073,11 +9131,16 @@ class MusicApp(QWidget):
         artist_name = last_played.get("artist_name", "") or "YouTube"
         channel_url = last_played.get("_youtube_channel_url", "")
         channel_avatar = last_played.get("_youtube_channel_avatar", "")
+        try:
+            duration = int(last_played.get("duration") or 0)
+        except Exception:
+            duration = 0
         track = {
             "title": track_title, "url": webpage_url, "artist_name": artist_name,
             "_is_youtube": True, "_youtube_channel_url": channel_url,
             "_youtube_channel_avatar": channel_avatar,
             "_youtube_thumbnail": last_played.get("album_cover", ""),
+            "duration": duration,
         }
         artist = {
             "artist": artist_name, "_is_youtube": True,
@@ -9875,13 +9938,14 @@ class MusicApp(QWidget):
         artist_name = lt.get("artist_name", "")
         album_title = lt.get("album_title", "")
         if lt.get("_is_youtube"):
+            youtube_artist_name = _youtube_artist_label(lt)
             # Never in the library — url is the permanent youtube.com/watch
             # link (see _build_track_ref), resolved to a fresh stream only
             # when actually played (see MusicApp._resolve_track_url_for_player).
             return {
                 "title": lt.get("track_title") or lt.get("title", ""),
                 "url": url,
-                "artist_name": artist_name,
+                "artist_name": youtube_artist_name,
                 "_is_youtube": True,
                 "_youtube_thumbnail": lt.get("_youtube_thumbnail", ""),
                 "_youtube_channel_url": lt.get("_youtube_channel_url", ""),
@@ -9979,6 +10043,8 @@ class MusicApp(QWidget):
         )
 
     def _on_logout(self):
+        if self._discord_rpc and hasattr(self._discord_rpc, "set_local_cover_credentials"):
+            self._discord_rpc.set_local_cover_credentials("", "")
         if self._account_manager:
             self._account_manager.logout()
         self.player.stop()
@@ -10341,6 +10407,8 @@ class MusicApp(QWidget):
         else:
             album_title = album.get("title", "") or ""
         artist_name = track.get("artist_name") or ((artist or {}).get("artist", "") if artist else "") or ""
+        if is_youtube:
+            artist_name = _youtube_artist_label(track, artist)
         ref = {
             "url": rel_url or resolve_media_url(rel_url),
             "artist_name": artist_name,
@@ -11032,12 +11100,23 @@ class MusicApp(QWidget):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _sync_discord_rpc_credentials(self):
+        rpc = self._discord_rpc
+        if not rpc or not hasattr(rpc, "set_local_cover_credentials"):
+            return
+        try:
+            data = self._account_manager.get_login_data() if self._account_manager else {}
+            rpc.set_local_cover_credentials(data.get("login", ""), data.get("password", ""))
+        except Exception:
+            rpc.set_local_cover_credentials("", "")
+
     def _on_discord_connect_result(self, rpc, connected: bool):
         self._discord_connecting = False
         self._discord_connect_signal = None
         if connected:
             self._discord_rpc = rpc
-            self._refresh_discord_presence()
+            self._sync_discord_rpc_credentials()
+            self._refresh_discord_presence(force_play=self._discord_playback_active)
         else:
             try:
                 rpc.disconnect()
@@ -11052,6 +11131,7 @@ class MusicApp(QWidget):
     def _dispose_discord_rpc(self):
         if not self._discord_rpc:
             return
+        self._discord_refresh_generation += 1
         try:
             self._discord_rpc.clear()
         except Exception:
@@ -11062,17 +11142,32 @@ class MusicApp(QWidget):
             pass
         self._discord_rpc = None
 
-    def _schedule_discord_presence_refresh(self, delay_ms: int = 180):
+    def _schedule_discord_presence_refresh(self, delay_ms: int = 180, force_play: bool = False):
         if not self._discord_rpc:
             return
+        # Discord rate-limits Rich Presence updates, so collapse bursts of
+        # track_changed/playback_state_changed/seek callbacks into one latest
+        # snapshot. Bump generation even when a timer is already pending so
+        # any in-flight worker for the old snapshot is cancelled.
+        self._discord_refresh_generation += 1
+        self._discord_pending_force_play = self._discord_pending_force_play or bool(force_play)
+        delay = max(0, int(delay_ms))
         if self._discord_refresh_timer is None:
             self._discord_refresh_timer = QTimer(self)
             self._discord_refresh_timer.setSingleShot(True)
-            self._discord_refresh_timer.timeout.connect(self._refresh_discord_presence)
-        self._discord_refresh_timer.stop()
-        self._discord_refresh_timer.start(max(0, delay_ms))
+            self._discord_refresh_timer.timeout.connect(self._flush_discord_presence_refresh)
+        if self._discord_refresh_timer.isActive():
+            remaining = self._discord_refresh_timer.remainingTime()
+            if remaining >= 0 and remaining <= delay:
+                return
+        self._discord_refresh_timer.start(delay)
 
-    def _refresh_discord_presence(self):
+    def _flush_discord_presence_refresh(self):
+        force_play = bool(self._discord_pending_force_play)
+        self._discord_pending_force_play = False
+        self._refresh_discord_presence(force_play=force_play)
+
+    def _refresh_discord_presence(self, force_play: bool = False):
         # Everything in this try block is cheap (dict/attr reads already
         # sitting in memory) — safe to keep on the main thread. The actual
         # rpc.set_play()/set_pause()/clear() calls are dispatched to a
@@ -11103,10 +11198,17 @@ class MusicApp(QWidget):
                 self._send_discord_presence_async(rpc, None)
                 return
 
+            is_youtube = bool(track.get("_is_youtube"))
+            is_local = _is_local_collection_item(track=track, album=album, artist=artist)
             rpc_title = track.get("title", "") or "Неизвестно"
+            artist_source = (
+                _youtube_artist_label(track, artist)
+                if is_youtube
+                else track.get("artist_name") or (artist or {}).get("artist", "")
+            )
             rpc_artist_names = self._display_artist_names(
                 track.get("album_id") or album.get("album_id"),
-                track.get("artist_name") or (artist or {}).get("artist", ""),
+                artist_source,
             )
             rpc_artist = ", ".join(rpc_artist_names) or "Неизвестно"
             rpc_album_title = track.get("_real_album_title") or album.get("title", "") or ""
@@ -11115,20 +11217,23 @@ class MusicApp(QWidget):
             cover_rel = track.get("_real_album_cover") or album.get("cover", "")
             if cover_rel and not (os.path.isabs(cover_rel) and os.path.exists(cover_rel)):
                 resolved_cover = resolve_media_url(cover_rel)
-                # Discord can only fetch public http(s) images — a local
-                # file:// cover isn't reachable from Discord's servers, so
-                # just omit the artwork rather than send an unusable URL.
-                rpc_cover = resolved_cover if resolved_cover.startswith("http") else None
+                # http(s) covers can be used directly; file:// covers from
+                # the local library are uploaded by DiscordRPC to the server
+                # and replaced with a public /rpc/local_cover/... URL.
+                rpc_cover = resolved_cover if resolved_cover.startswith(("http", "file://")) else None
             else:
                 rpc_cover = None
 
             rpc_pos_ms = self.player.get_current_position()
-            rpc_dur_ms = self.player.get_duration()
+            rpc_dur_ms = self._player_duration_or_track_hint()
 
-            if self.player.is_playing():
-                payload = ("play", rpc_title, rpc_artist, rpc_album_title, rpc_cover, rpc_pos_ms, rpc_dur_ms)
-            else:
-                payload = ("pause",)
+            if not (force_play or self._discord_playback_active):
+                self._send_discord_presence_async(rpc, None)
+                return
+            payload = (
+                "play", rpc_title, rpc_artist, rpc_album_title, rpc_cover,
+                rpc_pos_ms, rpc_dur_ms, is_youtube, is_local,
+            )
             self._send_discord_presence_async(rpc, payload)
         except Exception as e:
             print(f"[RPC] refresh error: {e}")
@@ -11137,22 +11242,34 @@ class MusicApp(QWidget):
         self._discord_refresh_generation += 1
         my_gen = self._discord_refresh_generation
 
+        def _is_stale():
+            return (
+                my_gen != self._discord_refresh_generation
+                or rpc is not self._discord_rpc
+                or not getattr(rpc, "connected", False)
+            )
+
         def _worker():
             # A newer _refresh_discord_presence already ran (another track/
             # play-pause change landed before this one got to actually talk
             # to Discord) — sending this stale snapshot now would just flash
             # outdated info before the newer call's own send catches up, so
             # skip it instead.
-            if my_gen != self._discord_refresh_generation:
+            if _is_stale():
                 return
             try:
                 if payload is None:
-                    rpc.clear()
+                    rpc.clear(should_cancel=_is_stale)
                 elif payload[0] == "play":
-                    _, title, artist_s, album_title, cover, pos_ms, dur_ms = payload
-                    rpc.set_play(title, artist_s, album_title, cover, pos_ms, dur_ms)
+                    _, title, artist_s, album_title, cover, pos_ms, dur_ms, is_youtube, is_local = payload
+                    rpc.set_play(
+                        title, artist_s, album_title, cover, pos_ms, dur_ms,
+                        is_youtube=is_youtube,
+                        is_local=is_local,
+                        should_cancel=_is_stale,
+                    )
                 else:
-                    rpc.set_pause()
+                    rpc.clear(should_cancel=_is_stale)
             except Exception as e:
                 print(f"[RPC] async send error: {e}")
 
@@ -11194,13 +11311,20 @@ class MusicApp(QWidget):
         if album_id:
             artists = self.library_manager.get_artists_for_album_id(album_id)
             if len(artists) > 1:
-                return [clean_artist_name(a) for a in artists]
-        return [clean_artist_name(fallback_artist_name)] if fallback_artist_name else []
+                return [name for name in (_clean_artist_name_or_empty(a) for a in artists) if name]
+        fallback = _clean_artist_name_or_empty(fallback_artist_name)
+        return [fallback] if fallback else []
 
     def _on_track_changed(self, track: dict, artist: dict, album: dict):
+        self._discord_playback_active = True
+        artist_source = (
+            _youtube_artist_label(track, artist)
+            if (track or {}).get("_is_youtube")
+            else track.get("artist_name") or (artist or {}).get("artist", "")
+        )
         display_artist_names = self._display_artist_names(
             track.get("album_id") or (album or {}).get("album_id"),
-            track.get("artist_name") or (artist or {}).get("artist", ""),
+            artist_source,
         )
         self._controls.update_track_info(track, artist, album, display_artist_names=display_artist_names)
         self._controls.set_playing(True)
@@ -11208,8 +11332,8 @@ class MusicApp(QWidget):
         if self._mpris_service:
             self._mpris_service.update_track(track, artist, album)
         self._sync_like_button()
-        self._schedule_discord_presence_refresh(90)
-        self._schedule_discord_presence_refresh(650)
+        self._schedule_discord_presence_refresh(90, force_play=True)
+        self._schedule_discord_presence_refresh(650, force_play=True)
         # Highlight playing track everywhere. For a YouTube track this must
         # be the permanent link (_track_identity_url), not the one-shot
         # stream URL just returned for playback.
@@ -11256,6 +11380,12 @@ class MusicApp(QWidget):
             # watch link is what makes resuming possible at all.
             last_played_payload["_is_youtube"] = True
             last_played_payload["youtube_url"] = _track_identity_url(track)
+            try:
+                duration = int(track.get("duration") or 0)
+            except Exception:
+                duration = 0
+            if duration:
+                last_played_payload["duration"] = duration
             channel_url = track.get("_youtube_channel_url", "")
             if channel_url:
                 last_played_payload["_youtube_channel_url"] = channel_url
@@ -11361,14 +11491,14 @@ class MusicApp(QWidget):
         _on_track_changed, right alongside the same bottom-bar update."""
         panel = self._now_playing_panel
         title = clean_title(track.get("title", "")) or "Неизвестно"
-        panel.set_track(title, clean_artist_name(artist_name) if artist_name else "")
+        panel.set_track(title, _clean_artist_name_or_empty(artist_name))
         self._load_now_playing_cover(cover_rel)
 
         self._now_playing_avatar_request_id += 1
         avatar_request_id = self._now_playing_avatar_request_id
         is_youtube = bool(track.get("_is_youtube"))
         real_artist = self._find_artist_any(artist_name) if artist_name and not is_youtube else None
-        clean_artist = clean_artist_name(artist_name) if artist_name else ""
+        clean_artist = _clean_artist_name_or_empty(artist_name)
         is_local_now = _is_local_collection_item(
             track=track,
             album=self.player.current_playing_album,
@@ -11432,7 +11562,7 @@ class MusicApp(QWidget):
         there instead of starting the fetch only on click. title is already
         clean_title()'d by the caller (_refresh_now_playing_panel);
         artist_name is not."""
-        clean_artist = clean_artist_name(artist_name) if artist_name else ""
+        clean_artist = _clean_artist_name_or_empty(artist_name)
         if not title or not clean_artist:
             if self._lyrics_viewer.isVisible():
                 self._lyrics_request_id += 1
@@ -11505,7 +11635,7 @@ class MusicApp(QWidget):
             return
         title = clean_title(track.get("title", "")) or "Неизвестно"
         artist_name = track.get("artist_name") or (self.player.current_playing_artist or {}).get("artist", "") or ""
-        panel.set_queue_track(title, clean_artist_name(artist_name) if artist_name else "")
+        panel.set_queue_track(title, _clean_artist_name_or_empty(artist_name))
         self._load_now_playing_queue_cover(self._resolve_track_cover_rel(album, track))
 
     def _load_now_playing_cover(self, cover_rel: str):
@@ -11664,14 +11794,15 @@ class MusicApp(QWidget):
         self._disc_overlay.show_for(cover_rel, self.player.is_playing())
 
     def _on_playback_state_changed(self, is_playing: bool):
+        self._discord_playback_active = bool(is_playing)
         self._controls.set_playing(is_playing)
         self._disc_overlay.set_playing(is_playing)
         self._lyrics_viewer.set_playing(is_playing)
         self._album_page.set_paused(not is_playing)
         self._artist_page.set_random_tracks_paused(not is_playing)
         self._sync_play_all_button(is_playing)
-        self._schedule_discord_presence_refresh(90)
-        self._schedule_discord_presence_refresh(650)
+        self._schedule_discord_presence_refresh(90, force_play=is_playing)
+        self._schedule_discord_presence_refresh(650, force_play=is_playing)
         if self._mpris_service:
             self._mpris_service.update_playback_state(is_playing)
 
