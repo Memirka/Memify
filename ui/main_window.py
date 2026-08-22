@@ -8007,6 +8007,13 @@ class MusicApp(QWidget):
         # fields above at least once (from local cache or network) — see
         # its guard in _save_player_data_async.
         self._player_data_ready = False
+        # Local cache is useful for instant startup UI, but it is not allowed
+        # to become the source of truth for server writes. A real /player/load
+        # must complete first, otherwise a stale desktop cache can erase likes
+        # or playlists made from web/mobile.
+        self._server_player_data_ready = False
+        self._settings_sync_deferred_until_player_data = False
+        self._full_player_data_save_deferred_until_server = False
         self._display_name: str = ""
         self._account_id: str = ""
         self._user_search_generation: int = 0
@@ -8170,6 +8177,9 @@ class MusicApp(QWidget):
         fire on every tick — without this, dragging the slider would fire a
         network request and spin up a QThread dozens of times a second."""
         if not self._account_manager or self._closing:
+            return
+        if not self._server_player_data_ready:
+            self._settings_sync_deferred_until_player_data = True
             return
         if self._settings_sync_timer is None:
             self._settings_sync_timer = QTimer(self)
@@ -8544,7 +8554,7 @@ class MusicApp(QWidget):
         if self._account_manager:
             local = self._read_local_player_data()
             if local:
-                self._on_player_data_loaded(local)
+                self._on_player_data_loaded(local, from_cache=True)
             else:
                 self._sidebar.load_account_content(liked=False, entries=[])
             # Fetch the real, current player data right away — don't wait for
@@ -8614,7 +8624,7 @@ class MusicApp(QWidget):
             except ValueError:
                 pass
 
-        signal.finished.connect(self._on_player_data_loaded)
+        signal.finished.connect(lambda data: self._on_player_data_loaded(data, from_cache=False))
         signal.finished.connect(_cleanup)
 
         account_manager = self._account_manager
@@ -8628,7 +8638,7 @@ class MusicApp(QWidget):
 
         threading.Thread(target=_worker, daemon=True).start()
 
-    def _on_player_data_loaded(self, data: dict | None):
+    def _on_player_data_loaded(self, data: dict | None, *, from_cache: bool = False):
         if data is None:
             # The network fetch failed (timeout/server error) and there was
             # nothing already cached in this session to fall back on — do
@@ -8642,6 +8652,8 @@ class MusicApp(QWidget):
             if not self._closing:
                 QTimer.singleShot(5000, self._fetch_player_data)
             return
+        if not from_cache:
+            self._server_player_data_ready = True
         self._liked_tracks = [
             ref for ref in (data.get("liked_tracks", []) or [])
             if not _collection_ref_is_local(ref)
@@ -8694,6 +8706,20 @@ class MusicApp(QWidget):
         self._profile_page.set_listen_stats(self._listen_stats)
         self._update_sidebar_from_account()
         self._after_track_collections_changed()
+        if not from_cache:
+            cache_data = dict(data)
+            cache_data.update({
+                "liked_tracks": self._liked_tracks,
+                "playlists": self._playlists,
+                "playlist_subscriptions": self._playlist_subscriptions,
+                "subscriptions": self._subscriptions,
+                "album_subscriptions": self._album_subscriptions,
+                "follow_order": self._follow_order,
+                "listen_stats": self._listen_stats,
+                "display_name": self._display_name,
+                "account_id": self._account_id,
+            })
+            self._write_local_player_data(cache_data)
         was_ready = self._player_data_ready
         self._player_data_ready = True
         if not self._state_restored:
@@ -8705,7 +8731,13 @@ class MusicApp(QWidget):
         # empty defaults. Give it one real chance now that they're populated
         # for real, instead of silently dropping that change until the user
         # happens to touch a setting again.
-        if not was_ready:
+        if not from_cache and (
+            not was_ready
+            or self._settings_sync_deferred_until_player_data
+            or self._full_player_data_save_deferred_until_server
+        ):
+            self._settings_sync_deferred_until_player_data = False
+            self._full_player_data_save_deferred_until_server = False
             self._schedule_settings_sync()
 
     def _apply_own_identity(self):
@@ -8738,6 +8770,9 @@ class MusicApp(QWidget):
         optimistically, and /player/save only writes whatever keys are
         present, so this never touches liked_tracks/subscriptions/etc."""
         if "playlists" in updates:
+            if not self._server_player_data_ready:
+                self._full_player_data_save_deferred_until_server = True
+                return
             self._sanitize_account_collections()
             updates = dict(updates)
             updates["playlists"] = self._playlists
@@ -9365,6 +9400,13 @@ class MusicApp(QWidget):
 
     def _save_player_data_async(self, updates: dict):
         if not self._account_manager:
+            return
+        if not self._server_player_data_ready:
+            # A full desktop snapshot before the first authoritative server
+            # load is exactly how newer web/mobile changes get erased. Keep the
+            # UI-local change for now; the server copy will be loaded shortly
+            # and normal saves resume after that.
+            self._full_player_data_save_deferred_until_server = True
             return
         if not self._player_data_ready:
             # self._liked_tracks/_subscriptions/_album_subscriptions/
