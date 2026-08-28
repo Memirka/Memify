@@ -61,6 +61,10 @@ class LibraryManager:
         self.library = []
         self._search_index = []
         self._album_id_artists: dict[str, list[str]] = {}
+        # True only after this instance has received a valid library payload
+        # from the server.  A disk cache is intentionally not authoritative
+        # enough for deleting/repairing account collection references.
+        self.last_network_refresh_succeeded = False
 
     def load_library(self) -> list:
         global _library_cache
@@ -130,6 +134,7 @@ class LibraryManager:
     def refresh_from_network(self) -> list:
         """Fetch fresh library from server; on failure keep existing data unchanged."""
         global _library_cache
+        self.last_network_refresh_succeeded = False
         lib_data = None
         try:
             res = requests.get(SERVER_URL + "/music/library", timeout=8)
@@ -150,6 +155,8 @@ class LibraryManager:
         if not clean:
             # Network failed — keep whatever is already in library
             return list(self.library)
+
+        self.last_network_refresh_succeeded = True
 
         try:
             os.makedirs(os.path.dirname(LIBRARY_CACHE_FILE), exist_ok=True)

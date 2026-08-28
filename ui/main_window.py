@@ -35,6 +35,11 @@ from datetime import date, timedelta
 from PyQt6.QtGui import QFont, QColor, QPalette, QIcon, QPixmap, QImage, QFontMetrics, QCursor, QPainter, QPainterPath, QPen, QBrush, QLinearGradient, QDesktopServices
 
 from config import SERVER_URL, APP_ICON, ICONS_DIR, APP_SETTINGS_FILE, PLAYER_DATA_CACHE_DIR, LIBRARY_CACHE_FILE, WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT, DATA_DIR, APP_VERSION, LOCAL_MUSIC_DIR
+from core.collection_refs import (
+    LibraryTrackResolver,
+    canonical_library_track_ref,
+    repair_collection_refs,
+)
 from core.library import LibraryManager, SearchResult
 from core.local_library import ensure_local_music_dir, scan_local_library
 from core.player_vlc import PlayerController, get_eq_band_frequencies
@@ -594,6 +599,10 @@ def _make_play_pause_icon(playing: bool, size: int, color: str) -> QPixmap:
 # key support wouldn't mean anything here).
 _LOCAL_ONLY_SETTINGS_KEYS = {
     "audio_output_device_id", "global_media_keys",
+    # Kept in app_settings.json only as the desktop's fast local resume
+    # cache.  Cross-client resume uses player data's top-level last_played
+    # field, which is also what the web client reads and writes.
+    "last_played_track",
     # Эквалайзер настроен под конкретные наушники/колонки этой машины — на
     # другом устройстве (другой ПК, тем более телефон без поддержки EQ)
     # тот же изгиб частот скорее всего будет звучать плохо, поэтому не
@@ -8598,6 +8607,10 @@ class MusicApp(QWidget):
 
     def _on_library_loaded(self):
         self._loading = False
+        # A fresh library is now authoritative enough to repair refs created
+        # from an older desktop cache (stale album_id but still-valid URL),
+        # and to remove entries whose track truly disappeared everywhere.
+        self._repair_account_collection_refs()
         # Retry the player warm-up now that real track URLs may be available
         # — on a fresh login (no local library cache yet) the earlier
         # timer-based attempt had nothing to warm the network path up with.
@@ -8696,7 +8709,15 @@ class MusicApp(QWidget):
                 if seconds > merged_listen_stats.get(day, 0.0):
                     merged_listen_stats[day] = seconds
             self._listen_stats = merged_listen_stats
-        self._apply_synced_settings(data.get("app_settings") or {})
+        app_settings = data.get("app_settings") or {}
+        legacy_last_played = (
+            app_settings.get("last_played_track")
+            if isinstance(app_settings, dict) else None
+        )
+        self._apply_synced_settings(app_settings)
+        last_played_needs_migration = self._apply_synced_last_played(
+            data.get("last_played"), legacy_last_played
+        )
         self._display_name = data.get("display_name") or ""
         self._account_id = data.get("account_id") or ""
         self._apply_own_identity()
@@ -8722,7 +8743,14 @@ class MusicApp(QWidget):
             self._write_local_player_data(cache_data)
         was_ready = self._player_data_ready
         self._player_data_ready = True
-        if not self._state_restored:
+        if not from_cache and last_played_needs_migration:
+            self._save_player_data_async({"last_played": self._settings.get("last_played_track") or {}})
+        self._repair_account_collection_refs()
+        # The disk cache is only an instant visual preview.  Restoring the
+        # actual player/last track from it meant a track listened to on web
+        # was ignored for the whole desktop session because _state_restored
+        # was already latched before /player/load returned.
+        if not from_cache and not self._state_restored:
             QTimer.singleShot(0, self._restore_ui_state)
         # A settings change that landed before this (first) load — e.g. a
         # setting applied while restoring window state — was skipped by the
@@ -8739,6 +8767,24 @@ class MusicApp(QWidget):
             self._settings_sync_deferred_until_player_data = False
             self._full_player_data_save_deferred_until_server = False
             self._schedule_settings_sync()
+
+    def _apply_synced_last_played(self, last_played, legacy_last_played=None) -> bool:
+        """Use the same top-level ``last_played`` field as the web client.
+
+        Older desktop releases embedded this payload in app_settings under
+        ``last_played_track``.  Read that only as a one-way migration fallback
+        when the shared field is still empty; future settings saves exclude it.
+        """
+        shared = last_played if isinstance(last_played, dict) else {}
+        legacy = legacy_last_played if isinstance(legacy_last_played, dict) else {}
+        selected = shared if shared.get("title") else (legacy if legacy.get("title") else {})
+        self._settings["last_played_track"] = dict(selected)
+        try:
+            with open(APP_SETTINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(self._settings, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+        return bool(not shared.get("title") and legacy.get("title"))
 
     def _apply_own_identity(self):
         login = (self._account_manager.active_login if self._account_manager else "") or ""
@@ -8779,8 +8825,16 @@ class MusicApp(QWidget):
         self._enqueue_player_data_save(updates)
 
     def _enqueue_player_data_save(self, payload: dict):
-        if not self._account_manager:
+        if not self._account_manager or not isinstance(payload, dict) or not payload:
             return
+        # A partial network save must also be a partial local-cache update.
+        # Replacing the cache file with just this payload would make every
+        # omitted field look empty during the next launch's instant preview.
+        cached = self._read_local_player_data()
+        if not isinstance(cached, dict):
+            cached = {}
+        cached.update(payload)
+        self._write_local_player_data(cached)
         self._pending_player_data_saves += 1
         self._player_data_save_queue.put(payload)
 
@@ -8911,8 +8965,9 @@ class MusicApp(QWidget):
         session's own _load_settings() read the local file. Restart-required
         keys (theme/scale) only prompt if they actually differ from what's
         already running here; everything else applies immediately (or, for
-        last_view_*/last_played_track, is simply picked up by the normal
-        _restore_ui_state() flow that runs right after this)."""
+        last_view_* is simply picked up by the normal _restore_ui_state()
+        flow that runs right after this; last_played is applied separately
+        by _apply_synced_last_played because web stores it as its own field)."""
         if not isinstance(app_settings, dict) or not app_settings:
             return
 
@@ -9370,6 +9425,67 @@ class MusicApp(QWidget):
         except Exception:
             pass
 
+    def _repair_account_collection_refs(self):
+        """Repair stale track IDs and prune refs absent from a fresh library.
+
+        Never run this against the disk library cache: a cache can simply be
+        behind the server and would make valid new tracks look deleted.  Once
+        both authoritative account data and an authoritative network library
+        are present, URL-first matching safely upgrades old album IDs.  Only a
+        ref that cannot be found by URL, stable ID/title, or legacy names is
+        removed.
+        """
+        if (
+            not self._server_player_data_ready
+            or not self._player_data_ready
+            or not self.library_manager.last_network_refresh_succeeded
+        ):
+            return
+
+        library = self.library_manager.get_library()
+        if not library:
+            return
+
+        resolver = LibraryTrackResolver(library)
+        repaired_likes, removed_likes, likes_changed = repair_collection_refs(
+            self._liked_tracks, resolver
+        )
+        repaired_playlists = []
+        removed_playlist_tracks = 0
+        playlists_changed = False
+        for playlist in self._playlists or []:
+            if not isinstance(playlist, dict):
+                playlists_changed = True
+                continue
+            clean_playlist = dict(playlist)
+            clean_tracks, removed, changed = repair_collection_refs(
+                playlist.get("tracks", []), resolver
+            )
+            clean_playlist["tracks"] = clean_tracks
+            repaired_playlists.append(clean_playlist)
+            removed_playlist_tracks += removed
+            playlists_changed = playlists_changed or changed
+
+        updates = {}
+        if likes_changed:
+            self._liked_tracks = repaired_likes
+            updates["liked_tracks"] = self._liked_tracks
+        if playlists_changed:
+            self._playlists = repaired_playlists
+            updates["playlists"] = self._playlists
+        if not updates:
+            return
+
+        self._save_player_data_async(updates)
+        self._profile_page.set_playlists(self._playlists)
+        self._update_sidebar_from_account()
+        self._after_track_collections_changed()
+        if removed_likes or removed_playlist_tracks:
+            print(
+                "Removed broken account collection refs: "
+                f"likes={removed_likes}, playlist_tracks={removed_playlist_tracks}"
+            )
+
     def _sanitize_account_collections(self):
         """Keep machine-local tracks out of account-synced collections."""
         self._liked_tracks = [
@@ -9402,78 +9518,64 @@ class MusicApp(QWidget):
         if not self._account_manager:
             return
         if not self._server_player_data_ready:
-            # A full desktop snapshot before the first authoritative server
-            # load is exactly how newer web/mobile changes get erased. Keep the
-            # UI-local change for now; the server copy will be loaded shortly
-            # and normal saves resume after that.
+            # Even a per-field collection save based on the stale disk cache
+            # can replace newer web changes in that same field.  Wait for the
+            # authoritative account load before allowing writes.
             self._full_player_data_save_deferred_until_server = True
             return
         if not self._player_data_ready:
             # self._liked_tracks/_subscriptions/_album_subscriptions/
             # _follow_order are still whatever __init__ set them to (empty)
             # — _on_player_data_loaded hasn't run yet, from local cache or
-            # network. Sending "full" now wouldn't just skip an update, it
-            # would overwrite the real local cache *and* server copies with
-            # these empty placeholders — which is exactly what happened when
-            # a settings-sync (_schedule_settings_sync, 800ms debounce) won
-            # the race against the first load: real subscriptions/likes/
-            # follow_order, gone, both locally and on the server, replaced
-            # by nothing. _on_player_data_loaded flips the guard and retries
-            # this once real data is in, so nothing here is lost for good.
+            # network.  A collection update made from those placeholders
+            # would still replace the corresponding real server field.
             return
         self._sanitize_account_collections()
-        # Always send full current state to avoid partial overwrites on server.
-        # "playlists" belongs here too, not just in explicit playlist-mutation
-        # calls — _write_local_player_data below *replaces* the whole local
-        # cache file with this dict, so any save missing "playlists" (a plain
-        # settings/volume change, the listen-stats flush, ...) silently wiped
-        # it from the cache. On next launch that empty-playlists snapshot is
-        # what _on_player_data_loaded sees first (before the network re-fetch
-        # corrects it), and _update_sidebar_from_account — reading an
-        # apparently-playlist-less account at that exact moment — strips
-        # every "playlist::<id>" entry out of follow_order right then, which
-        # is what actually got persisted going forward: every reorder/drag a
-        # user ever did to a playlist's sidebar position was thrown away,
-        # and it reappeared at the bottom (freshly re-appended, newest-last)
-        # from then on.
-        full = {
-            "liked_tracks": self._liked_tracks,
-            "subscriptions": self._subscriptions,
-            "album_subscriptions": self._album_subscriptions,
-            "follow_order": self._follow_order,
-            "playlists": self._playlists,
-            "app_settings": {
+        # /player/save is a per-key PATCH endpoint.  Sending the desktop's
+        # entire in-memory account snapshot here lets an unrelated action
+        # (volume, theme, sidebar order...) overwrite newer likes/playlists
+        # made on web while this window was open.  Persist only the fields
+        # the caller actually changed.  An empty update is the settings
+        # debounce's explicit request to save app_settings.
+        payload = dict(updates or {})
+        if not payload:
+            payload["app_settings"] = {
                 k: v for k, v in self._settings.items() if k not in _LOCAL_ONLY_SETTINGS_KEYS
-            },
-            "listen_stats": self._listen_stats,
-        }
-        full.update(updates)
-        full["liked_tracks"] = [
-            ref for ref in (full.get("liked_tracks") or [])
-            if not _collection_ref_is_local(ref)
-        ]
-        clean_playlists = []
-        for playlist in (full.get("playlists") or []):
-            if not isinstance(playlist, dict):
-                continue
-            clean_playlist = dict(playlist)
-            clean_playlist["tracks"] = [
-                ref for ref in (playlist.get("tracks", []) or [])
+            }
+        elif "app_settings" in payload:
+            settings = payload.get("app_settings") or {}
+            payload["app_settings"] = {
+                k: v for k, v in settings.items() if k not in _LOCAL_ONLY_SETTINGS_KEYS
+            }
+
+        if "liked_tracks" in payload:
+            payload["liked_tracks"] = [
+                ref for ref in (payload.get("liked_tracks") or [])
                 if not _collection_ref_is_local(ref)
             ]
-            clean_playlists.append(clean_playlist)
-        full["playlists"] = clean_playlists
-        full["album_subscriptions"] = [
-            key for key in (full.get("album_subscriptions") or [])
-            if not str(key or "").startswith("local::")
-        ]
-        full["follow_order"] = [
-            key for key in (full.get("follow_order") or [])
-            if not str(key or "").startswith("album::local::")
-        ]
-        # Write to local cache immediately so next startup sees it right away
-        self._write_local_player_data(full)
-        self._enqueue_player_data_save(full)
+        if "playlists" in payload:
+            clean_playlists = []
+            for playlist in payload.get("playlists") or []:
+                if not isinstance(playlist, dict):
+                    continue
+                clean_playlist = dict(playlist)
+                clean_playlist["tracks"] = [
+                    ref for ref in (playlist.get("tracks", []) or [])
+                    if not _collection_ref_is_local(ref)
+                ]
+                clean_playlists.append(clean_playlist)
+            payload["playlists"] = clean_playlists
+        if "album_subscriptions" in payload:
+            payload["album_subscriptions"] = [
+                key for key in (payload.get("album_subscriptions") or [])
+                if not str(key or "").startswith("local::")
+            ]
+        if "follow_order" in payload:
+            payload["follow_order"] = [
+                key for key in (payload.get("follow_order") or [])
+                if not str(key or "").startswith("album::local::")
+            ]
+        self._enqueue_player_data_save(payload)
 
     # ── Player setup ──────────────────────────────────────────────────────────
 
@@ -9972,11 +10074,11 @@ class MusicApp(QWidget):
     def _on_album_selected(self, album: dict, artist: dict):
         self._navigate_to_album(album, artist)
 
-    def _resolve_liked_track(self, lt: dict, library: list) -> dict:
-        """Return the real track dict from library if found; otherwise construct one from stored fields."""
+    def _resolve_liked_track(
+        self, lt: dict, library: list, resolver: LibraryTrackResolver | None = None
+    ) -> dict:
+        """Resolve a collection ref URL-first, marking a real miss explicitly."""
         url = lt.get("url", "")
-        album_id = str(lt.get("album_id") or "").strip()
-        track_title = lt.get("track_title") or lt.get("title", "")
         artist_name = lt.get("artist_name", "")
         album_title = lt.get("album_title", "")
         if lt.get("_is_youtube"):
@@ -9996,58 +10098,45 @@ class MusicApp(QWidget):
                 "_real_album_cover": lt.get("_youtube_thumbnail") or lt.get("album_cover", ""),
                 "duration": lt.get("duration") or 0,
             }
-        for artist in library:
-            if not isinstance(artist, dict):
-                continue
-            a_name = clean_artist_name(artist.get("artist", ""))
-            # album_id survives artist-folder renames too; only legacy refs
-            # without it need their saved artist name as a lookup constraint.
-            if not album_id and artist_name and a_name != clean_artist_name(artist_name):
-                continue
-            for album in artist.get("albums", []):
-                if album_id and str(album.get("album_id") or "").strip() != album_id:
-                    continue
-                if not album_id and album_title and clean_title(album.get("title", "")) != clean_title(album_title):
-                    continue
-                url_keys = _track_url_keys({}, url)
-                if url_keys:
-                    for track in album.get("tracks", []):
-                        if _track_url_keys(track, track.get("url", "")) & url_keys:
-                            result = dict(track)
-                            result.setdefault("artist_name", artist.get("artist", ""))
-                            result["_real_album_title"] = album.get("title", "")
-                            result["_real_album_cover"] = album.get("cover", "")
-                            return result
-                for track in album.get("tracks", []):
-                    if album_id and track_title and clean_title(track.get("title", "")) != clean_title(track_title):
-                        continue
-                    t_url = track.get("url", "")
-                    full_url = resolve_media_url(t_url)
-                    if album_id or url in (t_url, full_url):
-                        result = dict(track)
-                        result.setdefault("artist_name", artist.get("artist", ""))
-                        result["_real_album_title"] = album.get("title", "")
-                        result["_real_album_cover"] = album.get("cover", "")
-                        return result
+        resolver = resolver or LibraryTrackResolver(library)
+        match = resolver.resolve(lt)
+        if match:
+            track, album, artist = match
+            result = dict(track)
+            result.setdefault("album_id", album.get("album_id", ""))
+            result.setdefault("artist_name", artist.get("artist", ""))
+            result["_real_album_title"] = album.get("title", "")
+            result["_real_album_cover"] = album.get("cover", "")
+            return result
         return {
             "title": lt.get("track_title") or lt.get("title", ""),
             "url": url,
             "artist_name": artist_name,
+            "album_id": str(lt.get("album_id") or "").strip(),
             "duration": lt.get("duration"),
             "_real_album_title": album_title,
             "_real_album_cover": lt.get("album_cover", ""),
+            "_collection_unresolved": True,
         }
 
     def _build_liked_virtual_album(self) -> tuple[dict, dict]:
         library = self.library_manager.get_library()
+        resolver = LibraryTrackResolver(library)
         tracks = []
         for lt in self._liked_tracks:
             if _collection_ref_is_local(lt):
                 continue
             if isinstance(lt, dict):
-                tracks.append(self._resolve_liked_track(lt, library))
+                resolved = self._resolve_liked_track(lt, library, resolver)
+                if not resolved.get("_collection_unresolved"):
+                    tracks.append(resolved)
             elif isinstance(lt, str):
-                tracks.append({"url": lt, "title": lt.split("/")[-1]})
+                resolved = resolver.resolve(lt)
+                if resolved:
+                    track, album, artist = resolved
+                    tracks.append(self._resolve_liked_track(
+                        canonical_library_track_ref(track, album, artist), library, resolver
+                    ))
 
         icon_path = os.path.join(ICONS_DIR, "liked_icon.png")
         cover = icon_path if os.path.exists(icon_path) else ""
@@ -10444,7 +10533,7 @@ class MusicApp(QWidget):
         album = album or {}
         is_youtube = bool(track.get("_is_youtube"))
         rel_url = _track_identity_url(track) if is_youtube else track.get("url", "")
-        if album.get("_is_liked_album"):
+        if album.get("_is_liked_album") or album.get("_is_playlist"):
             album_title = track.get("_real_album_title", "")
         else:
             album_title = album.get("title", "") or ""
@@ -10456,8 +10545,23 @@ class MusicApp(QWidget):
             "artist_name": artist_name,
             "album_title": album_title,
             "track_title": track.get("title", "") or "",
-            "album_id": str(track.get("album_id") or "").strip(),
+            "album_id": str(track.get("album_id") or album.get("album_id") or "").strip(),
         }
+        if not is_youtube:
+            if self.library_manager.last_network_refresh_succeeded:
+                # The clicked row may itself have been built from the old
+                # disk cache before the background refresh completed.  Map
+                # it through the fresh URL-first index before persisting so
+                # web never receives that stale album_id.
+                match = LibraryTrackResolver(self.library_manager.get_library()).resolve(ref)
+                if match:
+                    ref = canonical_library_track_ref(*match)
+                else:
+                    ref["album_id"] = ""
+            else:
+                # Let the server attach its current ID from the concrete URL
+                # instead of asserting an ID from a non-authoritative cache.
+                ref["album_id"] = ""
         if is_youtube:
             ref["_is_youtube"] = True
             thumb = track.get("_youtube_thumbnail") or album.get("cover", "")
@@ -10566,9 +10670,8 @@ class MusicApp(QWidget):
         self._save_account_field_async({"playlists": self._playlists})
 
     def _save_follow_order_async(self):
-        # follow_order lives in _save_player_data_async's "full" bundle (see
-        # its definition) — any call persists whatever's currently in
-        # self._follow_order, so this just makes the intent explicit at call sites.
+        # Keep the intent explicit at call sites; partial saves only send this
+        # field and cannot touch likes/playlists/settings.
         self._save_player_data_async({"follow_order": self._follow_order})
 
     def _refresh_playlists_ui(self):
@@ -10582,6 +10685,16 @@ class MusicApp(QWidget):
         self._album_page.refresh_track_likes(collection_keys)
         if self._current_album and self._current_album.get("_is_liked_album"):
             self._on_liked_tracks_selected()
+        elif (
+            self._current_album
+            and self._current_album.get("_is_playlist")
+            and self._current_album.get("_playlist_editable")
+        ):
+            # Rebuild from the source playlist after a removal.  Keeping the
+            # old virtual album snapshot on screen made the deleted row stay
+            # visible; clicking it again then added the track back, which
+            # looked like a broken song that could never be removed.
+            self._open_playlist(self._current_album.get("_playlist_id", ""))
 
     def _build_playlist_virtual_album(self, playlist: dict, creator_name: str, editable: bool, owner_login: str = "") -> dict:
         """Same "virtual album" shape liked-tracks uses (see _resolve_liked_track),
@@ -10590,11 +10703,14 @@ class MusicApp(QWidget):
         cover, and (unlike liked tracks) each track's own artist name kept
         so it can show a per-track subtitle."""
         library = self.library_manager.get_library()
-        tracks = [
-            self._resolve_liked_track(ref, library)
-            for ref in (playlist.get("tracks", []) or [])
-            if isinstance(ref, dict) and not _collection_ref_is_local(ref)
-        ]
+        resolver = LibraryTrackResolver(library)
+        tracks = []
+        for ref in playlist.get("tracks", []) or []:
+            if not isinstance(ref, dict) or _collection_ref_is_local(ref):
+                continue
+            resolved = self._resolve_liked_track(ref, library, resolver)
+            if not resolved.get("_collection_unresolved"):
+                tracks.append(resolved)
         return {
             "title": playlist.get("name") or "Плейлист",
             "tracks": tracks,
@@ -11455,6 +11571,10 @@ class MusicApp(QWidget):
                 else self._record_album_history(artist_name, album_title, album_id, cover)
             ),
         )
+        # Shared resume state lives outside app_settings.  The web client
+        # reads/writes this exact field and payload shape, so whichever
+        # client played most recently is what both restore next time.
+        self._save_player_data_async({"last_played": last_played_payload})
 
     def _record_album_history(self, artist_name: str, album_title: str, album_id: str, cover: str) -> list:
         """Push (artist, album) onto the "recently listened" list the home
@@ -11779,6 +11899,7 @@ class MusicApp(QWidget):
         updated = dict(last_played)
         updated["_youtube_channel_avatar"] = avatar_url
         self._save_ui_state(last_played_track=updated)
+        self._save_player_data_async({"last_played": updated})
 
     def _load_now_playing_artist_avatar(self, url: str, request_id: int | None = None):
         def _is_current_request() -> bool:
@@ -11880,15 +12001,9 @@ class MusicApp(QWidget):
         if not self._listen_stats_dirty:
             return
         self._listen_stats_dirty = False
-        # Deliberately NOT _save_player_data_async({}) — that resends this
-        # window's whole in-memory snapshot (liked_tracks, subscriptions,
-        # follow_order, app_settings), and since this timer fires every 20s
-        # purely from *playback continuing* (not from the user touching any
-        # of those), a snapshot that's gone stale relative to the server
-        # (e.g. a track liked from another device/session meanwhile) gets
-        # silently overwritten back out — confirmed: a like made elsewhere
-        # while this window sits open and playing gets wiped within one
-        # flush cycle. A plain per-key save only ever touches listen_stats.
+        # Listening ticks only touch this one server field.  In particular,
+        # they must never resend likes/playlists that may have changed on web
+        # while the desktop window was sitting open and playing.
         self._enqueue_player_data_save({"listen_stats": self._listen_stats})
         self._profile_page.set_listen_stats(self._listen_stats)
 
